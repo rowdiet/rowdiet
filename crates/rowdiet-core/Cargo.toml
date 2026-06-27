@@ -1,0 +1,20 @@
+[package]
+name = "rowdiet-core"
+description = "Static analysis of Postgres migration DDL for alignment-padding waste (column tetris): exact fixed-width layout math, labeled varlena bounds, suggested column order"
+keywords = ["postgres", "padding", "alignment", "migration", "lint"]
+categories = ["development-tools", "database"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sqlparser.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+default = ["fs"]
+fs = []
+serde = ["dep:serde"]

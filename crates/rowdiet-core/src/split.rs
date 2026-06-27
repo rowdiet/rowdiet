@@ -1,0 +1,160 @@
+//! Tolerant statement splitter. Never fails: understands PG quoting (dollar quotes, E-strings,
+//! doubled quotes, nested block comments) just enough to find top-level semicolons and 1-based
+//! line numbers. Whether a statement parses is the caller's per-statement concern — a linter must
+//! degrade loudly per statement, never abort a whole file.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawStatement {
+    pub text: String,
+    pub line: u32,
+}
+
+pub fn split(sql: &str) -> Vec<RawStatement> {
+    let b = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut line = 1u32;
+    let mut content_start: Option<(usize, u32)> = None;
+    while i < b.len() {
+        match b[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // PG block comments nest, unlike C.
+                let mut depth = 1u32;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        b'*' if b.get(i + 1) == Some(&b'/') => {
+                            depth -= 1;
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b';' => {
+                if let Some((start, l)) = content_start.take() {
+                    push_stmt(&mut out, &sql[start..i], l);
+                }
+                i += 1;
+            }
+            c if c.is_ascii_whitespace() => i += 1,
+            b'\'' => {
+                mark(&mut content_start, i, line);
+                // Backslash escapes only in E'..' strings (standard_conforming_strings default).
+                let estring = i > 0 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !is_ident_byte(b[i - 2]));
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'\\' if estring => i += 2,
+                        b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'"' => {
+                mark(&mut content_start, i, line);
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'"' if b.get(i + 1) == Some(&b'"') => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'$' => {
+                mark(&mut content_start, i, line);
+                match dollar_tag_end(b, i) {
+                    Some(tag_end) => {
+                        let tag = &b[i..tag_end];
+                        i = tag_end;
+                        while i < b.len() {
+                            if b[i..].starts_with(tag) {
+                                i += tag.len();
+                                break;
+                            }
+                            if b[i] == b'\n' {
+                                line += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    None => i += 1,
+                }
+            }
+            _ => {
+                mark(&mut content_start, i, line);
+                i += 1;
+            }
+        }
+    }
+    if let Some((start, l)) = content_start {
+        push_stmt(&mut out, &sql[start..], l);
+    }
+    out
+}
+
+fn mark(content_start: &mut Option<(usize, u32)>, i: usize, line: u32) {
+    if content_start.is_none() {
+        *content_start = Some((i, line));
+    }
+}
+
+fn push_stmt(out: &mut Vec<RawStatement>, text: &str, line: u32) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        out.push(RawStatement { text: trimmed.to_string(), line });
+    }
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c == b'_' || c.is_ascii_alphanumeric() || c >= 0x80
+}
+
+/// `$tag$` (tag possibly empty, never starting with a digit — `$1` stays a parameter). Returns the
+/// index just past the closing `$` of the opening tag.
+fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {
+    if b.get(start + 1).is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut j = start + 1;
+    while j < b.len() && is_ident_byte(b[j]) {
+        j += 1;
+    }
+    if j < b.len() && b[j] == b'$' { Some(j + 1) } else { None }
+}
+
+#[cfg(test)]
+mod tests;

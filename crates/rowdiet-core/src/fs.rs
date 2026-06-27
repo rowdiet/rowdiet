@@ -1,0 +1,51 @@
+//! Filesystem conveniences (not compiled for wasm targets — disable the default `fs` feature).
+
+use crate::{analyze_sources, Analysis, Config, SqlSource};
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// All `*.sql` files under `dir` (recursive), version-ordered within each directory.
+pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    walk(dir, &mut files)?;
+    files.sort_by(|a, b| {
+        a.parent().cmp(&b.parent()).then_with(|| crate::version::compare(file_name(a), file_name(b)))
+    });
+    Ok(files)
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, out)?;
+        } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn file_name(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+}
+
+pub fn read_source(path: &Path) -> io::Result<SqlSource> {
+    let bytes = std::fs::read(path)?;
+    Ok(SqlSource { name: path.display().to_string(), sql: String::from_utf8_lossy(&bytes).into_owned() })
+}
+
+/// The five-line adopter integration: point it at a migrations directory (e.g. in a `#[test]` or
+/// right before the migration runner) and gate on the result.
+pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
+    let dir = dir.as_ref();
+    let mut sources = Vec::new();
+    for path in collect_sql_files(dir)? {
+        let bytes = std::fs::read(&path)?;
+        let name = path.strip_prefix(dir).unwrap_or(&path).display().to_string();
+        sources.push(SqlSource { name, sql: String::from_utf8_lossy(&bytes).into_owned() });
+    }
+    Ok(analyze_sources(&sources, config))
+}
