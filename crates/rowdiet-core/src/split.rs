@@ -135,7 +135,10 @@ fn mark(content_start: &mut Option<(usize, u32)>, i: usize, line: u32) {
 fn push_stmt(out: &mut Vec<RawStatement>, text: &str, line: u32) {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
-        out.push(RawStatement { text: trimmed.to_string(), line });
+        out.push(RawStatement {
+            text: trimmed.to_string(),
+            line,
+        });
     }
 }
 
@@ -153,7 +156,11 @@ fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {
     while j < b.len() && is_ident_byte(b[j]) {
         j += 1;
     }
-    if j < b.len() && b[j] == b'$' { Some(j + 1) } else { None }
+    if j < b.len() && b[j] == b'$' {
+        Some(j + 1)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

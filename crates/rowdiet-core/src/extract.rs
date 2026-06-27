@@ -31,19 +31,59 @@ pub enum DdlOp {
         is_ctas: bool,
         has_like: bool,
     },
-    AddColumn { table: RawName, column: RawColumn, if_not_exists: bool },
-    DropColumns { table: RawName, columns: Vec<String>, if_exists: bool },
-    RenameColumn { table: RawName, old: String, new: String },
-    RenameTable { table: RawName, new: RawName },
-    SetColumnType { table: RawName, column: String, type_ref: TypeRef },
-    SetNotNull { table: RawName, column: String, value: bool },
-    DropTables { names: Vec<RawName>, if_exists: bool },
-    CreateEnum { name: RawName },
-    CreateComposite { name: RawName },
-    CreateRange { name: RawName, subtype: Option<TypeRef> },
-    CreateBase { name: RawName },
-    CreateDomain { name: RawName, base: TypeRef },
-    DropTypes { names: Vec<RawName> },
+    AddColumn {
+        table: RawName,
+        column: RawColumn,
+        if_not_exists: bool,
+    },
+    DropColumns {
+        table: RawName,
+        columns: Vec<String>,
+        if_exists: bool,
+    },
+    RenameColumn {
+        table: RawName,
+        old: String,
+        new: String,
+    },
+    RenameTable {
+        table: RawName,
+        new: RawName,
+    },
+    SetColumnType {
+        table: RawName,
+        column: String,
+        type_ref: TypeRef,
+    },
+    SetNotNull {
+        table: RawName,
+        column: String,
+        value: bool,
+    },
+    DropTables {
+        names: Vec<RawName>,
+        if_exists: bool,
+    },
+    CreateEnum {
+        name: RawName,
+    },
+    CreateComposite {
+        name: RawName,
+    },
+    CreateRange {
+        name: RawName,
+        subtype: Option<TypeRef>,
+    },
+    CreateBase {
+        name: RawName,
+    },
+    CreateDomain {
+        name: RawName,
+        base: TypeRef,
+    },
+    DropTypes {
+        names: Vec<RawName>,
+    },
     Irrelevant,
 }
 
@@ -58,13 +98,26 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
         sq::Statement::AlterTable(at) => map_alter_table(at),
         sq::Statement::CreateType { name, representation } => vec![map_create_type(&name, representation)],
         sq::Statement::CreateDomain(cd) => {
-            vec![DdlOp::CreateDomain { name: raw_name(&cd.name), base: map_type(&cd.data_type) }]
+            vec![DdlOp::CreateDomain {
+                name: raw_name(&cd.name),
+                base: map_type(&cd.data_type),
+            }]
         }
-        sq::Statement::Drop { object_type, names, if_exists, .. } => match object_type {
+        sq::Statement::Drop {
+            object_type,
+            names,
+            if_exists,
+            ..
+        } => match object_type {
             sq::ObjectType::Table => {
-                vec![DdlOp::DropTables { names: names.iter().map(raw_name).collect(), if_exists }]
+                vec![DdlOp::DropTables {
+                    names: names.iter().map(raw_name).collect(),
+                    if_exists,
+                }]
             }
-            sq::ObjectType::Type => vec![DdlOp::DropTypes { names: names.iter().map(raw_name).collect() }],
+            sq::ObjectType::Type => vec![DdlOp::DropTypes {
+                names: names.iter().map(raw_name).collect(),
+            }],
             _ => vec![DdlOp::Irrelevant],
         },
         _ => vec![DdlOp::Irrelevant],
@@ -76,7 +129,14 @@ fn map_create_table(ct: sq::CreateTable) -> DdlOp {
     let has_like = ct.like.is_some();
     let pk_columns = ct.constraints.iter().flat_map(pk_constraint_columns).collect();
     let columns = ct.columns.iter().map(map_column).collect();
-    DdlOp::CreateTable { name: raw_name(&ct.name), columns, pk_columns, if_not_exists: ct.if_not_exists, is_ctas, has_like }
+    DdlOp::CreateTable {
+        name: raw_name(&ct.name),
+        columns,
+        pk_columns,
+        if_not_exists: ct.if_not_exists,
+        is_ctas,
+        has_like,
+    }
 }
 
 fn pk_constraint_columns(constraint: &sq::TableConstraint) -> Vec<String> {
@@ -99,27 +159,56 @@ fn map_column(cd: &sq::ColumnDef) -> RawColumn {
         sq::ColumnOption::NotNull => true,
         sq::ColumnOption::PrimaryKey(_) => true,
         // Identity columns (no generation expression) are implicitly NOT NULL.
-        sq::ColumnOption::Generated { generation_expr: None, .. } => true,
+        sq::ColumnOption::Generated {
+            generation_expr: None, ..
+        } => true,
         _ => false,
     });
-    RawColumn { display: cd.name.value.clone(), key: ident_key(&cd.name), type_ref: map_type(&cd.data_type), not_null }
+    RawColumn {
+        display: cd.name.value.clone(),
+        key: ident_key(&cd.name),
+        type_ref: map_type(&cd.data_type),
+        not_null,
+    }
 }
 
 fn map_alter_table(at: sq::AlterTable) -> Vec<DdlOp> {
     let table = raw_name(&at.name);
-    at.operations.into_iter().flat_map(|op| map_alter_op(&table, op)).collect()
+    at.operations
+        .into_iter()
+        .flat_map(|op| map_alter_op(&table, op))
+        .collect()
 }
 
 fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
     match op {
-        sq::AlterTableOperation::AddColumn { if_not_exists, column_def, .. } => {
-            vec![DdlOp::AddColumn { table: table.clone(), column: map_column(&column_def), if_not_exists }]
+        sq::AlterTableOperation::AddColumn {
+            if_not_exists,
+            column_def,
+            ..
+        } => {
+            vec![DdlOp::AddColumn {
+                table: table.clone(),
+                column: map_column(&column_def),
+                if_not_exists,
+            }]
         }
-        sq::AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+        sq::AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
             let columns = column_names.iter().map(ident_key).collect();
-            vec![DdlOp::DropColumns { table: table.clone(), columns, if_exists }]
+            vec![DdlOp::DropColumns {
+                table: table.clone(),
+                columns,
+                if_exists,
+            }]
         }
-        sq::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+        sq::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => {
             vec![DdlOp::RenameColumn {
                 table: table.clone(),
                 old: ident_key(&old_column_name),
@@ -131,7 +220,10 @@ fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
                 sq::RenameTableNameKind::As(n) => raw_name(&n),
                 sq::RenameTableNameKind::To(n) => raw_name(&n),
             };
-            vec![DdlOp::RenameTable { table: table.clone(), new }]
+            vec![DdlOp::RenameTable {
+                table: table.clone(),
+                new,
+            }]
         }
         sq::AlterTableOperation::AlterColumn { column_name, op } => {
             map_alter_column(table, ident_key(&column_name), op)
@@ -139,7 +231,11 @@ fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
         // ADD PRIMARY KEY forces NOT NULL on its columns.
         sq::AlterTableOperation::AddConstraint { constraint, .. } => pk_constraint_columns(&constraint)
             .into_iter()
-            .map(|column| DdlOp::SetNotNull { table: table.clone(), column, value: true })
+            .map(|column| DdlOp::SetNotNull {
+                table: table.clone(),
+                column,
+                value: true,
+            })
             .collect(),
         _ => vec![DdlOp::Irrelevant],
     }
@@ -148,13 +244,25 @@ fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
 fn map_alter_column(table: &RawName, column: String, op: sq::AlterColumnOperation) -> Vec<DdlOp> {
     match op {
         sq::AlterColumnOperation::SetNotNull => {
-            vec![DdlOp::SetNotNull { table: table.clone(), column, value: true }]
+            vec![DdlOp::SetNotNull {
+                table: table.clone(),
+                column,
+                value: true,
+            }]
         }
         sq::AlterColumnOperation::DropNotNull => {
-            vec![DdlOp::SetNotNull { table: table.clone(), column, value: false }]
+            vec![DdlOp::SetNotNull {
+                table: table.clone(),
+                column,
+                value: false,
+            }]
         }
         sq::AlterColumnOperation::SetDataType { data_type, .. } => {
-            vec![DdlOp::SetColumnType { table: table.clone(), column, type_ref: map_type(&data_type) }]
+            vec![DdlOp::SetColumnType {
+                table: table.clone(),
+                column,
+                type_ref: map_type(&data_type),
+            }]
         }
         sq::AlterColumnOperation::SetDefault { .. }
         | sq::AlterColumnOperation::DropDefault
@@ -195,7 +303,10 @@ fn raw_name(name: &sq::ObjectName) -> RawName {
         .and_then(|part| part.as_ident())
         .map(ident_key)
         .unwrap_or_else(|| name.to_string().to_lowercase());
-    RawName { display: name.to_string(), key }
+    RawName {
+        display: name.to_string(),
+        key,
+    }
 }
 
 fn map_type(dt: &sq::DataType) -> TypeRef {
@@ -210,13 +321,28 @@ fn map_type(dt: &sq::DataType) -> TypeRef {
         return match inner {
             Some(inner) => {
                 let base = map_type(inner);
-                TypeRef { key: base.key, display, char_len: None, dims: base.dims.saturating_add(1) }
+                TypeRef {
+                    key: base.key,
+                    display,
+                    char_len: None,
+                    dims: base.dims.saturating_add(1),
+                }
             }
-            None => TypeRef { key: "array".into(), display, char_len: None, dims: 1 },
+            None => TypeRef {
+                key: "array".into(),
+                display,
+                char_len: None,
+                dims: 1,
+            },
         };
     }
     let (key, char_len) = scalar_key(dt);
-    TypeRef { key, display, char_len, dims: 0 }
+    TypeRef {
+        key,
+        display,
+        char_len,
+        dims: 0,
+    }
 }
 
 fn scalar_key(dt: &sq::DataType) -> (String, Option<u64>) {
@@ -355,7 +481,10 @@ pub fn sniff(text: &str) -> Option<Sniff> {
     }
     if first.eq_ignore_ascii_case("create") {
         let mut tok = it.next()?;
-        while ["global", "local", "temporary", "temp", "unlogged"].iter().any(|w| tok.0.eq_ignore_ascii_case(w)) {
+        while ["global", "local", "temporary", "temp", "unlogged"]
+            .iter()
+            .any(|w| tok.0.eq_ignore_ascii_case(w))
+        {
             tok = it.next()?;
         }
         if !tok.0.eq_ignore_ascii_case("table") {

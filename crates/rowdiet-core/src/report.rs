@@ -68,10 +68,17 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     let current = stats(tier, &current_walk);
     let suggested = stats(tier, &suggested_walk);
     let avoidable = match tier {
-        Tier::Exact => current.footprint.unwrap_or(0).saturating_sub(suggested.footprint.unwrap_or(0)),
+        Tier::Exact => current
+            .footprint
+            .unwrap_or(0)
+            .saturating_sub(suggested.footprint.unwrap_or(0)),
         Tier::Estimate => current.padding.saturating_sub(suggested.padding),
     };
-    let final_order: Vec<usize> = if avoidable == 0 { (0..kinds.len()).collect() } else { order };
+    let final_order: Vec<usize> = if avoidable == 0 {
+        (0..kinds.len()).collect()
+    } else {
+        order
+    };
     let suggested_order = final_order.iter().map(|&i| table.columns[i].display.clone()).collect();
     let columns = table
         .columns
@@ -87,8 +94,12 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             offset: w.offset,
         })
         .collect();
-    let mut assumed_types: Vec<String> =
-        table.columns.iter().filter(|c| !c.known_type).map(|c| c.type_display.clone()).collect();
+    let mut assumed_types: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|c| !c.known_type)
+        .map(|c| c.type_display.clone())
+        .collect();
     assumed_types.sort();
     assumed_types.dedup();
     let any_nullable = table.columns.iter().any(|c| !c.not_null);
@@ -114,8 +125,16 @@ fn stats(tier: Tier, walk: &Walk) -> OrderStats {
     match tier {
         Tier::Exact => {
             let footprint = layout::footprint(walk.scenario_end);
-            OrderStats { padding: walk.padding, footprint: Some(footprint), rows_per_page: Some(layout::rows_per_page(footprint)) }
+            OrderStats {
+                padding: walk.padding,
+                footprint: Some(footprint),
+                rows_per_page: Some(layout::rows_per_page(footprint)),
+            }
         }
-        Tier::Estimate => OrderStats { padding: walk.padding, footprint: None, rows_per_page: None },
+        Tier::Estimate => OrderStats {
+            padding: walk.padding,
+            footprint: None,
+            rows_per_page: None,
+        },
     }
 }

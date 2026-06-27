@@ -4,7 +4,10 @@ use crate::layout::{Align, ColumnKind};
 use std::collections::BTreeMap;
 
 fn origin(line: u32) -> Origin {
-    Origin { source: "test.sql".into(), line }
+    Origin {
+        source: "test.sql".into(),
+        line,
+    }
 }
 
 fn folded(statements: &[&str]) -> (Vec<FoldedTable>, Vec<Note>) {
@@ -40,15 +43,19 @@ fn session_enum_resolves_columns() {
         "CREATE TABLE t (s status NOT NULL, id bigint NOT NULL)",
     ]);
     assert!(notes.is_empty(), "{notes:?}");
-    assert_eq!(tables[0].columns[0].kind, ColumnKind::Fixed { len: 4, align: Align::Int });
+    assert_eq!(
+        tables[0].columns[0].kind,
+        ColumnKind::Fixed {
+            len: 4,
+            align: Align::Int
+        }
+    );
     assert!(tables[0].columns[0].known_type);
 }
 
 #[test]
 fn unknown_type_noted_once() {
-    let (tables, notes) = folded(&[
-        "CREATE TABLE t (a citext, b citext)",
-    ]);
+    let (tables, notes) = folded(&["CREATE TABLE t (a citext, b citext)"]);
     assert!(!tables[0].columns[0].known_type);
     assert_eq!(notes.iter().filter(|n| n.kind == NoteKind::UnknownType).count(), 1);
 }
@@ -74,10 +81,7 @@ fn skipped_create_makes_ghost() {
 
 #[test]
 fn skipped_alter_marks_incomplete() {
-    let (tables, notes) = folded(&[
-        "CREATE TABLE t (a int)",
-        "ALTER TABLE t nonsense grammar here",
-    ]);
+    let (tables, notes) = folded(&["CREATE TABLE t (a int)", "ALTER TABLE t nonsense grammar here"]);
     assert!(tables[0].incomplete);
     assert!(notes.iter().any(|n| n.kind == NoteKind::SkippedStatement));
 }
@@ -103,7 +107,13 @@ fn set_type_and_not_null_edit_in_place() {
         "ALTER TABLE t ALTER COLUMN a TYPE bigint",
         "ALTER TABLE t ALTER COLUMN b SET NOT NULL",
     ]);
-    assert_eq!(tables[0].columns[0].kind, ColumnKind::Fixed { len: 8, align: Align::Double });
+    assert_eq!(
+        tables[0].columns[0].kind,
+        ColumnKind::Fixed {
+            len: 8,
+            align: Align::Double
+        }
+    );
     assert!(tables[0].columns[1].not_null);
     assert!(!tables[0].columns[0].not_null);
 }
@@ -150,13 +160,31 @@ fn domain_and_range_session_types() {
         "CREATE TABLE t (c code, r bigrange)",
     ]);
     assert!(notes.is_empty(), "{notes:?}");
-    assert_eq!(tables[0].columns[0].kind, ColumnKind::Varlena { align: Align::Int, proven_short: true });
-    assert_eq!(tables[0].columns[1].kind, ColumnKind::Varlena { align: Align::Double, proven_short: false });
+    assert_eq!(
+        tables[0].columns[0].kind,
+        ColumnKind::Varlena {
+            align: Align::Int,
+            proven_short: true
+        }
+    );
+    assert_eq!(
+        tables[0].columns[1].kind,
+        ColumnKind::Varlena {
+            align: Align::Double,
+            proven_short: false
+        }
+    );
 }
 
 #[test]
 fn serial_column_is_not_null() {
     let (tables, _) = folded(&["CREATE TABLE t (id bigserial, x int)"]);
     assert!(tables[0].columns[0].not_null);
-    assert_eq!(tables[0].columns[0].kind, ColumnKind::Fixed { len: 8, align: Align::Double });
+    assert_eq!(
+        tables[0].columns[0].kind,
+        ColumnKind::Fixed {
+            len: 8,
+            align: Align::Double
+        }
+    );
 }

@@ -121,7 +121,9 @@ fn quoted_and_qualified_table_names() {
 #[test]
 fn alter_forms() {
     match one("ALTER TABLE t ADD COLUMN IF NOT EXISTS z timestamptz NOT NULL") {
-        DdlOp::AddColumn { column, if_not_exists, .. } => {
+        DdlOp::AddColumn {
+            column, if_not_exists, ..
+        } => {
             assert!(if_not_exists);
             assert!(column.not_null);
             assert_eq!(column.type_ref.key, "timestamptz");
@@ -233,11 +235,26 @@ fn irrelevant_statements_are_silent() {
 
 #[test]
 fn sniff_targets() {
-    assert_eq!(sniff("ALTER TABLE only_tab ADD nope"), Some(Sniff::AlterTable("only_tab".into())));
-    assert_eq!(sniff("alter table ONLY my_schema.Big_Tab whatever"), Some(Sniff::AlterTable("big_tab".into())));
-    assert_eq!(sniff("ALTER TABLE IF EXISTS x DROP y"), Some(Sniff::AlterTable("x".into())));
-    assert_eq!(sniff("CREATE UNLOGGED TABLE ul (x int)"), Some(Sniff::CreateTable("ul".into())));
-    assert_eq!(sniff("CREATE TABLE IF NOT EXISTS s.t (x int)"), Some(Sniff::CreateTable("t".into())));
+    assert_eq!(
+        sniff("ALTER TABLE only_tab ADD nope"),
+        Some(Sniff::AlterTable("only_tab".into()))
+    );
+    assert_eq!(
+        sniff("alter table ONLY my_schema.Big_Tab whatever"),
+        Some(Sniff::AlterTable("big_tab".into()))
+    );
+    assert_eq!(
+        sniff("ALTER TABLE IF EXISTS x DROP y"),
+        Some(Sniff::AlterTable("x".into()))
+    );
+    assert_eq!(
+        sniff("CREATE UNLOGGED TABLE ul (x int)"),
+        Some(Sniff::CreateTable("ul".into()))
+    );
+    assert_eq!(
+        sniff("CREATE TABLE IF NOT EXISTS s.t (x int)"),
+        Some(Sniff::CreateTable("t".into()))
+    );
     assert_eq!(sniff("DO $$ x $$"), None);
     assert_eq!(sniff("CREATE INDEX i ON t (a)"), None);
 }

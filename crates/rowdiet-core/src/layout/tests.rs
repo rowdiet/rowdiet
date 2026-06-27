@@ -5,11 +5,17 @@ fn fixed(len: u64, align: Align) -> ColumnKind {
 }
 
 fn varlena(align: Align) -> ColumnKind {
-    ColumnKind::Varlena { align, proven_short: false }
+    ColumnKind::Varlena {
+        align,
+        proven_short: false,
+    }
 }
 
 fn short() -> ColumnKind {
-    ColumnKind::Varlena { align: Align::Int, proven_short: true }
+    ColumnKind::Varlena {
+        align: Align::Int,
+        proven_short: true,
+    }
 }
 
 #[test]
@@ -25,19 +31,39 @@ fn pad_and_maxalign() {
 
 #[test]
 fn walk_classic_bool_int8_interleave() {
-    let w = walk(&[fixed(1, Align::Char), fixed(8, Align::Double), fixed(1, Align::Char), fixed(8, Align::Double)]);
+    let w = walk(&[
+        fixed(1, Align::Char),
+        fixed(8, Align::Double),
+        fixed(1, Align::Char),
+        fixed(8, Align::Double),
+    ]);
     assert_eq!(w.padding, 14);
     assert_eq!(w.scenario_end, 32);
-    let s = walk(&[fixed(8, Align::Double), fixed(8, Align::Double), fixed(1, Align::Char), fixed(1, Align::Char)]);
+    let s = walk(&[
+        fixed(8, Align::Double),
+        fixed(8, Align::Double),
+        fixed(1, Align::Char),
+        fixed(1, Align::Char),
+    ]);
     assert_eq!(s.padding, 0);
     assert_eq!(s.scenario_end, 18);
 }
 
 #[test]
 fn footprint_rung_crossing() {
-    let cur = walk(&[fixed(4, Align::Int), fixed(8, Align::Double), fixed(4, Align::Int), fixed(8, Align::Double)]);
+    let cur = walk(&[
+        fixed(4, Align::Int),
+        fixed(8, Align::Double),
+        fixed(4, Align::Int),
+        fixed(8, Align::Double),
+    ]);
     assert_eq!(footprint(cur.scenario_end), 56);
-    let sug = walk(&[fixed(8, Align::Double), fixed(8, Align::Double), fixed(4, Align::Int), fixed(4, Align::Int)]);
+    let sug = walk(&[
+        fixed(8, Align::Double),
+        fixed(8, Align::Double),
+        fixed(4, Align::Int),
+        fixed(4, Align::Int),
+    ]);
     assert_eq!(footprint(sug.scenario_end), 48);
     assert_eq!(rows_per_page(56), 136);
     assert_eq!(rows_per_page(48), 157);
@@ -91,7 +117,13 @@ fn suggested_survives_null_masks() {
 
 #[test]
 fn varlena_cluster_and_align_desc() {
-    let kinds = [varlena(Align::Int), fixed(8, Align::Double), short(), varlena(Align::Double), fixed(1, Align::Char)];
+    let kinds = [
+        varlena(Align::Int),
+        fixed(8, Align::Double),
+        short(),
+        varlena(Align::Double),
+        fixed(1, Align::Char),
+    ];
     let order = suggested_order(&kinds);
     assert_eq!(order, vec![1, 4, 3, 0, 2]);
 }

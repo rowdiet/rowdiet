@@ -3,7 +3,13 @@ use std::cmp::Ordering::Less;
 
 fn assert_order(files: &[&str]) {
     for pair in files.windows(2) {
-        assert_eq!(compare(pair[0], pair[1]), Less, "{} should sort before {}", pair[0], pair[1]);
+        assert_eq!(
+            compare(pair[0], pair[1]),
+            Less,
+            "{} should sort before {}",
+            pair[0],
+            pair[1]
+        );
     }
 }
 

@@ -57,7 +57,10 @@ pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
     let mut folder = fold::Folder::new(config.assume.clone());
     for source in sources {
         for raw in split::split(&source.sql) {
-            let origin = Origin { source: source.name.clone(), line: raw.line };
+            let origin = Origin {
+                source: source.name.clone(),
+                line: raw.line,
+            };
             let ignore_marker = raw.text.contains(IGNORE_MARKER);
             let prepared = extract::preprocess(&raw.text);
             match extract::extract(&prepared) {
@@ -67,7 +70,10 @@ pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
         }
     }
     let (tables, notes) = folder.finish();
-    Analysis { tables: tables.into_iter().map(report::build).collect(), notes }
+    Analysis {
+        tables: tables.into_iter().map(report::build).collect(),
+        notes,
+    }
 }
 
 #[cfg(test)]

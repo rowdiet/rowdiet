@@ -92,14 +92,24 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
             ColumnKind::Fixed { len, align } => (pad(off, align.bytes()), *len),
             // A short varlena (1-byte header) is stored with no alignment at all (tupmacs.h).
             ColumnKind::Varlena { proven_short: true, .. } => (0, VARLENA_SHORT_HEADER),
-            ColumnKind::Varlena { align, proven_short: false } => (pad(off, align.bytes()), VARLENA_LONG_HEADER),
+            ColumnKind::Varlena {
+                align,
+                proven_short: false,
+            } => (pad(off, align.bytes()), VARLENA_LONG_HEADER),
         };
         off += p;
-        columns.push(ColumnWalk { pad_before: p, offset: off });
+        columns.push(ColumnWalk {
+            pad_before: p,
+            offset: off,
+        });
         off += size;
         padding += p;
     }
-    Walk { columns, padding, scenario_end: off }
+    Walk {
+        columns,
+        padding,
+        scenario_end: off,
+    }
 }
 
 /// Per-row on-disk footprint for a table of only fixed-width columns, no-NULL scenario:
@@ -119,7 +129,7 @@ pub fn no_null_thoff() -> u64 {
 /// t_hoff for rows that DO contain a NULL: header + one bitmap bit per table column.
 /// Order-invariant — display information only, never reorder advice.
 pub fn null_thoff(natts: usize) -> u64 {
-    maxalign(TUPLE_HEADER + (natts as u64 + 7) / 8)
+    maxalign(TUPLE_HEADER + (natts as u64).div_ceil(8))
 }
 
 /// Suggested column order: fixed before varlena; alignment descending; within a fixed alignment
@@ -135,8 +145,14 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u8, u8, usize) {
     let align_desc = |a: Align| 8 - a.bytes() as u8;
     match kind {
         ColumnKind::Fixed { align, .. } => (0, align_desc(*align), kind.irregular() as u8, index),
-        ColumnKind::Varlena { align, proven_short: false } => (1, align_desc(*align), 0, index),
-        ColumnKind::Varlena { align, proven_short: true } => (2, align_desc(*align), 0, index),
+        ColumnKind::Varlena {
+            align,
+            proven_short: false,
+        } => (1, align_desc(*align), 0, index),
+        ColumnKind::Varlena {
+            align,
+            proven_short: true,
+        } => (2, align_desc(*align), 0, index),
     }
 }
 

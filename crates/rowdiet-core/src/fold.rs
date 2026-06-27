@@ -92,7 +92,9 @@ impl Folder {
     pub fn skipped(&mut self, origin: &Origin, error: String, sniff: Option<Sniff>) {
         let detail = match &sniff {
             Some(Sniff::AlterTable(t)) => format!("statement skipped (targets table {t}): {error}"),
-            Some(Sniff::CreateTable(t)) => format!("statement skipped (creates table {t} — table not analyzed): {error}"),
+            Some(Sniff::CreateTable(t)) => {
+                format!("statement skipped (creates table {t} — table not analyzed): {error}")
+            }
             None => format!("statement skipped: {error}"),
         };
         match sniff {
@@ -117,14 +119,42 @@ impl Folder {
 
     fn apply_one(&mut self, op: DdlOp, origin: &Origin, ignore_marker: bool) {
         match op {
-            DdlOp::CreateTable { name, columns, pk_columns, if_not_exists, is_ctas, has_like } => {
-                self.create_table(name, columns, pk_columns, if_not_exists, is_ctas, has_like, origin, ignore_marker);
+            DdlOp::CreateTable {
+                name,
+                columns,
+                pk_columns,
+                if_not_exists,
+                is_ctas,
+                has_like,
+            } => {
+                self.create_table(
+                    name,
+                    columns,
+                    pk_columns,
+                    if_not_exists,
+                    is_ctas,
+                    has_like,
+                    origin,
+                    ignore_marker,
+                );
             }
-            DdlOp::AddColumn { table, column, if_not_exists } => self.add_column(table, column, if_not_exists, origin),
-            DdlOp::DropColumns { table, columns, if_exists } => self.drop_columns(table, columns, if_exists, origin),
+            DdlOp::AddColumn {
+                table,
+                column,
+                if_not_exists,
+            } => self.add_column(table, column, if_not_exists, origin),
+            DdlOp::DropColumns {
+                table,
+                columns,
+                if_exists,
+            } => self.drop_columns(table, columns, if_exists, origin),
             DdlOp::RenameColumn { table, old, new } => self.rename_column(table, old, new, origin),
             DdlOp::RenameTable { table, new } => self.rename_table(table, new, origin),
-            DdlOp::SetColumnType { table, column, type_ref } => self.set_column_type(table, column, type_ref, origin),
+            DdlOp::SetColumnType {
+                table,
+                column,
+                type_ref,
+            } => self.set_column_type(table, column, type_ref, origin),
             DdlOp::SetNotNull { table, column, value } => self.set_not_null(table, column, value, origin),
             DdlOp::DropTables { names, if_exists } => self.drop_tables(names, if_exists, origin),
             DdlOp::CreateEnum { name } => self.catalog.define_enum(name.key),
@@ -154,7 +184,10 @@ impl Folder {
         ignore_marker: bool,
     ) {
         if is_ctas {
-            let detail = format!("CREATE TABLE {} AS SELECT — column set unknown statically, table not analyzed", name.display);
+            let detail = format!(
+                "CREATE TABLE {} AS SELECT — column set unknown statically, table not analyzed",
+                name.display
+            );
             self.note(origin, NoteKind::CtasSkipped, detail);
             self.ghosts.insert(name.key);
             return;
@@ -163,11 +196,18 @@ impl Folder {
             if if_not_exists {
                 return;
             }
-            self.note(origin, NoteKind::Redefined, format!("table {} redefined — replacing prior definition", name.display));
+            self.note(
+                origin,
+                NoteKind::Redefined,
+                format!("table {} redefined — replacing prior definition", name.display),
+            );
             self.order.retain(|key| key != &name.key);
         }
         if has_like {
-            let detail = format!("table {}: LIKE clause not expanded — column list incomplete", name.display);
+            let detail = format!(
+                "table {}: LIKE clause not expanded — column list incomplete",
+                name.display
+            );
             self.note(origin, NoteKind::IncompleteColumns, detail);
         }
         let mut table = FoldedTable {
@@ -198,7 +238,10 @@ impl Folder {
         let duplicate = self.tables[&table.key].columns.iter().any(|c| c.key == column.key);
         if duplicate {
             if !if_not_exists {
-                let detail = format!("ALTER TABLE {} ADD COLUMN {}: column already exists", table.display, column.display);
+                let detail = format!(
+                    "ALTER TABLE {} ADD COLUMN {}: column already exists",
+                    table.display, column.display
+                );
                 self.note(origin, NoteKind::DuplicateColumn, detail);
             }
             return;
@@ -310,7 +353,10 @@ impl Folder {
             return true;
         }
         if self.ghosts.contains(&table.key) {
-            let detail = format!("ALTER TABLE {} — its CREATE was skipped, table not analyzed", table.display);
+            let detail = format!(
+                "ALTER TABLE {} — its CREATE was skipped, table not analyzed",
+                table.display
+            );
             self.note(origin, NoteKind::AlterSkippedTable, detail);
         } else {
             let detail = format!(
@@ -352,7 +398,11 @@ impl Folder {
     }
 
     fn note(&mut self, origin: &Origin, kind: NoteKind, detail: String) {
-        self.notes.push(Note { origin: origin.clone(), kind, detail });
+        self.notes.push(Note {
+            origin: origin.clone(),
+            kind,
+            detail,
+        });
     }
 }
 

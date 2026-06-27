@@ -9,7 +9,9 @@ pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
     files.sort_by(|a, b| {
-        a.parent().cmp(&b.parent()).then_with(|| crate::version::compare(file_name(a), file_name(b)))
+        a.parent()
+            .cmp(&b.parent())
+            .then_with(|| crate::version::compare(file_name(a), file_name(b)))
     });
     Ok(files)
 }
@@ -34,7 +36,10 @@ fn file_name(path: &Path) -> &str {
 
 pub fn read_source(path: &Path) -> io::Result<SqlSource> {
     let bytes = std::fs::read(path)?;
-    Ok(SqlSource { name: path.display().to_string(), sql: String::from_utf8_lossy(&bytes).into_owned() })
+    Ok(SqlSource {
+        name: path.display().to_string(),
+        sql: String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 /// The five-line adopter integration: point it at a migrations directory (e.g. in a `#[test]` or
@@ -45,7 +50,10 @@ pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysi
     for path in collect_sql_files(dir)? {
         let bytes = std::fs::read(&path)?;
         let name = path.strip_prefix(dir).unwrap_or(&path).display().to_string();
-        sources.push(SqlSource { name, sql: String::from_utf8_lossy(&bytes).into_owned() });
+        sources.push(SqlSource {
+            name,
+            sql: String::from_utf8_lossy(&bytes).into_owned(),
+        });
     }
     Ok(analyze_sources(&sources, config))
 }

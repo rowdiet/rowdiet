@@ -44,17 +44,32 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new(assume: BTreeMap<String, AssumedKind>) -> Self {
-        Catalog { assume, session: BTreeMap::new() }
+        Catalog {
+            assume,
+            session: BTreeMap::new(),
+        }
     }
 
     /// `CREATE TYPE .. AS ENUM`: an enum value occupies four bytes on disk (typecmds.c DefineEnum).
     pub fn define_enum(&mut self, key: String) {
-        self.session.insert(key, SessionEntry { kind: ColumnKind::Fixed { len: 4, align: Align::Int }, known: true });
+        self.session.insert(
+            key,
+            SessionEntry {
+                kind: ColumnKind::Fixed {
+                    len: 4,
+                    align: Align::Int,
+                },
+                known: true,
+            },
+        );
     }
 
     /// `CREATE TYPE .. AS (..)`: composite columns are varlena, double-aligned.
     pub fn define_composite(&mut self, key: String) {
-        let kind = ColumnKind::Varlena { align: Align::Double, proven_short: false };
+        let kind = ColumnKind::Varlena {
+            align: Align::Double,
+            proven_short: false,
+        };
         self.session.insert(key, SessionEntry { kind, known: true });
     }
 
@@ -64,20 +79,32 @@ impl Catalog {
             Some(sub) => (range_align(sub.kind.align()), sub.known),
             None => (Align::Int, false),
         };
-        let kind = ColumnKind::Varlena { align, proven_short: false };
+        let kind = ColumnKind::Varlena {
+            align,
+            proven_short: false,
+        };
         self.session.insert(key, SessionEntry { kind, known });
     }
 
     /// `CREATE DOMAIN .. AS base`: inherits the base type's storage verbatim (DefineDomain).
     pub fn define_domain(&mut self, key: String, base: &TypeRef) {
         let resolved = self.resolve(base);
-        self.session.insert(key, SessionEntry { kind: resolved.kind, known: resolved.known });
+        self.session.insert(
+            key,
+            SessionEntry {
+                kind: resolved.kind,
+                known: resolved.known,
+            },
+        );
     }
 
     /// `CREATE TYPE name (INPUT = ..)` or a shell type: alignment is declared in options we do not
     /// evaluate — keep the sound default and stay flagged.
     pub fn define_shell(&mut self, key: String) {
-        let kind = ColumnKind::Varlena { align: Align::Int, proven_short: false };
+        let kind = ColumnKind::Varlena {
+            align: Align::Int,
+            proven_short: false,
+        };
         self.session.insert(key, SessionEntry { kind, known: false });
     }
 
@@ -88,27 +115,51 @@ impl Catalog {
     pub fn resolve(&self, t: &TypeRef) -> Resolved {
         if t.dims > 0 {
             let elem = self.resolve_scalar(&t.key, None);
-            let kind = ColumnKind::Varlena { align: range_align(elem.kind.align()), proven_short: false };
-            return Resolved { kind, known: elem.known, implicit_not_null: false };
+            let kind = ColumnKind::Varlena {
+                align: range_align(elem.kind.align()),
+                proven_short: false,
+            };
+            return Resolved {
+                kind,
+                known: elem.known,
+                implicit_not_null: false,
+            };
         }
         self.resolve_scalar(&t.key, t.char_len)
     }
 
     fn resolve_scalar(&self, key: &str, char_len: Option<u64>) -> Resolved {
         if let Some(entry) = self.session.get(key) {
-            return Resolved { kind: entry.kind, known: entry.known, implicit_not_null: false };
+            return Resolved {
+                kind: entry.kind,
+                known: entry.known,
+                implicit_not_null: false,
+            };
         }
         if let Some(assumed) = self.assume.get(key) {
             let kind = match assumed {
-                AssumedKind::Fixed { len, align } => ColumnKind::Fixed { len: *len, align: *align },
-                AssumedKind::Varlena { align } => ColumnKind::Varlena { align: *align, proven_short: false },
+                AssumedKind::Fixed { len, align } => ColumnKind::Fixed {
+                    len: *len,
+                    align: *align,
+                },
+                AssumedKind::Varlena { align } => ColumnKind::Varlena {
+                    align: *align,
+                    proven_short: false,
+                },
             };
-            return Resolved { kind, known: true, implicit_not_null: false };
+            return Resolved {
+                kind,
+                known: true,
+                implicit_not_null: false,
+            };
         }
         match builtin(key, char_len) {
             Some(resolved) => resolved,
             None => Resolved {
-                kind: ColumnKind::Varlena { align: Align::Int, proven_short: false },
+                kind: ColumnKind::Varlena {
+                    align: Align::Int,
+                    proven_short: false,
+                },
                 known: false,
                 implicit_not_null: false,
             },
@@ -118,15 +169,38 @@ impl Catalog {
 
 /// Arrays and ranges alike: d iff the element/subtype is d-aligned, else i.
 fn range_align(elem: Align) -> Align {
-    if elem == Align::Double { Align::Double } else { Align::Int }
+    if elem == Align::Double {
+        Align::Double
+    } else {
+        Align::Int
+    }
 }
 
 fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
-    let fixed = |len, align| Some(Resolved { kind: ColumnKind::Fixed { len, align }, known: true, implicit_not_null: false });
-    let varlena = |align| {
-        Some(Resolved { kind: ColumnKind::Varlena { align, proven_short: false }, known: true, implicit_not_null: false })
+    let fixed = |len, align| {
+        Some(Resolved {
+            kind: ColumnKind::Fixed { len, align },
+            known: true,
+            implicit_not_null: false,
+        })
     };
-    let serial = |len, align| Some(Resolved { kind: ColumnKind::Fixed { len, align }, known: true, implicit_not_null: true });
+    let varlena = |align| {
+        Some(Resolved {
+            kind: ColumnKind::Varlena {
+                align,
+                proven_short: false,
+            },
+            known: true,
+            implicit_not_null: false,
+        })
+    };
+    let serial = |len, align| {
+        Some(Resolved {
+            kind: ColumnKind::Fixed { len, align },
+            known: true,
+            implicit_not_null: true,
+        })
+    };
     match key {
         // Verified against pg_type.dat in the spike research (64-bit, MAXALIGN 8).
         "bool" => fixed(1, Align::Char),
@@ -155,7 +229,10 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         // typmod can PROVE short form: n <= 31 chars is at most 4*31+1 = 125 bytes even in
         // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned.
         "varchar" | "bpchar" => Some(Resolved {
-            kind: ColumnKind::Varlena { align: Align::Int, proven_short: char_len.is_some_and(|n| n <= 31) },
+            kind: ColumnKind::Varlena {
+                align: Align::Int,
+                proven_short: char_len.is_some_and(|n| n <= 31),
+            },
             known: true,
             implicit_not_null: false,
         }),
