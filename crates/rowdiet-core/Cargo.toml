@@ -6,6 +6,8 @@ categories = ["development-tools", "database"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Private for now — flip when shipping to crates.io.
+publish = false
 
 [dependencies]
 sqlparser.workspace = true
