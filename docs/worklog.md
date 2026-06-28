@@ -21,6 +21,8 @@
   `~/projs/rowdiet-spike/research/libpg-query-wasm-verdict.md`.
 - Bridges armed: ukb author session (research context) and bringmeto (first adopter, co-design)
   via `/tmp/agent-bridge/rowdiet/`.
+- ukb author signed off post-ship: two-tier honesty confirmed as a correction superseding AXIS 2
+  (recorded in design.md), libpg_query verdict framing endorsed, architecture stands.
 
 Next (per README roadmap): wasm webpage (step 2), libpg_query native oracle in CI, curated
 extension type map, in-group exact search for multi-irregular tables, squawk upstream offer.

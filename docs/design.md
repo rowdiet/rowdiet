@@ -43,7 +43,11 @@ byte-guaranteed — payload lengths shift downstream pads in both orders. There 
 provable fact recorded here for a future refinement: with the tail sequence preserved, the
 realized recovery is **never negative** (induction over the walk: a running delta `D ≥ 0` before
 an item of alignment `a` becomes `D' = D + pad(x+D,a) − pad(x,a) ≥ 0`). So the current Estimate
-label is conservative, not wrong.
+label is conservative, not wrong. The spike's research author confirmed this reading on the
+bridge (2026-07-23): AXIS 2's "guaranteed component over fixed columns alone" was a hypothetical
+for the *clustered* layout — in an interleaved table a fixed column's real offset rides on the
+preceding varlena's actual length — so the two-tier shape is a correction that **supersedes the
+research letter**, not a compromise against it.
 
 Null bitmap: present per-row only when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it is display information only
