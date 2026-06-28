@@ -122,11 +122,11 @@ varlena (`bpchar`); an enum value is 4 bytes.
 
 ## Roadmap
 
-- WASM build of the same core → static paste-your-DDL webpage with a byte-ruler visualization.
-- Differential-test oracle against `libpg_query` (the real PG parser) in native CI. The wasm
-  feasibility question is settled empirically: it *builds and runs* on
-  `wasm32-unknown-emscripten` and `wasm32-wasip1`, but cannot join a wasm-bindgen module, so the
-  pure-Rust parser stays primary.
+- **Route 3 (planned in — see `docs/wasm-plan.md`):** PG-exact parsing via `libpg_query` behind
+  an off-by-default `pg-exact` feature (native consumers never compile C), doubling as a
+  differential-test oracle against the default parser; then a single Rust-linked
+  `wasm32-wasip1` module (recipe + stub headers vendored in `wasm/`) powering a static
+  paste-your-DDL webpage with a byte-ruler visualization.
 - Curated, source-verified extension type map (citext, hstore, pgvector, PostGIS, …).
 - Optional exact search within alignment groups when a table has >1 irregular-size column.
 - Offering the rule upstream to squawk once rowdiet has proven out.

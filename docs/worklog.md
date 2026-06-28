@@ -24,5 +24,11 @@
 - ukb author signed off post-ship: two-tier honesty confirmed as a correction superseding AXIS 2
   (recorded in design.md), libpg_query verdict framing endorsed, architecture stands.
 
-Next (per README roadmap): wasm webpage (step 2), libpg_query native oracle in CI, curated
-extension type map, in-group exact search for multi-irregular tables, squawk upstream offer.
+- Route 3 planned in (Sergey's call, confirmed in-session after driving the wasm researcher
+  directly): wasip1 + libpg_query behind a `pg-exact` feature for the web tier; plan in
+  docs/wasm-plan.md, proven build recipe + stub headers vendored in wasm/. The native-oracle
+  roadmap item merges into the pg-exact differential tests.
+
+Next (per README roadmap): pg-exact backend (Phase 1), rowdiet-wasm reactor module + webpage
+(Phases 2–3), curated extension type map, in-group exact search for multi-irregular tables,
+squawk upstream offer.

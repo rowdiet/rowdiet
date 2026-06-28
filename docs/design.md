@@ -124,6 +124,13 @@ the native differential-test oracle (roadmap), and a two-module hybrid (pganalyz
 JS package + the Rust core wasm) is the recorded fallback if PG-exact web parsing is ever
 required. Full verdict with recipes: `research/libpg-query-wasm-verdict.md` in the spike bundle.
 
+**Decision update (2026-07-23, Sergey — confirmed in-session after driving the researcher
+directly):** route 3 is adopted for the web tier — a single Rust-linked `wasm32-wasip1` module
+with `libpg_query` behind an off-by-default `pg-exact` feature, WASI preferred over emscripten
+for toolchain-ownership reasons. sqlparser-rs remains the default parser and native-primary
+path; the differential oracle merges into the `pg-exact` backend's test suite. Plan:
+`docs/wasm-plan.md`; rowdiet-owned build recipe + stub headers: `wasm/`.
+
 ## Platform assumption
 
 64-bit Postgres: `d` alignment = 8, `MAXALIGN` = 8. The docs hedge that `d` is "by no means all"
