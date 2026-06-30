@@ -125,7 +125,7 @@ impl Folder {
                 pk_columns,
                 if_not_exists,
                 is_ctas,
-                has_like,
+                incomplete_columns,
             } => {
                 self.create_table(
                     name,
@@ -133,7 +133,7 @@ impl Folder {
                     pk_columns,
                     if_not_exists,
                     is_ctas,
-                    has_like,
+                    incomplete_columns,
                     origin,
                     ignore_marker,
                 );
@@ -179,7 +179,7 @@ impl Folder {
         pk_columns: Vec<String>,
         if_not_exists: bool,
         is_ctas: bool,
-        has_like: bool,
+        incomplete_columns: bool,
         origin: &Origin,
         ignore_marker: bool,
     ) {
@@ -203,9 +203,9 @@ impl Folder {
             );
             self.order.retain(|key| key != &name.key);
         }
-        if has_like {
+        if incomplete_columns {
             let detail = format!(
-                "table {}: LIKE clause not expanded — column list incomplete",
+                "table {}: column list incomplete (LIKE / partition / typed-table clause not expanded)",
                 name.display
             );
             self.note(origin, NoteKind::IncompleteColumns, detail);
@@ -216,7 +216,7 @@ impl Folder {
             origin: origin.clone(),
             altered_in: Vec::new(),
             ignored: ignore_marker,
-            incomplete: has_like,
+            incomplete: incomplete_columns,
             columns: Vec::new(),
         };
         for raw in columns {

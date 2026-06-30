@@ -13,3 +13,9 @@ publish = false
 rowdiet-core = { workspace = true, features = ["serde"] }
 clap.workspace = true
 serde_json.workspace = true
+
+[features]
+# The CLI ships with both parsers so --parser pg-exact works out of the box;
+# build with --no-default-features to skip the C compile.
+default = ["pg-exact"]
+pg-exact = ["rowdiet-core/pg-exact"]

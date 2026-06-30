@@ -92,3 +92,24 @@ fn missing_path_is_an_error() {
     let out = bin().arg("no/such/path.sql").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn pg_exact_parser_matches_default() {
+    let default_run = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    let exact_run = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--format", "json", "--parser", "pg-exact"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&default_run.stdout).unwrap();
+    let e: serde_json::Value = serde_json::from_slice(&exact_run.stdout).unwrap();
+    assert_eq!(
+        d["analysis"]["tables"][0]["avoidable_bytes_per_row"],
+        e["analysis"]["tables"][0]["avoidable_bytes_per_row"]
+    );
+    assert_eq!(d["analysis"]["tables"][0]["natts"], e["analysis"]["tables"][0]["natts"]);
+}

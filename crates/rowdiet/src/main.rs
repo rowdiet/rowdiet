@@ -1,7 +1,9 @@
 mod render;
 
 use clap::{Parser, ValueEnum};
-use rowdiet_core::{analyze_sources, fs as core_fs, Align, Analysis, AssumedKind, Config, SqlSource};
+use rowdiet_core::{
+    analyze_sources_with, fs as core_fs, Align, Analysis, AssumedKind, Config, ParserBackend, SqlSource,
+};
 use std::io::Read as _;
 use std::path::Path;
 use std::process::ExitCode;
@@ -30,6 +32,9 @@ struct Cli {
     /// Teach an unknown type: NAME=varlena:ALIGN or NAME=fixed:LEN:ALIGN (align c|s|i|d); repeatable
     #[arg(long = "assume-type", value_name = "SPEC")]
     assume_type: Vec<String>,
+    /// Parser backend: pure-Rust sqlparser (default) or the real PG17 grammar via libpg_query
+    #[arg(long, value_enum, default_value_t = ParserChoice::Sqlparser)]
+    parser: ParserChoice,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -37,6 +42,22 @@ enum Format {
     Text,
     Json,
     Github,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ParserChoice {
+    Sqlparser,
+    PgExact,
+}
+
+fn backend(choice: ParserChoice) -> Result<ParserBackend, String> {
+    match choice {
+        ParserChoice::Sqlparser => Ok(ParserBackend::Sqlparser),
+        #[cfg(feature = "pg-exact")]
+        ParserChoice::PgExact => Ok(ParserBackend::PgExact),
+        #[cfg(not(feature = "pg-exact"))]
+        ParserChoice::PgExact => Err("this rowdiet binary was built without the pg-exact feature".to_string()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -53,7 +74,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     let config = build_config(&cli.assume_type)?;
     let sources = gather_sources(&cli.paths)?;
-    let analysis = analyze_sources(&sources, &config);
+    let analysis = analyze_sources_with(backend(cli.parser)?, &sources, &config);
     let gate = gate_exceeded(&analysis, cli.fail_over);
     let output = match cli.format {
         Format::Text => render::text(&analysis, cli.rows, cli.suggest, cli.fail_over),

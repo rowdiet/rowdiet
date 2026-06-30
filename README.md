@@ -63,6 +63,7 @@ rowdiet migrations/ --format github          # GitHub Actions annotations
 rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
 rowdiet migrations/ --assume-type vector=varlena:d   # teach extension types
+rowdiet migrations/ --parser pg-exact        # parse with the real PG17 grammar (libpg_query)
 ```
 
 Exit codes: `0` clean, `1` gate exceeded, `2` operational error. Exempt a deliberate layout with
@@ -117,16 +118,17 @@ varlena (`bpchar`); an enum value is 4 bytes.
   natts/null-bitmap residue.
 - Known sqlparser gaps (`DO $$…$$` bodies, `integer ARRAY` keyword form, `LIKE … INCLUDING`)
   are skipped per-statement with a note; `CREATE UNLOGGED TABLE` is handled by keyword strip.
+  The `pg-exact` backend (`--parser pg-exact`) parses all of these natively.
 - `--suggest` prints a reordered `CREATE TABLE` skeleton; it never rewrites files (editing an
   applied migration breaks Flyway checksums / refinery divergence checks).
 
 ## Roadmap
 
-- **Route 3 (planned in — see `docs/wasm-plan.md`):** PG-exact parsing via `libpg_query` behind
-  an off-by-default `pg-exact` feature (native consumers never compile C), doubling as a
-  differential-test oracle against the default parser; then a single Rust-linked
-  `wasm32-wasip1` module (recipe + stub headers vendored in `wasm/`) powering a static
-  paste-your-DDL webpage with a byte-ruler visualization.
+- **Route 3 (see `docs/wasm-plan.md`):** Phase 1 is shipped — PG-exact parsing via `libpg_query`
+  behind an off-by-default `pg-exact` core feature (native lib consumers never compile C),
+  swappable per call and doubling as the differential-test oracle. Remaining: a single
+  Rust-linked `wasm32-wasip1` module (recipe + stub headers vendored in `wasm/`) powering a
+  static paste-your-DDL webpage with a byte-ruler visualization.
 - Curated, source-verified extension type map (citext, hstore, pgvector, PostGIS, …).
 - Optional exact search within alignment groups when a table has >1 irregular-size column.
 - Offering the rule upstream to squawk once rowdiet has proven out.

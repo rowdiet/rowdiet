@@ -21,6 +21,8 @@
 
 pub mod catalog;
 pub mod extract;
+#[cfg(feature = "pg-exact")]
+pub mod extract_pgq;
 pub mod fold;
 #[cfg(feature = "fs")]
 pub mod fs;
@@ -51,9 +53,25 @@ pub struct SqlSource {
 /// A statement whose text contains this marker is exempt from the gate (still listed, as ignored).
 pub const IGNORE_MARKER: &str = "rowdiet:ignore";
 
+/// Which parser produces the `DdlOp` stream. Both feed the identical fold/layout/report pipeline,
+/// so backends are swappable per call — useful for hacking and for the differential oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParserBackend {
+    /// Pure-Rust sqlparser (the default; the wasm-bindgen-compatible path).
+    #[default]
+    Sqlparser,
+    /// The real PostgreSQL 17 grammar via libpg_query (native / wasip1 targets only).
+    #[cfg(feature = "pg-exact")]
+    PgExact,
+}
+
 /// Analyze SQL sources in the given order (callers pass migration files version-sorted; see
 /// [`version::compare`] and [`fs::analyze_dir`]).
 pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
+    analyze_sources_with(ParserBackend::Sqlparser, sources, config)
+}
+
+pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], config: &Config) -> Analysis {
     let mut folder = fold::Folder::new(config.assume.clone());
     for source in sources {
         for raw in split::split(&source.sql) {
@@ -62,8 +80,12 @@ pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
                 line: raw.line,
             };
             let ignore_marker = raw.text.contains(IGNORE_MARKER);
-            let prepared = extract::preprocess(&raw.text);
-            match extract::extract(&prepared) {
+            let extracted = match backend {
+                ParserBackend::Sqlparser => extract::extract(&extract::preprocess(&raw.text)),
+                #[cfg(feature = "pg-exact")]
+                ParserBackend::PgExact => extract_pgq::extract(&raw.text),
+            };
+            match extracted {
                 Ok(ops) => folder.apply(ops, &origin, ignore_marker),
                 Err(error) => folder.skipped(&origin, error, extract::sniff(&raw.text)),
             }

@@ -130,3 +130,190 @@ fn analysis_serializes() {
     let json = serde_json::to_string(&analysis).unwrap();
     assert!(json.contains("\"avoidable_bytes_per_row\""));
 }
+
+/// The pg-exact backend doubles as the differential oracle: both parsers must produce the same
+/// DdlOps (modulo display text) and the same analysis numbers over everything both can parse.
+#[cfg(feature = "pg-exact")]
+mod differential {
+    use crate::catalog::TypeRef;
+    use crate::extract::{DdlOp, RawColumn, RawName};
+    use crate::{analyze_sources_with, extract, extract_pgq, Config, ParserBackend, SqlSource};
+
+    const CORPUS: &[&str] = &[
+        "CREATE TABLE account (active boolean NOT NULL, id bigint PRIMARY KEY, kind smallint NOT NULL, balance bigint NOT NULL)",
+        "CREATE TABLE ints (a int, b integer, c int4, d int8, e bigint, f smallint, g real, h double precision, i float4, j float8)",
+        "CREATE TABLE chars (a varchar(255), b character varying(31), c char(10), d char, e varchar, f text)",
+        "CREATE TABLE times (a timestamptz, b timestamp with time zone, c timestamp(6) without time zone, d time, e time(3) with time zone, f timetz, g date, h interval)",
+        "CREATE TABLE nums (a numeric(10,2), b decimal(12,4), c numeric, d bit(4), e bit varying(8))",
+        "CREATE TABLE arrs (a int[], b bigint[], c double precision[][], d numeric(10,2)[], e varchar(16)[], f text[])",
+        "CREATE TABLE serials (id bigserial PRIMARY KEY, n serial, m smallserial)",
+        "CREATE TABLE nn (a int NOT NULL, b int GENERATED ALWAYS AS IDENTITY, c int, PRIMARY KEY (a, c))",
+        "CREATE TABLE cu (a my_schema.status_enum, b citext, c vector(768), d tstzrange, e int4range, f inet, g macaddr, h money, i oid, j xml, k tsvector, l point, m uuid, n jsonb, o bytea)",
+        "CREATE TABLE \"my schema\".\"My Table\" (\"select\" int, \"Weird Col\" text, UnQuoted int)",
+        "CREATE TABLE t4 (a text DEFAULT 'x; y', b int)",
+        "CREATE TEMPORARY TABLE tmp (a int)",
+        "ALTER TABLE t ADD COLUMN z timestamptz NOT NULL",
+        "ALTER TABLE t ADD COLUMN IF NOT EXISTS w int",
+        "ALTER TABLE t ADD COLUMN x int, ADD COLUMN y text",
+        "ALTER TABLE t DROP COLUMN a",
+        "ALTER TABLE t RENAME COLUMN a TO b",
+        "ALTER TABLE t RENAME TO u",
+        "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN c SET NOT NULL",
+        "ALTER TABLE t ALTER COLUMN c DROP NOT NULL",
+        "ALTER TABLE t ADD PRIMARY KEY (a)",
+        "ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (a)",
+        "CREATE TYPE status AS ENUM ('a','b')",
+        "CREATE TYPE pair AS (x int, y int)",
+        "CREATE TYPE br AS RANGE (SUBTYPE = int8)",
+        "CREATE DOMAIN code AS varchar(20)",
+        "DROP TABLE IF EXISTS a, b",
+        "DROP TYPE status",
+        "CREATE INDEX i ON t (a)",
+    ];
+
+    fn norm_name(n: RawName) -> RawName {
+        RawName {
+            display: n.key.clone(),
+            key: n.key,
+        }
+    }
+
+    fn norm_type(t: TypeRef) -> TypeRef {
+        TypeRef {
+            display: format!("{}/{}", t.key, t.dims),
+            key: t.key,
+            char_len: t.char_len,
+            dims: t.dims,
+        }
+    }
+
+    fn norm_col(c: RawColumn) -> RawColumn {
+        RawColumn {
+            display: c.key.clone(),
+            key: c.key,
+            type_ref: norm_type(c.type_ref),
+            not_null: c.not_null,
+        }
+    }
+
+    fn norm(op: DdlOp) -> DdlOp {
+        match op {
+            DdlOp::CreateTable {
+                name,
+                columns,
+                pk_columns,
+                if_not_exists,
+                is_ctas,
+                incomplete_columns,
+            } => DdlOp::CreateTable {
+                name: norm_name(name),
+                columns: columns.into_iter().map(norm_col).collect(),
+                pk_columns,
+                if_not_exists,
+                is_ctas,
+                incomplete_columns,
+            },
+            DdlOp::AddColumn {
+                table,
+                column,
+                if_not_exists,
+            } => DdlOp::AddColumn {
+                table: norm_name(table),
+                column: norm_col(column),
+                if_not_exists,
+            },
+            DdlOp::DropColumns {
+                table,
+                columns,
+                if_exists,
+            } => DdlOp::DropColumns {
+                table: norm_name(table),
+                columns,
+                if_exists,
+            },
+            DdlOp::RenameColumn { table, old, new } => DdlOp::RenameColumn {
+                table: norm_name(table),
+                old,
+                new,
+            },
+            DdlOp::RenameTable { table, new } => DdlOp::RenameTable {
+                table: norm_name(table),
+                new: norm_name(new),
+            },
+            DdlOp::SetColumnType {
+                table,
+                column,
+                type_ref,
+            } => DdlOp::SetColumnType {
+                table: norm_name(table),
+                column,
+                type_ref: norm_type(type_ref),
+            },
+            DdlOp::SetNotNull { table, column, value } => DdlOp::SetNotNull {
+                table: norm_name(table),
+                column,
+                value,
+            },
+            DdlOp::DropTables { names, if_exists } => DdlOp::DropTables {
+                names: names.into_iter().map(norm_name).collect(),
+                if_exists,
+            },
+            DdlOp::CreateEnum { name } => DdlOp::CreateEnum { name: norm_name(name) },
+            DdlOp::CreateComposite { name } => DdlOp::CreateComposite { name: norm_name(name) },
+            DdlOp::CreateRange { name, subtype } => DdlOp::CreateRange {
+                name: norm_name(name),
+                subtype: subtype.map(norm_type),
+            },
+            DdlOp::CreateBase { name } => DdlOp::CreateBase { name: norm_name(name) },
+            DdlOp::CreateDomain { name, base } => DdlOp::CreateDomain {
+                name: norm_name(name),
+                base: norm_type(base),
+            },
+            DdlOp::DropTypes { names } => DdlOp::DropTypes {
+                names: names.into_iter().map(norm_name).collect(),
+            },
+            DdlOp::Irrelevant => DdlOp::Irrelevant,
+        }
+    }
+
+    #[test]
+    fn backends_agree_on_extracted_ops() {
+        for sql in CORPUS {
+            let via_sqlparser: Vec<DdlOp> = extract::extract(&extract::preprocess(sql))
+                .expect(sql)
+                .into_iter()
+                .map(norm)
+                .collect();
+            let via_pgq: Vec<DdlOp> = extract_pgq::extract(sql).expect(sql).into_iter().map(norm).collect();
+            assert_eq!(via_sqlparser, via_pgq, "{sql}");
+        }
+    }
+
+    #[test]
+    fn backends_agree_on_full_analysis() {
+        let sources = vec![
+            SqlSource {
+                name: "V1__init.sql".into(),
+                sql: "CREATE TYPE order_status AS ENUM ('new','paid');\nCREATE UNLOGGED TABLE orders (flag boolean NOT NULL, id bigint PRIMARY KEY, status order_status NOT NULL, note text);".into(),
+            },
+            SqlSource {
+                name: "V2__add.sql".into(),
+                sql: "ALTER TABLE orders ADD COLUMN created_at timestamptz NOT NULL, ADD COLUMN meta jsonb;".into(),
+            },
+        ];
+        let a = analyze_sources_with(ParserBackend::Sqlparser, &sources, &Config::default());
+        let b = analyze_sources_with(ParserBackend::PgExact, &sources, &Config::default());
+        assert_eq!(a.tables.len(), b.tables.len());
+        for (x, y) in a.tables.iter().zip(&b.tables) {
+            assert_eq!(x.name, y.name);
+            assert_eq!(x.natts, y.natts, "{}", x.name);
+            assert_eq!(x.tier, y.tier);
+            assert_eq!(x.current.padding, y.current.padding);
+            assert_eq!(x.suggested.padding, y.suggested.padding);
+            assert_eq!(x.avoidable_bytes_per_row, y.avoidable_bytes_per_row);
+            assert_eq!(x.suggested_order, y.suggested_order);
+            assert_eq!(x.any_nullable, y.any_nullable);
+        }
+    }
+}

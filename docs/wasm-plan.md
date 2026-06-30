@@ -11,7 +11,12 @@ What does **not** change: `sqlparser-rs` stays the default parser and the native
 adopters of `rowdiet-core` never compile C unless they opt in. `extract.rs` already isolates the
 parser behind the `DdlOp` boundary; route 3 slots a second backend behind the same boundary.
 
-## Phase 1 — `pg-exact` feature in rowdiet-core
+## Phase 1 — `pg-exact` feature in rowdiet-core — **DONE (2026-07-23)**
+
+Landed same-day at Sergey's request ("swappable parsers while we are hacking"): everything below
+is implemented, plus a CLI `--parser sqlparser|pg-exact` flag (the CLI builds with the feature by
+default; `--no-default-features` skips the C compile). The differential suite runs a 30-statement
+corpus op-for-op and a full-analysis comparison across both backends.
 
 - Optional dependency `pg_query = "=6.1.1"` behind feature `pg-exact` (off by default,
   not in `default`).

@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 sqlparser.workspace = true
 serde = { workspace = true, optional = true }
+# PG17 grammar, native-only (C build); powers the pg-exact backend + differential oracle.
+pg_query = { version = "=6.1.1", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -20,3 +22,4 @@ serde_json.workspace = true
 default = ["fs"]
 fs = []
 serde = ["dep:serde"]
+pg-exact = ["dep:pg_query"]

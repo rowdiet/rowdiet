@@ -29,6 +29,13 @@
   docs/wasm-plan.md, proven build recipe + stub headers vendored in wasm/. The native-oracle
   roadmap item merges into the pg-exact differential tests.
 
-Next (per README roadmap): pg-exact backend (Phase 1), rowdiet-wasm reactor module + webpage
-(Phases 2–3), curated extension type map, in-group exact search for multi-irregular tables,
-squawk upstream offer.
+- Phase 1 landed same-day (Sergey: "swappable parsers while we are hacking"): `pg-exact` core
+  feature (optional pg_query =6.1.1), `extract_pgq` backend mapping the PG17 raw parse tree onto
+  the same DdlOp boundary, `ParserBackend` + `analyze_sources_with`, CLI `--parser` flag (CLI
+  default-features include pg-exact; lib stays off-by-default). Differential oracle: 30-statement
+  corpus op-equality + full-analysis agreement across backends. 106 tests green; the pg-exact
+  path parses every known sqlparser gap natively (DO $$, integer ARRAY, UNLOGGED, LIKE INCLUDING,
+  PARTITION OF).
+
+Next (per README roadmap): rowdiet-wasm reactor module + webpage (Phases 2–3), curated extension
+type map, in-group exact search for multi-irregular tables, squawk upstream offer.
