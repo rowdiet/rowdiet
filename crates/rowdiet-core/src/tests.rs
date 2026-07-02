@@ -76,18 +76,29 @@ fn ignore_marker_flags_table() {
 
 #[test]
 fn unknown_type_assumed_and_teachable() {
-    let sql = "CREATE TABLE t (v vector(768), id bigint NOT NULL);";
+    let sql = "CREATE TABLE t (v wat_type(768), id bigint NOT NULL);";
     let analysis = analyze_sources(&[src("V1__v.sql", sql)], &Config::default());
     let t = &analysis.tables[0];
-    assert_eq!(t.assumed_types, vec!["vector(768)"]);
+    assert_eq!(t.assumed_types, vec!["wat_type(768)"]);
     assert!(analysis.notes.iter().any(|n| n.kind == NoteKind::UnknownType));
     let mut config = Config::default();
     config
         .assume
-        .insert("vector".into(), AssumedKind::Varlena { align: Align::Double });
+        .insert("wat_type".into(), AssumedKind::Varlena { align: Align::Double });
     let taught = analyze_sources(&[src("V1__v.sql", sql)], &config);
     assert!(taught.tables[0].assumed_types.is_empty());
     assert!(taught.notes.is_empty());
+}
+
+#[test]
+fn pgvector_columns_resolve_verified() {
+    let sql = "CREATE TABLE emb (id bigint NOT NULL, v vector(768) NOT NULL);";
+    let analysis = analyze_sources(&[src("V1__emb.sql", sql)], &Config::default());
+    let t = &analysis.tables[0];
+    assert!(t.assumed_types.is_empty());
+    assert!(analysis.notes.is_empty());
+    assert_eq!(t.tier, Tier::Estimate);
+    assert_eq!(t.avoidable_bytes_per_row, 0);
 }
 
 #[test]

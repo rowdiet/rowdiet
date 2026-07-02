@@ -56,7 +56,8 @@ closed webpage with no CI story).
 ## Install & use
 
 ```sh
-cargo install rowdiet            # or build from this repo: cargo build --release
+cargo install rowdiet            # or from a checkout: cargo install --path crates/rowdiet
+cargo rowdiet migrations/        # installs a cargo subcommand too (cargo-rowdiet)
 rowdiet migrations/                          # report
 rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row
 rowdiet migrations/ --format github          # GitHub Actions annotations

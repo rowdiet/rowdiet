@@ -55,7 +55,7 @@ fn session_enum_resolves_columns() {
 
 #[test]
 fn unknown_type_noted_once() {
-    let (tables, notes) = folded(&["CREATE TABLE t (a citext, b citext)"]);
+    let (tables, notes) = folded(&["CREATE TABLE t (a wat_type, b wat_type)"]);
     assert!(!tables[0].columns[0].known_type);
     assert_eq!(notes.iter().filter(|n| n.kind == NoteKind::UnknownType).count(), 1);
 }

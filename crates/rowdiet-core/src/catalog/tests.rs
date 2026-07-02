@@ -161,7 +161,7 @@ fn serial_implies_not_null() {
 
 #[test]
 fn unknown_defaults_flagged() {
-    let r = cat().resolve(&t("citext"));
+    let r = cat().resolve(&t("wat_type"));
     assert_eq!(
         r.kind,
         ColumnKind::Varlena {
@@ -170,6 +170,37 @@ fn unknown_defaults_flagged() {
         }
     );
     assert!(!r.known);
+}
+
+#[test]
+fn assume_specs_parse() {
+    assert_eq!(
+        parse_assume_spec("vector=varlena:d").unwrap(),
+        ("vector".to_string(), AssumedKind::Varlena { align: Align::Double })
+    );
+    assert_eq!(
+        parse_assume_spec("Foo=fixed:16:c").unwrap(),
+        ("foo".to_string(), AssumedKind::Fixed { len: 16, align: Align::Char })
+    );
+    assert!(parse_assume_spec("nope").is_err());
+    assert!(parse_assume_spec("x=fixed:banana:c").is_err());
+    assert!(parse_assume_spec("x=varlena:z").is_err());
+}
+
+#[test]
+fn curated_extension_types_are_verified() {
+    for key in ["citext", "hstore", "vector", "halfvec", "sparsevec"] {
+        let r = cat().resolve(&t(key));
+        assert_eq!(
+            r.kind,
+            ColumnKind::Varlena {
+                align: Align::Int,
+                proven_short: false
+            },
+            "{key}"
+        );
+        assert!(r.known, "{key}");
+    }
 }
 
 #[test]

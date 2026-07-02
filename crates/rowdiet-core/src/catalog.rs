@@ -167,6 +167,33 @@ impl Catalog {
     }
 }
 
+/// Parse a `NAME=varlena:ALIGN` / `NAME=fixed:LEN:ALIGN` assumption spec (align c|s|i|d).
+/// Shared by the CLI `--assume-type` flag and the wasm module's JSON config.
+pub fn parse_assume_spec(spec: &str) -> Result<(String, AssumedKind), String> {
+    let usage = || format!("assume-type `{spec}`: expected NAME=varlena:ALIGN or NAME=fixed:LEN:ALIGN");
+    let (name, rest) = spec.split_once('=').ok_or_else(usage)?;
+    let parts: Vec<&str> = rest.split(':').collect();
+    let kind = match parts.as_slice() {
+        ["varlena", align] => AssumedKind::Varlena { align: parse_align(align)? },
+        ["fixed", len, align] => AssumedKind::Fixed {
+            len: len.parse().map_err(|_| format!("assume-type `{spec}`: bad length `{len}`"))?,
+            align: parse_align(align)?,
+        },
+        _ => return Err(usage()),
+    };
+    Ok((name.trim().to_lowercase(), kind))
+}
+
+fn parse_align(s: &str) -> Result<Align, String> {
+    match s {
+        "c" | "char" => Ok(Align::Char),
+        "s" | "short" => Ok(Align::Short),
+        "i" | "int" => Ok(Align::Int),
+        "d" | "double" => Ok(Align::Double),
+        other => Err(format!("bad alignment `{other}` (use c|s|i|d)")),
+    }
+}
+
 /// Arrays and ranges alike: d iff the element/subtype is d-aligned, else i.
 fn range_align(elem: Align) -> Align {
     if elem == Align::Double {
@@ -252,6 +279,11 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         "serial" | "serial4" => serial(4, Align::Int),
         "bigserial" | "serial8" => serial(8, Align::Double),
         "smallserial" | "serial2" => serial(2, Align::Short),
+        // Curated extension types, verified 2026-07-23 from their CREATE TYPE definitions:
+        // pgvector sql/vector.sql, contrib/citext, contrib/hstore. None declare ALIGNMENT, so
+        // all take CREATE TYPE's int4 default with variable length — same storage class as our
+        // unknown-type assumption, verified rather than assumed.
+        "citext" | "hstore" | "vector" | "halfvec" | "sparsevec" => varlena(Align::Int),
         _ => None,
     }
 }

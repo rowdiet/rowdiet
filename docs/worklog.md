@@ -37,5 +37,15 @@
   path parses every known sqlparser gap natively (DO $$, integer ARRAY, UNLOGGED, LIKE INCLUDING,
   PARTITION OF).
 
-Next (per README roadmap): rowdiet-wasm reactor module + webpage (Phases 2–3), curated extension
-type map, in-group exact search for multi-irregular tables, squawk upstream offer.
+- Near-term batch (same day): curated extension types verified from source (pgvector
+  vector/halfvec/sparsevec, citext, hstore — none declare ALIGNMENT → int4 default, confirming
+  the never-guess-`d` rule); `cargo-rowdiet` subcommand (CLI logic moved to a lib shared by both
+  bins); assume-spec parsing moved into core (`catalog::parse_assume_spec`) for wasm reuse.
+- First real-corpus validation: bringmeto (11 tables / 4 crates) fully clean — 0 avoidable,
+  0 unknown types (vector resolves verified); ukb: 3 real findings (tmp_credentials 4 B/row,
+  ledger account 8 B/row, ledger_transaction 4 B/row), partition children honestly flagged
+  incomplete, drop-column residue note fired on a real migration. Parser comparison on real DDL:
+  identical numbers; sqlparser's only miss is one DO-block skip (pg-exact parses it).
+
+Next (per README roadmap): rowdiet-wasm reactor module + webpage (Phases 2–3), in-group exact
+search for multi-irregular tables, squawk upstream offer.

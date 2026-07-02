@@ -94,6 +94,20 @@ fn missing_path_is_an_error() {
 }
 
 #[test]
+fn cargo_subcommand_shim() {
+    let ok = Command::new(env!("CARGO_BIN_EXE_cargo-rowdiet"))
+        .args(["rowdiet", &fixtures("optimal"), "--fail-over", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(ok.status.code(), Some(0));
+    let gated = Command::new(env!("CARGO_BIN_EXE_cargo-rowdiet"))
+        .args(["rowdiet", &fixtures("wasteful"), "--fail-over", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(gated.status.code(), Some(1));
+}
+
+#[test]
 fn pg_exact_parser_matches_default() {
     let default_run = bin()
         .arg(fixtures("wasteful"))
