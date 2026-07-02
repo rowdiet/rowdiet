@@ -1,0 +1,20 @@
+[package]
+name = "rowdiet-wasm"
+description = "wasip1 reactor module: rowdiet analysis behind a minimal C ABI, for the static webpage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rowdiet-core = { workspace = true, default-features = false, features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# The web build wants the real PG17 grammar; disable to get a sqlparser-only module.
+default = ["pg-exact"]
+pg-exact = ["rowdiet-core/pg-exact"]

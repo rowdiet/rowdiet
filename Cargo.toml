@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/rowdiet-core", "crates/rowdiet"]
+members = ["crates/rowdiet-core", "crates/rowdiet", "crates/rowdiet-wasm"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+# Size-tuned profile for wasm artifacts (wasm/build-wasip1.sh builds with --profile wasm).
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
 
 [workspace.dependencies]
 rowdiet-core = { path = "crates/rowdiet-core", version = "0.1.0" }

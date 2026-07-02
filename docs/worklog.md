@@ -47,5 +47,12 @@
   incomplete, drop-column residue note fired on a real migration. Parser comparison on real DDL:
   identical numbers; sqlparser's only miss is one DO-block skip (pg-exact parses it).
 
-Next (per README roadmap): rowdiet-wasm reactor module + webpage (Phases 2–3), in-group exact
-search for multi-irregular tables, squawk upstream offer.
+- Phase 2 built (same day): crates/rowdiet-wasm — reactor cdylib (rowdiet_alloc/free/lint,
+  provisional length-prefixed ABI) + rowdiet-smoke command bin, wasm/build-wasip1.sh with a
+  size-tuned `wasm` profile. Verified under wasmtime: full pipeline with the real PG17 parser in
+  wasm (DO-block DDL parses; numbers match native); reactor exports answer via --invoke. Sizes:
+  smoke 1.92 MB raw / 388 KB gz (matches spike); cdylib 857 KB gz (wasm-opt pass = Phase-3 TODO).
+  Adoption asks with real corpus numbers posted to bringmeto and ukb (cargo-rowdiet plugin).
+
+Next: Phase 3 (webpage: browser_wasi_shim pin + ~100-line loader + byte-ruler page; ABI finalize
+after ukb's research reply; wasm-opt/export pruning), in-group exact search, squawk upstream.

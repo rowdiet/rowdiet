@@ -180,7 +180,13 @@ fn assume_specs_parse() {
     );
     assert_eq!(
         parse_assume_spec("Foo=fixed:16:c").unwrap(),
-        ("foo".to_string(), AssumedKind::Fixed { len: 16, align: Align::Char })
+        (
+            "foo".to_string(),
+            AssumedKind::Fixed {
+                len: 16,
+                align: Align::Char
+            }
+        )
     );
     assert!(parse_assume_spec("nope").is_err());
     assert!(parse_assume_spec("x=fixed:banana:c").is_err());

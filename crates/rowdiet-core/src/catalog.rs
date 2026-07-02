@@ -174,9 +174,13 @@ pub fn parse_assume_spec(spec: &str) -> Result<(String, AssumedKind), String> {
     let (name, rest) = spec.split_once('=').ok_or_else(usage)?;
     let parts: Vec<&str> = rest.split(':').collect();
     let kind = match parts.as_slice() {
-        ["varlena", align] => AssumedKind::Varlena { align: parse_align(align)? },
+        ["varlena", align] => AssumedKind::Varlena {
+            align: parse_align(align)?,
+        },
         ["fixed", len, align] => AssumedKind::Fixed {
-            len: len.parse().map_err(|_| format!("assume-type `{spec}`: bad length `{len}`"))?,
+            len: len
+                .parse()
+                .map_err(|_| format!("assume-type `{spec}`: bad length `{len}`"))?,
             align: parse_align(align)?,
         },
         _ => return Err(usage()),

@@ -33,7 +33,16 @@ corpus op-for-op and a full-analysis comparison across both backends.
   degradation); libpg_query itself parses whole scripts, but per-statement feeding preserves
   rowdiet's loud-skip contract and origin tracking.
 
-## Phase 2 — `crates/rowdiet-wasm` (wasip1 reactor module)
+## Phase 2 — `crates/rowdiet-wasm` (wasip1 reactor module) — **BUILT (2026-07-23)**
+
+Landed: the reactor cdylib + a smoke command-bin, built by `wasm/build-wasip1.sh` (size-tuned
+`wasm` cargo profile). Verified under wasmtime: the smoke bin runs the full pipeline with the
+real PG17 parser in wasm (DO-block DDL parses, numbers match native), and the reactor's exports
+answer via `--invoke`. Sizes: smoke 1.92 MB raw / 388 KB gzip (matches the spike measurement);
+cdylib 3.65 MB raw / 857 KB gzip — a wasm-opt / export-pruning pass is a Phase-3 TODO. ABI is
+provisional v1 (length-prefixed buffers) pending the ukb author's reactor-ABI research reply;
+hosts must use the shim's `initialize()` path, never `start()`. Still open here: pin
+`browser_wasi_shim`, CI job. Original plan follows.
 
 - Library module exporting a C ABI: `rowdiet_alloc(len) -> ptr`, `rowdiet_free(ptr, len)`,
   `rowdiet_lint(ptr, len) -> ptr` where input/output are JSON (`{sources, config}` in, the

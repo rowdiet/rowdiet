@@ -25,6 +25,12 @@ libpg_query only needs declarations (or, for `setjmp.h`, a name mapping):
 
 ## The build
 
+`./wasm/build-wasip1.sh` runs everything below against the pinned SDK (override with `WASI_SDK`)
+using the size-tuned `wasm` cargo profile; smoke-run the result with
+`echo '{"sources":[...]}' | wasmtime run target/wasm32-wasip1/wasm/rowdiet-smoke.wasm`.
+The reactor cdylib (`rowdiet_wasm.wasm`) must be instantiated through the WASI shim's
+`initialize()` path — never `start()` — with `_initialize` called before any `rowdiet_*` export.
+
 ```sh
 WASI_SDK=/path/to/wasi-sdk-33.0
 CC_wasm32_wasip1="$WASI_SDK/bin/clang" \

@@ -89,7 +89,10 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 
 fn gate_exceeded(analysis: &Analysis, fail_over: Option<u64>) -> bool {
     match fail_over {
-        Some(limit) => analysis.tables.iter().any(|t| !t.ignored && t.avoidable_bytes_per_row > limit),
+        Some(limit) => analysis
+            .tables
+            .iter()
+            .any(|t| !t.ignored && t.avoidable_bytes_per_row > limit),
         None => false,
     }
 }
@@ -108,8 +111,13 @@ fn gather_sources(paths: &[String]) -> Result<Vec<SqlSource>, String> {
     for raw in paths {
         if raw == "-" {
             let mut sql = String::new();
-            std::io::stdin().read_to_string(&mut sql).map_err(|e| format!("stdin: {e}"))?;
-            sources.push(SqlSource { name: "<stdin>".into(), sql });
+            std::io::stdin()
+                .read_to_string(&mut sql)
+                .map_err(|e| format!("stdin: {e}"))?;
+            sources.push(SqlSource {
+                name: "<stdin>".into(),
+                sql,
+            });
             continue;
         }
         let path = Path::new(raw);
