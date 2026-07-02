@@ -39,10 +39,12 @@ Landed: the reactor cdylib + a smoke command-bin, built by `wasm/build-wasip1.sh
 `wasm` cargo profile). Verified under wasmtime: the smoke bin runs the full pipeline with the
 real PG17 parser in wasm (DO-block DDL parses, numbers match native), and the reactor's exports
 answer via `--invoke`. Sizes: smoke 1.92 MB raw / 388 KB gzip (matches the spike measurement);
-cdylib 3.65 MB raw / 857 KB gzip — a wasm-opt / export-pruning pass is a Phase-3 TODO. ABI is
-provisional v1 (length-prefixed buffers) pending the ukb author's reactor-ABI research reply;
-hosts must use the shim's `initialize()` path, never `start()`. Still open here: pin
-`browser_wasi_shim`, CI job. Original plan follows.
+cdylib 3.65 MB raw / 857 KB gzip — a wasm-opt / export-pruning pass is a Phase-3 TODO. ABI
+**finalized v1** same day per the ukb author's empirically verified research: packed-u64 return
+(`(out_ptr << 32) | out_len`), `@bjorn3/browser_wasi_shim` pinned at **0.4.2**, loader gotchas
+(initialize-not-start, fresh memory views after calls, WASIProcExit try/catch, go-pgquery =
+shape-only precedent) recorded in `wasm/README.md`. Still open here: the CI job. Original plan
+follows.
 
 - Library module exporting a C ABI: `rowdiet_alloc(len) -> ptr`, `rowdiet_free(ptr, len)`,
   `rowdiet_lint(ptr, len) -> ptr` where input/output are JSON (`{sources, config}` in, the

@@ -54,5 +54,11 @@
   smoke 1.92 MB raw / 388 KB gz (matches spike); cdylib 857 KB gz (wasm-opt pass = Phase-3 TODO).
   Adoption asks with real corpus numbers posted to bringmeto and ukb (cargo-rowdiet plugin).
 
-Next: Phase 3 (webpage: browser_wasi_shim pin + ~100-line loader + byte-ruler page; ABI finalize
-after ukb's research reply; wasm-opt/export pruning), in-group exact search, squawk upstream.
+- ABI finalized same day on the ukb author's verified research (#5): packed-u64 return replaces
+  the length prefix; browser_wasi_shim pinned 0.4.2; the five loader gotchas recorded in
+  wasm/README.md (initialize-not-start even without _initialize, fresh views after memory.grow,
+  WASIProcExit try/catch, go-pgquery = wazero/wasix shape-only precedent, lazy libpg_query init
+  verified sufficient single-threaded).
+
+Next: Phase 3 (the ~100-line loader + byte-ruler page against the pinned shim; wasm-opt/export
+pruning for the cdylib), in-group exact search, squawk upstream.

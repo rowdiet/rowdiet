@@ -56,6 +56,24 @@ Gotchas, learned the hard way:
   current wasmtime/V8. For an older browser floor, rebuild with legacy EH.
 - Measured size ballpark: ~2.2 MB raw / ~390 KB gzip.
 
+## Browser loader contract (pins + verified gotchas, 2026-07-23)
+
+- Pin `@bjorn3/browser_wasi_shim@0.4.2` (npm latest since 2025-06-22; no 2026 release exists).
+- Instantiate the reactor with `wasi.initialize(instance)`, never `wasi.start()` (throws on a
+  reactor). The shim's README documents only the start() flow — do not follow it here.
+  `initialize()` is mandatory even without an `_initialize` export (it records the instance every
+  syscall dereferences); our wasi-sdk link DOES export `_initialize`, which it calls if present.
+- `rowdiet_lint` returns a packed u64 — JS: `Number(v >> 32n)` / `Number(v & 0xffffffffn)`.
+- `memory.grow` invalidates views: build a fresh `Uint8Array(memory.buffer)` AFTER each
+  `rowdiet_lint` call, before slicing the output. A cached view is the classic loader bug here.
+- Wrap export calls in try/catch: aborts surface as the shim's `WASIProcExit` exception
+  (`initialize()` and direct calls do not catch it; only `start()` would).
+- go-pgquery is ABI-*shape* precedent only: its shipped module targets wazero/wasix (host-side
+  setjmp snapshots, no Wasm-EH) and is not browser-runnable. This repo's wasi-sdk-33 + wasm-EH
+  route is the browser-correct one.
+- libpg_query init: no explicit init export needed single-threaded — lazy init inside the parse
+  call covered the wasmtime smoke run; revisit only for exotic multi-instance hosts.
+
 ## Runtime shape (Phase 2 target)
 
 Reactor-style library module, not a bin: `#[no_mangle] extern "C" fn rowdiet_lint(ptr, len) ->

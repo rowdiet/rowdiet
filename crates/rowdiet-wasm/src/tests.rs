@@ -42,11 +42,16 @@ fn abi_roundtrip() {
     let bytes = INPUT.as_bytes();
     let input_ptr = rowdiet_alloc(bytes.len());
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), input_ptr, bytes.len()) };
-    let out_ptr = rowdiet_lint(input_ptr, bytes.len());
-    let json_len = u32::from_le_bytes(unsafe { *(out_ptr as *const [u8; 4]) }) as usize;
-    let json = unsafe { std::slice::from_raw_parts(out_ptr.add(4), json_len) };
+    let (out_ptr, out_len) = lint_raw(input_ptr, bytes.len());
+    let json = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
     let out: serde_json::Value = serde_json::from_slice(json).unwrap();
     assert_eq!(out["gate_exceeded"], true);
     rowdiet_free(input_ptr, bytes.len());
-    rowdiet_free(out_ptr, 4 + json_len);
+    rowdiet_free(out_ptr, out_len);
+}
+
+#[test]
+fn packed_return_layout() {
+    assert_eq!(pack(0x1234, 0x56), 0x0000_1234_0000_0056);
+    assert_eq!(pack(u32::MAX, u32::MAX), u64::MAX);
 }

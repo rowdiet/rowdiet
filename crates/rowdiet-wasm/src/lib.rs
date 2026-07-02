@@ -4,12 +4,17 @@
 //! `initialize()` path — never `start()` — and call `_initialize` (when exported) before any
 //! `rowdiet_*` export.
 //!
-//! ABI (provisional v1, may be revised before the page ships):
+//! ABI (v1, finalized 2026-07-23 per the empirically verified reactor-ABI research):
 //! - `rowdiet_alloc(len) -> ptr` — allocate an input buffer, write UTF-8 JSON into it.
-//! - `rowdiet_lint(ptr, len) -> out` — analyze; `out` points at a 4-byte little-endian length
-//!   followed by that many UTF-8 JSON bytes. The input buffer is NOT consumed.
-//! - `rowdiet_free(ptr, len)` — free any buffer from this module: the input (its alloc len) and
-//!   the output (`4 + json_len`).
+//! - `rowdiet_lint(ptr, len) -> u64` — analyze; returns `(out_ptr << 32) | out_len` (a wasm32
+//!   contract — pointers are 32-bit there; JS receives a BigInt: `Number(v >> 32n)` /
+//!   `Number(v & 0xffffffffn)`). The output is `out_len` bytes of UTF-8 JSON, unframed. The
+//!   input buffer is NOT consumed.
+//! - `rowdiet_free(ptr, len)` — free either buffer: the input (its alloc len) and the output
+//!   (`out_len`).
+//!
+//! Loader gotchas (verified): re-derive views from `memory.buffer` AFTER `rowdiet_lint` returns
+//! (the parser may grow memory); wrap export calls in try/catch for the shim's `WASIProcExit`.
 //!
 //! Input JSON: `{"sources": [{"name": "...", "sql": "..."}], "assume": ["vector=varlena:d"],
 //! "fail_over": 0}` (`assume`/`fail_over` optional). Output JSON mirrors the CLI's `--format
@@ -98,7 +103,7 @@ pub extern "C" fn rowdiet_alloc(len: usize) -> *mut u8 {
 }
 
 /// Callers must pass a pointer previously returned by this module together with the exact length
-/// it was created with (alloc len for inputs, `4 + json_len` for lint outputs).
+/// it was created with (alloc len for inputs, `out_len` for lint outputs).
 #[no_mangle]
 pub extern "C" fn rowdiet_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
@@ -108,17 +113,28 @@ pub extern "C" fn rowdiet_free(ptr: *mut u8, len: usize) {
     unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))) };
 }
 
-#[no_mangle]
-pub extern "C" fn rowdiet_lint(ptr: *const u8, len: usize) -> *mut u8 {
-    // The pointer/length pair must describe a live buffer in this module's memory (the ABI
-    // contract); anything else is host error.
+/// The pointer/length pair must describe a live buffer in this module's memory (the ABI
+/// contract); anything else is host error. Free the returned buffer with
+/// `rowdiet_free(out_ptr, out_len)`.
+pub fn lint_raw(ptr: *const u8, len: usize) -> (*mut u8, usize) {
     let input = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let output = lint_json(&String::from_utf8_lossy(input));
-    let json = output.as_bytes();
-    let mut framed = Vec::with_capacity(4 + json.len());
-    framed.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    framed.extend_from_slice(json);
-    Box::into_raw(framed.into_boxed_slice()) as *mut u8
+    let output = lint_json(&String::from_utf8_lossy(input))
+        .into_bytes()
+        .into_boxed_slice();
+    let out_len = output.len();
+    (Box::into_raw(output) as *mut u8, out_len)
+}
+
+/// High 32 bits = pointer, low 32 = length. Meaningful on wasm32 only (pointers fit in 32 bits);
+/// native callers use [`lint_raw`].
+fn pack(ptr: u32, len: u32) -> u64 {
+    (u64::from(ptr) << 32) | u64::from(len)
+}
+
+#[no_mangle]
+pub extern "C" fn rowdiet_lint(ptr: *const u8, len: usize) -> u64 {
+    let (out_ptr, out_len) = lint_raw(ptr, len);
+    pack(out_ptr as usize as u32, out_len as u32)
 }
 
 #[cfg(test)]
