@@ -57,7 +57,20 @@ follows.
 - Pin a `browser_wasi_shim` version here; decide exnref vs legacy-EH browser floor at page
   launch (exnref default; legacy rebuild documented if an older floor is ever needed).
 
-## Phase 3 — the webpage
+## Phase 3 — the webpage — **SHIPPED (2026-07-23)**
+
+`web/`: static page (`index.html` + `app.js` + `loader.js`) against the finalized ABI, with
+`@bjorn3/browser_wasi_shim` 0.4.2 vendored (dual-licensed, `VENDOR.md`). The loader implements
+all five verified gotchas. Byte rulers follow the dataviz method: validated two-slot palette
+(blue fixed / aqua varlena-header; light-mode aqua relief via labels + table view), padding as
+neutral 45°-hatch (dead bytes, never color-alone), status color only on the avoidable headline,
+per-segment tooltips, legend, per-table column table, copy-reordered-DDL. Exact tier renders
+t_hoff + MAXALIGN tail; estimate tier shows the "+ payloads…" open end. Verified: node headless
+smoke (`web/smoke.mjs`, 7 checks incl. abort path + instance reuse) and Chrome visual check of
+both tiers + tooltips (dark mode; light validated via the palette script). Build:
+`web/build.sh` (wasm build + stage; artifact gitignored). Remaining wasm items: CI job,
+wasm-opt/export pruning (cdylib 857 KB gz vs 388 KB smoke bin), child-partition parent-layout
+inheritance (promoted from ukb's adoption feedback). Original plan follows.
 
 - Static page loads the Phase 2 module via `browser_wasi_shim` + the hand-rolled loader.
 - Paste DDL → per-table byte ruler (padding highlighted), current vs suggested side-by-side,

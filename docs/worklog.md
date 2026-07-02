@@ -60,5 +60,14 @@
   WASIProcExit try/catch, go-pgquery = wazero/wasix shape-only precedent, lazy libpg_query init
   verified sufficient single-threaded).
 
-Next: Phase 3 (the ~100-line loader + byte-ruler page against the pinned shim; wasm-opt/export
-pruning for the cdylib), in-group exact search, squawk upstream.
+- Phase 3 shipped (same day): web/ static page — vendored shim 0.4.2, loader with all five
+  gotchas, dataviz-validated byte rulers (two-slot palette; padding = neutral hatch, alarm lives
+  in the headline stat), both tiers verified in Chrome + node headless smoke (7 checks). ADOPTIONS
+  LANDED: bringmeto padding gate green (11 tables, dedicated bridge channel live); ukb reordered
+  its 3 flagged tables (id-first variant, equally zero-pad), wired the soft-skip cargo-rowdiet
+  gate ("34 tables, 0 avoidable" in-gate), documented its canonical column order. Correction
+  posted to ukb: partition children still model column-list-incomplete (gate-pass is vacuous
+  exactness) — parent-layout inheritance promoted to roadmap.
+
+Next: wasm CI job, wasm-opt/export pruning, partition-child parent-layout inheritance, in-group
+exact search, squawk upstream offer.

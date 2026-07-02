@@ -125,11 +125,13 @@ varlena (`bpchar`); an enum value is 4 bytes.
 
 ## Roadmap
 
-- **Route 3 (see `docs/wasm-plan.md`):** Phase 1 is shipped — PG-exact parsing via `libpg_query`
-  behind an off-by-default `pg-exact` core feature (native lib consumers never compile C),
-  swappable per call and doubling as the differential-test oracle. Remaining: a single
-  Rust-linked `wasm32-wasip1` module (recipe + stub headers vendored in `wasm/`) powering a
-  static paste-your-DDL webpage with a byte-ruler visualization.
+- **Route 3 is fully shipped** (`docs/wasm-plan.md`): the `pg-exact` parser feature (off by
+  default; doubles as the differential oracle), the Rust-linked `wasm32-wasip1` module carrying
+  the real PG17 parser, and the static paste-your-DDL page in `web/` (byte rulers, current vs
+  suggested, copy-reordered-DDL) — `./web/build.sh` then serve `web/`. Remaining wasm items: CI
+  job, wasm-opt size pass.
+- Partition children: inherit the parent's modeled layout (today they are honestly flagged
+  column-list-incomplete).
 - Curated, source-verified extension type map (citext, hstore, pgvector, PostGIS, …).
 - Optional exact search within alignment groups when a table has >1 irregular-size column.
 - Offering the rule upstream to squawk once rowdiet has proven out.
