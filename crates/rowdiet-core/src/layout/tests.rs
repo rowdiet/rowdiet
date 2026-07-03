@@ -116,6 +116,49 @@ fn suggested_survives_null_masks() {
 }
 
 #[test]
+fn two_irregulars_get_the_exact_search() {
+    let kinds = [fixed(12, Align::Double), fixed(12, Align::Double), fixed(4, Align::Int)];
+    let order = suggested_order(&kinds);
+    let sug: Vec<_> = order.iter().map(|&i| kinds[i]).collect();
+    assert_eq!(walk(&sug).padding, 0, "int4 interposed between the two timetz: {order:?}");
+}
+
+#[test]
+fn exact_search_never_worse_than_plain_sort() {
+    let batteries: Vec<Vec<ColumnKind>> = vec![
+        vec![fixed(12, Align::Double), fixed(12, Align::Double), fixed(4, Align::Int)],
+        vec![fixed(12, Align::Double), fixed(6, Align::Int), fixed(6, Align::Int), fixed(2, Align::Short)],
+        vec![fixed(12, Align::Double), fixed(12, Align::Double), fixed(12, Align::Double), fixed(4, Align::Int)],
+        vec![fixed(8, Align::Double), fixed(4, Align::Int), fixed(2, Align::Short), fixed(1, Align::Char)],
+        vec![fixed(6, Align::Int), fixed(6, Align::Int), fixed(8, Align::Double), fixed(1, Align::Char)],
+    ];
+    for kinds in batteries {
+        let mut sorted: Vec<usize> = (0..kinds.len()).collect();
+        sorted.sort_by_key(|&i| sort_key(&kinds[i], i));
+        let plain = walk(&sorted.iter().map(|&i| kinds[i]).collect::<Vec<_>>()).padding;
+        let refined = suggested_order(&kinds);
+        let exact = walk(&refined.iter().map(|&i| kinds[i]).collect::<Vec<_>>()).padding;
+        assert!(exact <= plain, "{kinds:?}: exact {exact} vs sorted {plain}");
+    }
+}
+
+#[test]
+fn exact_search_keeps_varlena_tail() {
+    let kinds =
+        [fixed(12, Align::Double), fixed(12, Align::Double), fixed(4, Align::Int), varlena(Align::Int)];
+    let order = suggested_order(&kinds);
+    assert_eq!(order[3], 3, "varlena stays last: {order:?}");
+    let fixed_part: Vec<_> = order[..3].iter().map(|&i| kinds[i]).collect();
+    assert_eq!(walk(&fixed_part).padding, 0);
+}
+
+#[test]
+fn regular_schemas_keep_the_heuristic_shape() {
+    let kinds = [fixed(1, Align::Char), fixed(8, Align::Double), fixed(4, Align::Int), fixed(2, Align::Short)];
+    assert_eq!(suggested_order(&kinds), vec![1, 2, 3, 0]);
+}
+
+#[test]
 fn varlena_cluster_and_align_desc() {
     let kinds = [
         varlena(Align::Int),

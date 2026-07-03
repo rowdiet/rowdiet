@@ -138,7 +138,100 @@ pub fn null_thoff(natts: usize) -> u64 {
 pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..kinds.len()).collect();
     order.sort_by_key(|&i| sort_key(&kinds[i], i));
+    refine_fixed_block(kinds, &mut order);
     order
+}
+
+/// Descending-alignment sorting is provably zero-padding only while every size is a multiple of
+/// its own alignment; with two or more irregulars (timetz, macaddr, …) it can leave padding an
+/// interposed smaller column would absorb. When the sorted fixed block still pads, find the
+/// exact minimum: padding depends only on (alignment, len mod MAXALIGN) classes and the running
+/// offset mod MAXALIGN, so a small memoized search over class counts is exhaustive. Ties prefer
+/// the heuristic's own class order, so regular schemas keep their familiar shape.
+fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
+    let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
+    if fixed_len < 3 || fixed_len > 24 {
+        return;
+    }
+    let sorted_fixed: Vec<ColumnKind> = order[..fixed_len].iter().map(|&i| kinds[i]).collect();
+    if walk(&sorted_fixed).padding == 0 {
+        return;
+    }
+    let mut classes: Vec<FixedClass> = Vec::new();
+    for &index in order[..fixed_len].iter() {
+        let ColumnKind::Fixed { len, align } = kinds[index] else { unreachable!("fixed prefix") };
+        let key = (align.bytes(), len % MAXALIGN);
+        match classes.iter_mut().find(|c| c.key == key) {
+            Some(class) => class.members.push(index),
+            None => classes.push(FixedClass { key, members: vec![index] }),
+        }
+    }
+    if classes.len() > 12 {
+        return;
+    }
+    let mut dp = Dp { classes: &classes, memo: std::collections::HashMap::new() };
+    let full: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
+    let mut counts = full;
+    let mut off = 0u64;
+    let mut queues: Vec<std::collections::VecDeque<usize>> =
+        classes.iter().map(|c| c.members.iter().copied().collect()).collect();
+    let mut refined = Vec::with_capacity(fixed_len);
+    while counts.iter().any(|&c| c > 0) {
+        let target = dp.min_padding(&counts, off);
+        for class_index in 0..classes.len() {
+            if counts[class_index] == 0 {
+                continue;
+            }
+            let (align, len_mod) = classes[class_index].key;
+            let step = pad(off, align);
+            counts[class_index] -= 1;
+            let rest = dp.min_padding(&counts, (off + step + len_mod) % MAXALIGN);
+            if step + rest == target {
+                refined.push(queues[class_index].pop_front().expect("count tracked"));
+                off = (off + step + len_mod) % MAXALIGN;
+                break;
+            }
+            counts[class_index] += 1;
+        }
+    }
+    order[..fixed_len].copy_from_slice(&refined);
+}
+
+struct FixedClass {
+    key: (u64, u64),
+    members: Vec<usize>,
+}
+
+struct Dp<'a> {
+    classes: &'a [FixedClass],
+    memo: std::collections::HashMap<(Vec<u8>, u64), u64>,
+}
+
+impl Dp<'_> {
+    fn min_padding(&mut self, counts: &[u8], off: u64) -> u64 {
+        if counts.iter().all(|&c| c == 0) {
+            return 0;
+        }
+        let key = (counts.to_vec(), off);
+        if let Some(&cached) = self.memo.get(&key) {
+            return cached;
+        }
+        let mut best = u64::MAX;
+        let mut next = counts.to_vec();
+        for class_index in 0..self.classes.len() {
+            if next[class_index] == 0 {
+                continue;
+            }
+            let (align, len_mod) = self.classes[class_index].key;
+            let step = pad(off, align);
+            next[class_index] -= 1;
+            let total = step + self.min_padding(&next, (off + step + len_mod) % MAXALIGN);
+            next[class_index] += 1;
+            best = best.min(total);
+        }
+        self.memo.insert(key, best);
+        best
+    }
 }
 
 fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u8, u8, usize) {
