@@ -41,6 +41,18 @@ fn optimal_table_is_a_checkmark_line() {
 }
 
 #[test]
+fn empty_modeled_tables_are_not_called_optimal() {
+    let sql = "CREATE TABLE p (a int NOT NULL) PARTITION BY RANGE (a);\nCREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
+    let analysis =
+        analyze_sources(&[SqlSource { name: "V1__p.sql".into(), sql: sql.into() }], &Config::default());
+    let rendered = text(&analysis, None, false, Some(0));
+    assert!(rendered.contains("◌ c"), "{rendered}");
+    assert!(rendered.contains("not analyzable"), "{rendered}");
+    assert!(!rendered.contains("✓ c"), "{rendered}");
+    assert!(!rendered.contains("FAIL"), "{rendered}");
+}
+
+#[test]
 fn github_annotations() {
     let rendered = github(&sample(), Some(0));
     assert!(rendered.starts_with("::error file=V1__init.sql,line=1,title=rowdiet::table account"));

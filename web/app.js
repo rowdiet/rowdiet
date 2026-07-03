@@ -95,6 +95,10 @@ function tableCard(t, rows) {
   const hero = el("p", "hero");
   if (t.ignored) {
     hero.append(el("span", "muted", "ignored (rowdiet:ignore)"));
+  } else if (t.natts === 0) {
+    hero.append(el("span", "muted", "no modeled columns — not analyzable (partition child / LIKE / typed table)"));
+    card.append(hero);
+    return card;
   } else if (t.avoidable_bytes_per_row > 0) {
     hero.append(el("strong", "bad", `▲ ${t.avoidable_bytes_per_row} B/row avoidable`));
     if (rows > 0) hero.append(el("span", "muted", `  × ${rows.toLocaleString("en")} rows ≈ ${humanBytes(t.avoidable_bytes_per_row * rows)}`));

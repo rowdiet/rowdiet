@@ -50,6 +50,13 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.name);
         return;
     }
+    // An empty modeled column set (partition child / LIKE / typed table) passes the gate
+    // vacuously — say so instead of wearing an "optimal [exact]" chip it did not earn.
+    if t.natts == 0 {
+        let _ = writeln!(out, "◌ {} ({loc}) — no modeled columns — not analyzable", t.name);
+        render_flags(out, t);
+        return;
+    }
     if t.avoidable_bytes_per_row == 0 {
         let detail = match (t.tier, t.current.padding) {
             (_, 0) => "optimal: zero padding".to_string(),
