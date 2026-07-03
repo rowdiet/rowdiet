@@ -181,6 +181,8 @@ mod differential {
         "DROP TABLE IF EXISTS a, b",
         "DROP TYPE status",
         "CREATE INDEX i ON t (a)",
+        "CREATE TABLE part_parent (a int NOT NULL, b bigint NOT NULL) PARTITION BY RANGE (a)",
+        "CREATE TABLE part_child PARTITION OF part_parent FOR VALUES FROM (1) TO (10)",
     ];
 
     fn norm_name(n: RawName) -> RawName {
@@ -217,6 +219,7 @@ mod differential {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                partition_of,
             } => DdlOp::CreateTable {
                 name: norm_name(name),
                 columns: columns.into_iter().map(norm_col).collect(),
@@ -224,6 +227,7 @@ mod differential {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                partition_of: partition_of.map(norm_name),
             },
             DdlOp::AddColumn {
                 table,
@@ -298,6 +302,24 @@ mod differential {
                 .collect();
             let via_pgq: Vec<DdlOp> = extract_pgq::extract(sql).expect(sql).into_iter().map(norm).collect();
             assert_eq!(via_sqlparser, via_pgq, "{sql}");
+        }
+    }
+
+    #[test]
+    fn partition_children_inherit_parent_layout() {
+        let sql = "CREATE TABLE evt (flag boolean NOT NULL, id bigint NOT NULL) PARTITION BY RANGE (id);\nCREATE TABLE evt_1 PARTITION OF evt FOR VALUES FROM (1) TO (10);";
+        for backend in [ParserBackend::Sqlparser, ParserBackend::PgExact] {
+            let analysis = analyze_sources_with(
+                backend,
+                &[SqlSource { name: "V1__evt.sql".into(), sql: sql.into() }],
+                &Config::default(),
+            );
+            let child = &analysis.tables[1];
+            assert_eq!(child.name, "evt_1");
+            assert_eq!(child.natts, 2, "{backend:?}");
+            assert!(!child.incomplete);
+            assert_eq!(child.avoidable_bytes_per_row, analysis.tables[0].avoidable_bytes_per_row);
+            assert!(analysis.notes.is_empty(), "{backend:?}: {:?}", analysis.notes);
         }
     }
 

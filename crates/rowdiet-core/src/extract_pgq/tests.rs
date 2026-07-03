@@ -234,7 +234,17 @@ fn ctas_and_partition_children() {
         other => panic!("{other:?}"),
     }
     match one("CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')") {
-        DdlOp::CreateTable { incomplete_columns, .. } => assert!(incomplete_columns),
+        DdlOp::CreateTable { incomplete_columns, partition_of, .. } => {
+            assert!(!incomplete_columns);
+            assert_eq!(partition_of.unwrap().key, "events");
+        }
+        other => panic!("{other:?}"),
+    }
+    match one("CREATE TABLE kid () INHERITS (folks)") {
+        DdlOp::CreateTable { incomplete_columns, partition_of, .. } => {
+            assert!(incomplete_columns);
+            assert!(partition_of.is_none());
+        }
         other => panic!("{other:?}"),
     }
 }

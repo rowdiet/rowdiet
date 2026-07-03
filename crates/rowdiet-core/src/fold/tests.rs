@@ -177,6 +177,27 @@ fn domain_and_range_session_types() {
 }
 
 #[test]
+fn partition_child_inherits_parent_columns() {
+    let (tables, notes) = folded(&[
+        "CREATE TABLE p (flag boolean NOT NULL, id bigint NOT NULL) PARTITION BY RANGE (id)",
+        "CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2)",
+    ]);
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(tables[1].key, "c");
+    assert!(!tables[1].incomplete);
+    let keys: Vec<&str> = tables[1].columns.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(keys, vec!["flag", "id"]);
+}
+
+#[test]
+fn partition_child_with_unknown_parent_is_incomplete() {
+    let (tables, notes) = folded(&["CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2)"]);
+    assert!(tables[0].incomplete);
+    assert!(tables[0].columns.is_empty());
+    assert_eq!(notes.iter().filter(|n| n.kind == NoteKind::IncompleteColumns).count(), 1);
+}
+
+#[test]
 fn serial_column_is_not_null() {
     let (tables, _) = folded(&["CREATE TABLE t (id bigserial, x int)"]);
     assert!(tables[0].columns[0].not_null);

@@ -42,7 +42,7 @@ fn optimal_table_is_a_checkmark_line() {
 
 #[test]
 fn empty_modeled_tables_are_not_called_optimal() {
-    let sql = "CREATE TABLE p (a int NOT NULL) PARTITION BY RANGE (a);\nCREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
+    let sql = "CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2);";
     let analysis =
         analyze_sources(&[SqlSource { name: "V1__p.sql".into(), sql: sql.into() }], &Config::default());
     let rendered = text(&analysis, None, false, Some(0));
@@ -50,6 +50,16 @@ fn empty_modeled_tables_are_not_called_optimal() {
     assert!(rendered.contains("not analyzable"), "{rendered}");
     assert!(!rendered.contains("✓ c"), "{rendered}");
     assert!(!rendered.contains("FAIL"), "{rendered}");
+}
+
+#[test]
+fn partition_children_with_known_parent_render_real_analysis() {
+    let sql = "CREATE TABLE p (flag boolean NOT NULL, id bigint NOT NULL) PARTITION BY RANGE (id);\nCREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
+    let analysis =
+        analyze_sources(&[SqlSource { name: "V1__p.sql".into(), sql: sql.into() }], &Config::default());
+    let rendered = text(&analysis, None, false, None);
+    assert!(rendered.contains("✓ c") || rendered.contains("■ c"), "{rendered}");
+    assert!(!rendered.contains("◌ c"), "{rendered}");
 }
 
 #[test]

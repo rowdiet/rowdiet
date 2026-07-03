@@ -75,7 +75,19 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
         Some(rv) => rangevar_name(rv),
         None => return DdlOp::Irrelevant,
     };
-    let mut incomplete_columns = cs.partbound.is_some() || cs.of_typename.is_some() || !cs.inh_relations.is_empty();
+    // The grammar reuses inh_relations for the PARTITION OF parent (partbound set) as well as
+    // plain INHERITS (no partbound).
+    let partition_of = if cs.partbound.is_some() {
+        cs.inh_relations.iter().find_map(|n| match n.node.as_ref() {
+            Some(NodeEnum::RangeVar(rv)) => Some(rangevar_name(rv)),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let mut incomplete_columns = cs.of_typename.is_some()
+        || (cs.partbound.is_none() && !cs.inh_relations.is_empty())
+        || (cs.partbound.is_some() && partition_of.is_none());
     let mut columns = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
     for elt in cs.table_elts.iter().chain(cs.constraints.iter()) {
@@ -93,6 +105,7 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
         if_not_exists: cs.if_not_exists,
         is_ctas: false,
         incomplete_columns,
+        partition_of,
     }
 }
 
@@ -273,6 +286,7 @@ fn map_ctas(ctas: &pb::CreateTableAsStmt) -> Vec<DdlOp> {
             if_not_exists: ctas.if_not_exists,
             is_ctas: true,
             incomplete_columns: false,
+            partition_of: None,
         }],
         None => vec![DdlOp::Irrelevant],
     }

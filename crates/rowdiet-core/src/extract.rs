@@ -29,8 +29,10 @@ pub enum DdlOp {
         pk_columns: Vec<String>,
         if_not_exists: bool,
         is_ctas: bool,
-        /// LIKE clause / partition child / typed table — declared columns are not the whole story.
+        /// LIKE / INHERITS / typed table — declared columns are not the whole story.
         incomplete_columns: bool,
+        /// `PARTITION OF parent`: the child's physical layout is the parent's, verbatim.
+        partition_of: Option<RawName>,
     },
     AddColumn {
         table: RawName,
@@ -127,7 +129,8 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
 
 fn map_create_table(ct: sq::CreateTable) -> DdlOp {
     let is_ctas = ct.query.is_some() && ct.columns.is_empty();
-    let incomplete_columns = ct.like.is_some();
+    let incomplete_columns = ct.like.is_some() || ct.inherits.is_some();
+    let partition_of = ct.partition_of.as_ref().map(raw_name);
     let pk_columns = ct.constraints.iter().flat_map(pk_constraint_columns).collect();
     let columns = ct.columns.iter().map(map_column).collect();
     DdlOp::CreateTable {
@@ -137,6 +140,7 @@ fn map_create_table(ct: sq::CreateTable) -> DdlOp {
         if_not_exists: ct.if_not_exists,
         is_ctas,
         incomplete_columns,
+        partition_of,
     }
 }
 

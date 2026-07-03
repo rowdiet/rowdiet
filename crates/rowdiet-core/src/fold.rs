@@ -126,6 +126,7 @@ impl Folder {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                partition_of,
             } => {
                 self.create_table(
                     name,
@@ -134,6 +135,7 @@ impl Folder {
                     if_not_exists,
                     is_ctas,
                     incomplete_columns,
+                    partition_of,
                     origin,
                     ignore_marker,
                 );
@@ -180,6 +182,7 @@ impl Folder {
         if_not_exists: bool,
         is_ctas: bool,
         incomplete_columns: bool,
+        partition_of: Option<RawName>,
         origin: &Origin,
         ignore_marker: bool,
     ) {
@@ -205,10 +208,30 @@ impl Folder {
         }
         if incomplete_columns {
             let detail = format!(
-                "table {}: column list incomplete (LIKE / partition / typed-table clause not expanded)",
+                "table {}: column list incomplete (LIKE / INHERITS / typed-table clause not expanded)",
                 name.display
             );
             self.note(origin, NoteKind::IncompleteColumns, detail);
+        }
+        // A partition child's physical layout is its parent's, verbatim (children cannot add
+        // columns) — inherit the parent's modeled columns when the parent is in the set.
+        let mut incomplete = incomplete_columns;
+        let mut inherited: Vec<FoldedColumn> = Vec::new();
+        if let Some(parent) = &partition_of {
+            match self.tables.get(&parent.key) {
+                Some(parent_table) => {
+                    inherited = parent_table.columns.clone();
+                    incomplete = incomplete || parent_table.incomplete;
+                }
+                None => {
+                    let detail = format!(
+                        "table {}: PARTITION OF {} — parent not in the analyzed set, child not modeled",
+                        name.display, parent.display
+                    );
+                    self.note(origin, NoteKind::IncompleteColumns, detail);
+                    incomplete = true;
+                }
+            }
         }
         let mut table = FoldedTable {
             display: name.display,
@@ -216,8 +239,8 @@ impl Folder {
             origin: origin.clone(),
             altered_in: Vec::new(),
             ignored: ignore_marker,
-            incomplete: incomplete_columns,
-            columns: Vec::new(),
+            incomplete,
+            columns: inherited,
         };
         for raw in columns {
             let mut column = self.resolve_column(raw, origin);
