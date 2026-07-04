@@ -1,6 +1,7 @@
 // rowdiet page logic: textarea → lint via the wasm module → per-table byte rulers.
 
 import { initRowdiet } from "./loader.js";
+import { initEditor } from "./editor.js";
 
 const MAXALIGN = 8;
 const TUPLE_HEADER_ALIGNED = 24;
@@ -10,6 +11,10 @@ const els = {
   results: document.getElementById("results"),
   status: document.getElementById("status"),
   tooltip: document.getElementById("tooltip"),
+  hlcode: document.getElementById("hlcode"),
+  gutter: document.getElementById("gutter"),
+  dragline: document.getElementById("dragline"),
+  download: document.getElementById("download"),
 };
 
 let api = null;
@@ -35,11 +40,27 @@ async function wasmBytes() {
 }
 
 let debounce = null;
-for (const el of [els.sql, els.rows]) {
-  el.addEventListener("input", () => {
-    clearTimeout(debounce);
-    debounce = setTimeout(analyze, 350);
-  });
+function schedule() {
+  clearTimeout(debounce);
+  debounce = setTimeout(analyze, 350);
+}
+els.rows.addEventListener("input", schedule);
+initEditor({
+  textarea: els.sql,
+  highlightCode: els.hlcode,
+  gutter: els.gutter,
+  dragline: els.dragline,
+  onChange: schedule,
+});
+els.download.addEventListener("click", () => downloadSql("schema.sql", els.sql.value));
+
+function downloadSql(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "application/sql" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
 function analyze() {
@@ -135,7 +156,11 @@ function tableCard(t, rows) {
       btn.textContent = "copied ✓";
       setTimeout(() => (btn.textContent = "copy reordered CREATE TABLE"), 1500);
     });
-    card.append(btn);
+    const dl = el("button", "copy", "download .sql");
+    dl.addEventListener("click", () =>
+      downloadSql(`${t.name.replace(/[^A-Za-z0-9_-]/g, "_")}-suggested.sql`, reorderedDdl(t)),
+    );
+    card.append(btn, dl);
   }
   card.append(columnTable(t));
   return card;

@@ -15,6 +15,7 @@
   --pad-fill: #eceae4; --pad-ink: #b5b2a8;
   --hdr-fill: #e1e0d9;
   --good: #006300; --bad: #d03b3b;
+  --tk-str: #eb6834; --tk-num: #4a3aa7;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -26,6 +27,7 @@
     --pad-fill: #262624; --pad-ink: #4f4e49;
     --hdr-fill: #2c2c2a;
     --good: #0ca30c; --bad: #d03b3b;
+    --tk-str: #d95926; --tk-num: #9085e9;
   }
 }
 * { box-sizing: border-box; }
@@ -38,12 +40,35 @@ h1 { font-size: 26px; margin: 0 0 4px; }
 h1 small { font-weight: 400; color: var(--ink-2); font-size: 15px; margin-left: 8px; }
 .sub { color: var(--ink-2); margin: 0 0 20px; }
 .controls { display: flex; flex-direction: column; gap: 10px; margin-bottom: 24px; }
-textarea {
-  width: 100%; min-height: 190px; resize: vertical;
-  background: var(--surface); color: var(--ink);
-  border: 1px solid var(--hairline); border-radius: 8px; padding: 12px;
-  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+.editor { position: relative; }
+.editor pre, .editor textarea {
+  margin: 0; width: 100%; min-height: 190px; box-sizing: border-box;
+  border: 1px solid var(--hairline); border-radius: 8px;
+  padding: 12px 12px 12px 40px;
+  font: 13px/19.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre; tab-size: 4;
 }
+.editor pre { position: absolute; inset: 0; background: var(--surface); overflow: hidden; pointer-events: none; }
+.editor textarea {
+  position: relative; z-index: 1; display: block; resize: vertical; overflow: auto;
+  background: transparent; color: transparent; caret-color: var(--ink); border-color: transparent;
+}
+.editor textarea::selection { background: color-mix(in srgb, var(--data) 30%, transparent); color: transparent; }
+.editor textarea:focus { outline: 2px solid var(--data); outline-offset: -1px; border-radius: 8px; }
+#gutter { position: absolute; z-index: 2; left: 0; top: 1px; bottom: 1px; width: 36px; overflow: hidden; }
+.handle {
+  position: absolute; left: 6px; width: 24px; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); cursor: grab; font: 11px/1 ui-monospace, monospace; letter-spacing: -1px;
+  user-select: none; touch-action: none; border-radius: 4px;
+}
+.handle:hover { color: var(--ink); background: color-mix(in srgb, var(--muted) 18%, transparent); }
+body.dragging, body.dragging .handle { cursor: grabbing; }
+#dragline { position: absolute; z-index: 3; left: 36px; right: 8px; height: 2px; background: var(--data); border-radius: 1px; pointer-events: none; }
+.tk-kw { color: var(--data); font-weight: 600; }
+.tk-ty { color: var(--vhdr); }
+.tk-str { color: var(--tk-str); }
+.tk-num { color: var(--tk-num); }
+.tk-com { color: var(--muted); font-style: italic; }
 .controls-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; color: var(--ink-2); font-size: 13px; }
 .controls-row input {
   width: 130px; background: var(--surface); color: var(--ink);
@@ -115,7 +140,9 @@ footer { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
   <em>before</em> the migration is applied. This page runs the real PostgreSQL&nbsp;17 parser compiled to
   WebAssembly; nothing leaves your browser.</p>
   <div class="controls">
-    <textarea id="sql" spellcheck="false">CREATE TABLE account (
+    <div class="editor">
+      <pre id="hl" aria-hidden="true"><code id="hlcode"></code></pre>
+      <textarea id="sql" spellcheck="false" wrap="off">CREATE TABLE account (
     active boolean NOT NULL,
     id bigint PRIMARY KEY,
     kind smallint NOT NULL,
@@ -124,8 +151,12 @@ footer { margin-top: 40px; font-size: 12.5px; color: var(--muted); }
 
 ALTER TABLE account ADD COLUMN note text;
 ALTER TABLE account ADD COLUMN flags integer NOT NULL;</textarea>
+      <div id="gutter"></div>
+      <div id="dragline" hidden></div>
+    </div>
     <div class="controls-row">
       <label>project over <input id="rows" type="text" value="10000000"> rows</label>
+      <button id="download" class="copy">download .sql</button>
       <span id="status"></span>
     </div>
   </div>
