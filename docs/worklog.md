@@ -77,6 +77,11 @@
   clippy -D warnings, tests, no-default builds, wasm32 check, wasip1+smoke — becomes the GH
   workflow at publish); clippy strictness fixes (unsafe fn contracts on the wasm ABI).
 
+- Standalone single-file page (Sergey asked why a server at all): `node web/build-standalone.mjs`
+  emits rowdiet-standalone.html (3.7 MB — esbuild-inlined JS + base64-embedded wasm), works from
+  file:// double-click; the multi-file page stays the hosted variant (a "server" was only ever a
+  static file host — browsers block module imports + wasm fetch on file:// origins).
+
 Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
 pre-commit hook, GH Action, hosted page), squawk upstream offer. Ungated backlog: grow the
 extension map (PostGIS, …).

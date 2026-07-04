@@ -14,12 +14,24 @@ const els = {
 
 let api = null;
 try {
-  const bytes = await (await fetch("./rowdiet.wasm")).arrayBuffer();
-  api = await initRowdiet(bytes);
+  api = await initRowdiet(await wasmBytes());
   els.status.textContent = "";
   analyze();
 } catch (e) {
   els.status.textContent = `failed to load rowdiet.wasm — run web/build.sh first (${e})`;
+}
+
+// The standalone single-file build embeds the module as base64 so the page works from file://
+// (where fetch is blocked); the hosted multi-file page fetches it normally.
+async function wasmBytes() {
+  const embedded = globalThis.ROWDIET_WASM_B64;
+  if (embedded) {
+    const bin = atob(embedded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+  return await (await fetch("./rowdiet.wasm")).arrayBuffer();
 }
 
 let debounce = null;
