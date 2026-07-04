@@ -42,7 +42,7 @@ fn abi_roundtrip() {
     let bytes = INPUT.as_bytes();
     let input_ptr = rowdiet_alloc(bytes.len());
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), input_ptr, bytes.len()) };
-    let (out_ptr, out_len) = lint_raw(input_ptr, bytes.len());
+    let (out_ptr, out_len) = unsafe { lint_raw(input_ptr, bytes.len()) };
     let json = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
     let out: serde_json::Value = serde_json::from_slice(json).unwrap();
     assert_eq!(out["gate_exceeded"], true);

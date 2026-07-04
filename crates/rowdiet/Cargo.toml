@@ -10,7 +10,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-rowdiet-core = { workspace = true, features = ["serde"] }
+rowdiet-core = { workspace = true, features = ["serde", "fs"] }
 clap.workspace = true
 serde_json.workspace = true
 

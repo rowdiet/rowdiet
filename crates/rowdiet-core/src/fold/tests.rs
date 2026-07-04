@@ -194,7 +194,10 @@ fn partition_child_with_unknown_parent_is_incomplete() {
     let (tables, notes) = folded(&["CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2)"]);
     assert!(tables[0].incomplete);
     assert!(tables[0].columns.is_empty());
-    assert_eq!(notes.iter().filter(|n| n.kind == NoteKind::IncompleteColumns).count(), 1);
+    assert_eq!(
+        notes.iter().filter(|n| n.kind == NoteKind::IncompleteColumns).count(),
+        1
+    );
 }
 
 #[test]

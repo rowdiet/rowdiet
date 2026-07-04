@@ -123,18 +123,19 @@ varlena (`bpchar`); an enum value is 4 bytes.
 - `--suggest` prints a reordered `CREATE TABLE` skeleton; it never rewrites files (editing an
   applied migration breaks Flyway checksums / refinery divergence checks).
 
-## Roadmap
+## Status & roadmap
 
-- **Route 3 is fully shipped** (`docs/wasm-plan.md`): the `pg-exact` parser feature (off by
-  default; doubles as the differential oracle), the Rust-linked `wasm32-wasip1` module carrying
-  the real PG17 parser, and the static paste-your-DDL page in `web/` (byte rulers, current vs
-  suggested, copy-reordered-DDL) — `./web/build.sh` then serve `web/`. Remaining wasm items: CI
-  job, wasm-opt size pass.
-- Partition children: inherit the parent's modeled layout (today they are honestly flagged
-  column-list-incomplete).
-- Curated, source-verified extension type map (citext, hstore, pgvector, PostGIS, …).
-- Optional exact search within alignment groups when a table has >1 irregular-size column.
-- Offering the rule upstream to squawk once rowdiet has proven out.
+Shipped: **route 3 end to end** (`docs/wasm-plan.md` — the off-by-default `pg-exact` parser
+feature doubling as a differential oracle, the Rust-linked `wasm32-wasip1` module with the real
+PG17 parser, and the static paste-your-DDL page in `web/`: `./web/build.sh`, then serve `web/`);
+partition children inheriting the parent's modeled layout; a source-verified extension map
+(pgvector, citext, hstore); an exact minimum-padding search when a table has several
+irregular-size columns; the `cargo rowdiet` subcommand; a wasm-opt size pass; and the full local
+verification matrix (`scripts/ci.sh` — becomes the CI workflow at publish time).
+
+Remaining: publish-time distribution (crates.io, prebuilt binaries, pre-commit hook, GitHub
+Action, hosted webpage), a grown extension map (PostGIS, …), and offering the rule upstream to
+squawk once rowdiet has proven out publicly.
 
 ## License
 

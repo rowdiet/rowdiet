@@ -113,10 +113,12 @@ pub extern "C" fn rowdiet_free(ptr: *mut u8, len: usize) {
     unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len))) };
 }
 
-/// The pointer/length pair must describe a live buffer in this module's memory (the ABI
-/// contract); anything else is host error. Free the returned buffer with
-/// `rowdiet_free(out_ptr, out_len)`.
-pub fn lint_raw(ptr: *const u8, len: usize) -> (*mut u8, usize) {
+/// Free the returned buffer with `rowdiet_free(out_ptr, out_len)`.
+///
+/// # Safety
+/// `ptr..ptr+len` must be a live, initialized buffer in this module's memory (the ABI
+/// contract); anything else is host error.
+pub unsafe fn lint_raw(ptr: *const u8, len: usize) -> (*mut u8, usize) {
     let input = unsafe { std::slice::from_raw_parts(ptr, len) };
     let output = lint_json(&String::from_utf8_lossy(input))
         .into_bytes()
@@ -131,9 +133,12 @@ fn pack(ptr: u32, len: u32) -> u64 {
     (u64::from(ptr) << 32) | u64::from(len)
 }
 
+/// # Safety
+/// Same contract as [`lint_raw`]: the host passes a live buffer previously obtained from
+/// `rowdiet_alloc` and filled with the input JSON.
 #[no_mangle]
-pub extern "C" fn rowdiet_lint(ptr: *const u8, len: usize) -> u64 {
-    let (out_ptr, out_len) = lint_raw(ptr, len);
+pub unsafe extern "C" fn rowdiet_lint(ptr: *const u8, len: usize) -> u64 {
+    let (out_ptr, out_len) = unsafe { lint_raw(ptr, len) };
     pack(out_ptr as usize as u32, out_len as u32)
 }
 

@@ -311,14 +311,20 @@ mod differential {
         for backend in [ParserBackend::Sqlparser, ParserBackend::PgExact] {
             let analysis = analyze_sources_with(
                 backend,
-                &[SqlSource { name: "V1__evt.sql".into(), sql: sql.into() }],
+                &[SqlSource {
+                    name: "V1__evt.sql".into(),
+                    sql: sql.into(),
+                }],
                 &Config::default(),
             );
             let child = &analysis.tables[1];
             assert_eq!(child.name, "evt_1");
             assert_eq!(child.natts, 2, "{backend:?}");
             assert!(!child.incomplete);
-            assert_eq!(child.avoidable_bytes_per_row, analysis.tables[0].avoidable_bytes_per_row);
+            assert_eq!(
+                child.avoidable_bytes_per_row,
+                analysis.tables[0].avoidable_bytes_per_row
+            );
             assert!(analysis.notes.is_empty(), "{backend:?}: {:?}", analysis.notes);
         }
     }

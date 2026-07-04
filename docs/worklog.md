@@ -69,5 +69,14 @@
   posted to ukb: partition children still model column-list-incomplete (gate-pass is vacuous
   exactness) — parent-layout inheritance promoted to roadmap.
 
-Next: wasm CI job, wasm-opt/export pruning, partition-child parent-layout inheritance, in-group
-exact search, squawk upstream offer.
+- AFK follow-up batch (everything not gated on Sergey): partition children now inherit the
+  parent's modeled layout (both backends carry PARTITION OF's parent; ukb's h00–h15 analyze for
+  real); exact minimum-padding search for multi-irregular fixed blocks (residue-class DP, two
+  timetz + int4 → 0 pad); wasm-opt -Oz integrated into build-wasip1.sh (cdylib 857→757 KB gz,
+  optimized module re-validated via node smoke); scripts/ci.sh = the full local matrix (fmt,
+  clippy -D warnings, tests, no-default builds, wasm32 check, wasip1+smoke — becomes the GH
+  workflow at publish); clippy strictness fixes (unsafe fn contracts on the wasm ABI).
+
+Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
+pre-commit hook, GH Action, hosted page), squawk upstream offer. Ungated backlog: grow the
+extension map (PostGIS, …).

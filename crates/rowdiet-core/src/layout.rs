@@ -150,7 +150,7 @@ pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
 /// the heuristic's own class order, so regular schemas keep their familiar shape.
 fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
-    if fixed_len < 3 || fixed_len > 24 {
+    if !(3..=24).contains(&fixed_len) {
         return;
     }
     let sorted_fixed: Vec<ColumnKind> = order[..fixed_len].iter().map(|&i| kinds[i]).collect();
@@ -159,17 +159,25 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     }
     let mut classes: Vec<FixedClass> = Vec::new();
     for &index in order[..fixed_len].iter() {
-        let ColumnKind::Fixed { len, align } = kinds[index] else { unreachable!("fixed prefix") };
+        let ColumnKind::Fixed { len, align } = kinds[index] else {
+            unreachable!("fixed prefix")
+        };
         let key = (align.bytes(), len % MAXALIGN);
         match classes.iter_mut().find(|c| c.key == key) {
             Some(class) => class.members.push(index),
-            None => classes.push(FixedClass { key, members: vec![index] }),
+            None => classes.push(FixedClass {
+                key,
+                members: vec![index],
+            }),
         }
     }
     if classes.len() > 12 {
         return;
     }
-    let mut dp = Dp { classes: &classes, memo: std::collections::HashMap::new() };
+    let mut dp = Dp {
+        classes: &classes,
+        memo: std::collections::HashMap::new(),
+    };
     let full: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
     let mut counts = full;
     let mut off = 0u64;

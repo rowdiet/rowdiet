@@ -61,11 +61,13 @@ index)`. Irregulars are fixed types whose size isn't a multiple of their own ali
 `timetz (12,d)` and `macaddr (6,i)` among built-ins (also `tid (6,s)`); putting them last in
 their group keeps every following smaller-alignment column aligned. For all-regular schemas the
 result is provably zero-padding under any NULL mask (a subsequence of a desc-aligned regular
-sequence is still one). With ≥2 irregulars in one group a sorted order can be up to 4 bytes off
-optimal (two `timetz` always pad 4 between; an interposed 4-byte column would fix it) — the
-report stays honest because both layouts are *computed*, never assumed; an exact tiny search
-within groups is roadmap. A safety guard keeps the original order whenever the heuristic doesn't
-strictly improve the metric.
+sequence is still one). With ≥2 irregulars in one group a sorted order can leave padding an
+interposed smaller column would absorb (two `timetz` pad 4 between; `timetz, int4, timetz` is
+zero) — when the sorted fixed block still pads, `refine_fixed_block` finds the exact scenario
+minimum with a memoized search over (alignment, len mod 8) classes × offset residue (ties prefer
+the heuristic's class order; capped at 24 fixed columns / 12 classes, falling back to the sort).
+The report stays honest because both layouts are *computed*, never assumed, and a safety guard
+keeps the original order whenever the suggestion doesn't strictly improve the metric.
 
 ## Type catalog provenance
 
@@ -102,6 +104,10 @@ waste. No unverified extension entries are hardcoded (curated map is roadmap).
   implicitly NOT NULL; serial types likewise.
 - CTAS (`CREATE TABLE … AS SELECT`) and `LIKE` clauses cannot be resolved statically → note +
   ghost/incomplete.
+- `PARTITION OF parent`: the child inherits the parent's modeled columns verbatim (children
+  cannot add columns), including the parent's incompleteness; an out-of-set parent leaves the
+  child honestly not-modeled. Plain `INHERITS` stays incomplete (inherited-plus-own semantics
+  are not modeled).
 
 ## Version ordering
 
