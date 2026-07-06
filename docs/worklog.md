@@ -82,6 +82,22 @@
   file:// double-click; the multi-file page stays the hosted variant (a "server" was only ever a
   static file host — browsers block module imports + wasm fetch on file:// origins).
 
+- Production-scale validation (2026-07-23, agent sweep over two production Kotlin/Flyway
+  codebases, corpus kept privately outside this repo): 49 migration dirs / 1,552 files / ~8,400
+  statements — zero crashes, zero pg-exact skips, sqlparser skip-rate 0.8% (DO blocks, LIKE
+  INCLUDING, a few PG-only ALTERs), and ZERO numeric divergences between backends on every
+  shared table. Real findings: 140 tables with avoidable padding across the two schemas (max
+  28 B/row on a 55-column table); recurring anti-pattern = enums/booleans interleaved between
+  8-byte columns. Web page verified against CLI line-for-line on a partman-grade file; its one
+  cosmetic issue (labels illegible on 30+-column bars) fixed same day. Known modeling gap
+  promoted to backlog: DDL executed inside DO bodies is invisible to the fold on both backends
+  (pg-exact parses the DO silently; sqlparser at least notes the skip).
+- Parallel research (agents): domains — every rowdiet TLD unregistered; lean rowdiet.dev +
+  rowdiet.com (~$19/yr1), spike research/domains.md. Gradle plugin — GO via Chicory pure-JVM
+  wasm (empirical: even the exnref-EH pg-exact module runs; v1 = sqlparser-only wasm compiled
+  to classes at build time, Java 11+, zero native artifacts, ~2-4 days), spike
+  research/gradle-plugin-verdict.md.
+
 Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
-pre-commit hook, GH Action, hosted page), squawk upstream offer. Ungated backlog: grow the
-extension map (PostGIS, …).
+pre-commit hook, GH Action, hosted page), squawk upstream offer, domain purchases, Gradle-plugin
+build. Ungated backlog: DO-body DDL visibility note, grow the extension map (PostGIS, …).

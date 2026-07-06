@@ -112,6 +112,12 @@ function render(out) {
   for (const t of out.analysis.tables) {
     els.results.append(tableCard(t, rows));
   }
+  // Wide tables squeeze segments below legibility — drop those labels (tooltips keep the name).
+  requestAnimationFrame(() => {
+    for (const seg of els.results.querySelectorAll(".seg")) {
+      if (seg.textContent && seg.clientWidth < 26) seg.textContent = "";
+    }
+  });
   for (const n of out.analysis.notes) {
     els.results.append(el("p", "note", `${n.origin.source}:${n.origin.line} [${n.kind}] ${n.detail}`));
   }
