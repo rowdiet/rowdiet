@@ -21,6 +21,13 @@ split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touchi
 - Parse failure ladder: skip loudly (note) → sniff the target (`ALTER TABLE x` → mark table `x`
   incomplete; `CREATE TABLE y` → remember `y` as a ghost so later ALTERs say "its CREATE was
   skipped" instead of "unknown table").
+- `DO` bodies (both backends, shared path in `lib.rs`): extract the dollar-quoted body, re-split
+  it, parse each fragment from its first word-boundary CREATE/ALTER/DROP. Type-creating DDL is
+  folded (idempotency-guard pattern — a column using the type implies it exists; wrong only if
+  the guard would have *not* created it, in which case PG itself would have errored). Table DDL
+  is never folded: conditional execution is unknowable, so it becomes a `do-block` note +
+  incomplete flag. DDL-looking fragments that resist parsing (dynamic `EXECUTE format`) produce
+  one summary note. DML-only DO bodies are silent — same as any other DML.
 
 ## The scenario model (what the numbers mean)
 

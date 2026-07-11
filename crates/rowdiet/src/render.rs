@@ -165,6 +165,7 @@ fn kind_label(kind: NoteKind) -> &'static str {
         NoteKind::Redefined => "redefined",
         NoteKind::DuplicateColumn => "duplicate-column",
         NoteKind::UnknownColumn => "unknown-column",
+        NoteKind::DoBlockDdl => "do-block",
     }
 }
 

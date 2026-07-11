@@ -28,6 +28,7 @@ pub enum NoteKind {
     Redefined,
     DuplicateColumn,
     UnknownColumn,
+    DoBlockDdl,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +390,20 @@ impl Folder {
             self.note(origin, NoteKind::AlterUnknownTable, detail);
         }
         false
+    }
+
+    /// Table DDL found inside a DO body: execution is conditional, so it is never folded — the
+    /// table (when known) is marked incomplete and the finding surfaces as a note.
+    pub fn conditional_table_ddl(&mut self, table: &RawName, verb: &str, origin: &Origin) {
+        if let Some(entry) = self.tables.get_mut(&table.key) {
+            entry.incomplete = true;
+        }
+        let detail = format!("DO block: {verb} {} — conditional execution, not folded", table.display);
+        self.note(origin, NoteKind::DoBlockDdl, detail);
+    }
+
+    pub fn do_block_note(&mut self, origin: &Origin, detail: String) {
+        self.note(origin, NoteKind::DoBlockDdl, detail);
     }
 
     fn unknown_column(&mut self, table: &RawName, column: &str, origin: &Origin) {

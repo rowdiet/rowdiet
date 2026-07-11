@@ -146,6 +146,66 @@ fn is_ident_byte(c: u8) -> bool {
     c == b'_' || c.is_ascii_alphanumeric() || c >= 0x80
 }
 
+/// The first dollar-quoted body in `text` (`$tag$ … $tag$`), comment/string-aware up to the
+/// opening tag. Used to look inside `DO` blocks; None when absent or unterminated.
+pub fn dollar_quoted_body(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1u32;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => match dollar_tag_end(b, i) {
+                Some(tag_end) => {
+                    let tag = &text[i..tag_end];
+                    let close = text[tag_end..].find(tag)?;
+                    return Some(&text[tag_end..tag_end + close]);
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+pub(crate) fn ident_byte(c: u8) -> bool {
+    is_ident_byte(c)
+}
+
 /// `$tag$` (tag possibly empty, never starting with a digit — `$1` stays a parameter). Returns the
 /// index just past the closing `$` of the opening tag.
 fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {

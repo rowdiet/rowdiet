@@ -98,6 +98,12 @@
   to classes at build time, Java 11+, zero native artifacts, ~2-4 days), spike
   research/gradle-plugin-verdict.md.
 
+- DO-body DDL visibility closed (Sergey: "if doable without a rabbit hole"): shared best-effort
+  scan on both backends — type DDL behind guards folds (fixes the corpus's 3 unknown enum
+  types), table DDL becomes a conditional `do-block` note + incomplete flag, dynamic SQL is
+  flagged; DML-only DO bodies now silent on both backends (sqlparser's per-DO skip-note noise is
+  gone). Full plpgsql semantics deliberately out of scope.
+
 Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
 pre-commit hook, GH Action, hosted page), squawk upstream offer, domain purchases, Gradle-plugin
-build. Ungated backlog: DO-body DDL visibility note, grow the extension map (PostGIS, …).
+build. Ungated backlog: grow the extension map (PostGIS, …).

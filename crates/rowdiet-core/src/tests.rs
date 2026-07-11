@@ -40,7 +40,45 @@ fn end_to_end_migration_series() {
     );
     assert_eq!(t.altered_in.len(), 1);
     assert!(t.any_nullable);
-    assert!(analysis.notes.iter().any(|n| n.kind == NoteKind::SkippedStatement));
+    assert!(
+        analysis.notes.is_empty(),
+        "DML-only DO blocks are silent now: {:?}",
+        analysis.notes
+    );
+}
+
+#[test]
+fn do_block_enum_guard_resolves_types() {
+    let sql = "DO $$ BEGIN\n CREATE TYPE mood AS ENUM ('ok','bad');\nEXCEPTION WHEN duplicate_object THEN null;\nEND $$;\nCREATE TABLE t (m mood NOT NULL, id bigint NOT NULL);";
+    let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
+    let t = &analysis.tables[0];
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    assert!(t.assumed_types.is_empty());
+    assert_eq!(t.tier, Tier::Exact);
+    assert_eq!(t.natts, 2);
+}
+
+#[test]
+fn do_block_table_ddl_is_conditional_not_folded() {
+    let sql = "CREATE TABLE t (a bigint NOT NULL);\nDO $$ BEGIN\n IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 't' AND column_name = 'x') THEN\n ALTER TABLE t ADD COLUMN x int;\n END IF;\nEND $$;";
+    let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+    let t = &analysis.tables[0];
+    assert_eq!(t.natts, 1, "conditional column must not be folded");
+    assert!(t.incomplete);
+    assert!(
+        analysis.notes.iter().any(|n| n.kind == NoteKind::DoBlockDdl),
+        "{:?}",
+        analysis.notes
+    );
+}
+
+#[test]
+fn dynamic_sql_in_do_is_flagged() {
+    let sql = "DO $x$ BEGIN\n EXECUTE format('ALTER TABLE %I ADD COLUMN y int', tbl);\nEND $x$;";
+    let analysis = analyze_sources(&[src("V1__d.sql", sql)], &Config::default());
+    assert_eq!(analysis.notes.len(), 1);
+    assert_eq!(analysis.notes[0].kind, NoteKind::DoBlockDdl);
+    assert!(analysis.notes[0].detail.contains("not statically analyzable"));
 }
 
 #[test]
@@ -326,6 +364,26 @@ mod differential {
                 analysis.tables[0].avoidable_bytes_per_row
             );
             assert!(analysis.notes.is_empty(), "{backend:?}: {:?}", analysis.notes);
+        }
+    }
+
+    #[test]
+    fn do_block_scan_agrees_across_backends() {
+        let sql = "DO $$ BEGIN CREATE TYPE mood AS ENUM ('ok','bad'); EXCEPTION WHEN duplicate_object THEN null; END $$;\nCREATE TABLE t (m mood NOT NULL, id bigint NOT NULL);\nDO $$ BEGIN IF true THEN ALTER TABLE t ADD COLUMN x int; END IF; END $$;";
+        for backend in [ParserBackend::Sqlparser, ParserBackend::PgExact] {
+            let analysis = analyze_sources_with(
+                backend,
+                &[SqlSource {
+                    name: "V1__do.sql".into(),
+                    sql: sql.into(),
+                }],
+                &Config::default(),
+            );
+            let t = &analysis.tables[0];
+            assert_eq!(t.natts, 2, "{backend:?}");
+            assert!(t.assumed_types.is_empty(), "{backend:?}");
+            assert!(t.incomplete, "{backend:?}");
+            assert_eq!(analysis.notes.len(), 1, "{backend:?}: {:?}", analysis.notes);
         }
     }
 
