@@ -239,6 +239,16 @@ fn map_rename(rs: &pb::RenameStmt) -> Vec<DdlOp> {
             };
             vec![DdlOp::RenameTable { table, new }]
         }
+        (pb::ObjectType::ObjectType | pb::ObjectType::ObjectDomain, _) => {
+            let Some(name) = rs.object.as_ref().and_then(|n| dropped_name(n)) else {
+                return vec![DdlOp::Irrelevant];
+            };
+            let new = RawName {
+                display: rs.newname.clone(),
+                key: rs.newname.clone(),
+            };
+            vec![DdlOp::RenameType { name, new }]
+        }
         _ => vec![DdlOp::Irrelevant],
     }
 }

@@ -112,6 +112,14 @@ impl Catalog {
         self.session.remove(key);
     }
 
+    /// `ALTER TYPE old RENAME TO new`: moves a session-defined type; a rename of a type created
+    /// outside the analyzed set is a no-op (the new name stays unresolvable, as before).
+    pub fn rename_type(&mut self, old: &str, new: String) {
+        if let Some(entry) = self.session.remove(old) {
+            self.session.insert(new, entry);
+        }
+    }
+
     pub fn resolve(&self, t: &TypeRef) -> Resolved {
         if t.dims > 0 {
             let elem = self.resolve_scalar(&t.key, None);

@@ -170,6 +170,7 @@ impl Folder {
                     self.catalog.drop_type(&name.key);
                 }
             }
+            DdlOp::RenameType { name, new } => self.catalog.rename_type(&name.key, new.key),
             DdlOp::Irrelevant => {}
         }
     }

@@ -196,7 +196,8 @@ fn dispatch_do_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &Origin
         | DdlOp::CreateRange { .. }
         | DdlOp::CreateBase { .. }
         | DdlOp::CreateDomain { .. }
-        | DdlOp::DropTypes { .. } => folder.apply(vec![op], origin, false),
+        | DdlOp::DropTypes { .. }
+        | DdlOp::RenameType { .. } => folder.apply(vec![op], origin, false),
         DdlOp::CreateTable { name, .. } => folder.conditional_table_ddl(&name, "CREATE TABLE", origin),
         DdlOp::AddColumn { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (add column)", origin),
         DdlOp::DropColumns { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (drop column)", origin),

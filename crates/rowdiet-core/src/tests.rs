@@ -73,6 +73,16 @@ fn do_block_table_ddl_is_conditional_not_folded() {
 }
 
 #[test]
+fn renamed_type_resolves_under_new_name() {
+    let sql = "CREATE TYPE subject AS ENUM ('a','b');\nALTER TYPE subject RENAME TO run_subject;\nCREATE TABLE t (s run_subject NOT NULL, id bigint NOT NULL);";
+    let analysis = analyze_sources(&[src("V1__r.sql", sql)], &Config::default());
+    let t = &analysis.tables[0];
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    assert!(t.assumed_types.is_empty());
+    assert_eq!(t.tier, Tier::Exact);
+}
+
+#[test]
 fn dynamic_sql_in_do_is_flagged() {
     let sql = "DO $x$ BEGIN\n EXECUTE format('ALTER TABLE %I ADD COLUMN y int', tbl);\nEND $x$;";
     let analysis = analyze_sources(&[src("V1__d.sql", sql)], &Config::default());
@@ -218,6 +228,7 @@ mod differential {
         "CREATE DOMAIN code AS varchar(20)",
         "DROP TABLE IF EXISTS a, b",
         "DROP TYPE status",
+        "ALTER TYPE status RENAME TO status_v2",
         "CREATE INDEX i ON t (a)",
         "CREATE TABLE part_parent (a int NOT NULL, b bigint NOT NULL) PARTITION BY RANGE (a)",
         "CREATE TABLE part_child PARTITION OF part_parent FOR VALUES FROM (1) TO (10)",
@@ -325,6 +336,10 @@ mod differential {
             },
             DdlOp::DropTypes { names } => DdlOp::DropTypes {
                 names: names.into_iter().map(norm_name).collect(),
+            },
+            DdlOp::RenameType { name, new } => DdlOp::RenameType {
+                name: norm_name(name),
+                new: norm_name(new),
             },
             DdlOp::Irrelevant => DdlOp::Irrelevant,
         }

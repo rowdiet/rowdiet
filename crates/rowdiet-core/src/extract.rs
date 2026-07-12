@@ -87,6 +87,10 @@ pub enum DdlOp {
     DropTypes {
         names: Vec<RawName>,
     },
+    RenameType {
+        name: RawName,
+        new: RawName,
+    },
     Irrelevant,
 }
 
@@ -100,6 +104,16 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
         sq::Statement::CreateTable(ct) => vec![map_create_table(ct)],
         sq::Statement::AlterTable(at) => map_alter_table(at),
         sq::Statement::CreateType { name, representation } => vec![map_create_type(&name, representation)],
+        sq::Statement::AlterType(at) => match at.operation {
+            sq::AlterTypeOperation::Rename(rename) => vec![DdlOp::RenameType {
+                name: raw_name(&at.name),
+                new: RawName {
+                    display: rename.new_name.value.clone(),
+                    key: ident_key(&rename.new_name),
+                },
+            }],
+            _ => vec![DdlOp::Irrelevant],
+        },
         sq::Statement::CreateDomain(cd) => {
             vec![DdlOp::CreateDomain {
                 name: raw_name(&cd.name),
