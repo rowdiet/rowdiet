@@ -222,6 +222,9 @@ function footprintOf(stats) {
 function seg(text, bytes, total, tip, cls) {
   const s = el("span", `seg ${cls}`, text);
   s.style.flexGrow = String(bytes);
+  // A byte-proportional basis keeps proportions honest when a wide table overflows into the
+  // bar's own horizontal scroll (grow-only would collapse every segment to its min width).
+  s.style.flexBasis = `${bytes * 6}px`;
   s.dataset.tip = `${tip} · ${bytes} B`;
   s.addEventListener("pointerenter", showTip);
   s.addEventListener("pointermove", moveTip);
