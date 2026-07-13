@@ -116,7 +116,22 @@
   state stands: pg-exact handles it, sqlparser degrades visibly; the real fix is contributing
   ARRAY-suffix support upstream to sqlparser-rs.
 
-Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
-pre-commit hook, GH Action, hosted page), squawk upstream offer, domain purchases, Gradle-plugin
-build. Ungated backlog: grow the extension map (PostGIS, …), upstream ARRAY-suffix parsing to
-sqlparser-rs (kills divergence class R5).
+- Repo split for publishing (Sergey's call): this repo is now pure Rust (core + CLI +
+  rowdiet-wasm + the wasm recipe — the wasm module stays here because its artifact feeds BOTH
+  downstream repos); the page moved to ../rowdiet-web (fresh history, builds the module via
+  ROWDIET_REPO, becomes a release-artifact download at publish); ../rowdiet-jvm is the JVM
+  umbrella (Sergey's second-thought upgrade: a reusable core library + thin gradle-plugin /
+  flyway-callback / maven-plugin adapters, Flyway/ArchUnit-style, instead of a Gradle-only
+  plugin); the spike bundle stays put, now under git. ci.sh's wasm leg swapped from the web
+  loader smoke to a wasmtime smoke (the loader smoke lives in rowdiet-web).
+- sqlparser ARRAY-suffix upstream (agent): NOT reported as an issue; already fixed in open PR
+  #2356 (CI-green, unreviewed ~8 weeks) — verified against our production shapes on a local
+  branch, two real gaps found (GenericDialect gating, missing custom-type/ALTER tests) with a
+  local supplement commit prepared; nothing pushed. Sergey's move: support #2356 with the
+  verification + suggested changes rather than filing a duplicate. Detail:
+  rowdiet-spike/research/sqlparser-upstream.md.
+
+Next (gated on Sergey): publish-time bundle (remotes for all three repos, CI workflows,
+crates.io, prebuilt binaries, pre-commit hook, GH Action, hosted page), rowdiet-jvm
+implementation, sqlparser PR #2356 support/review, squawk upstream offer, domain purchases.
+Ungated backlog: grow the extension map (PostGIS, …).

@@ -16,11 +16,14 @@ cargo check -p rowdiet --no-default-features
 echo "== core on wasm32-unknown-unknown (no default features)"
 cargo check -p rowdiet-core --no-default-features --target wasm32-unknown-unknown
 WASI_SDK="${WASI_SDK:-$HOME/projs/rowdiet-spike/experiments/wasi-sdk-33.0-arm64-macos}"
-if [ -d "$WASI_SDK" ] && command -v node >/dev/null 2>&1; then
-    echo "== wasip1 module + loader smoke"
-    ./web/build.sh
-    node web/smoke.mjs
+if [ -d "$WASI_SDK" ] && command -v wasmtime >/dev/null 2>&1; then
+    echo "== wasip1 module + wasmtime smoke"
+    ./wasm/build-wasip1.sh > /dev/null
+    smoke_out=$(printf '{"sources":[{"name":"s.sql","sql":"CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);"}],"fail_over":0}' \
+        | wasmtime run target/wasm32-wasip1/wasm/rowdiet-smoke.wasm)
+    printf '%s' "$smoke_out" | grep -q '"avoidable_bytes_per_row":8' || { echo "wasm smoke mismatch: $smoke_out"; exit 1; }
+    echo "wasm smoke ok"
 else
-    echo "== wasip1 leg SKIPPED (wasi-sdk or node missing)"
+    echo "== wasip1 leg SKIPPED (wasi-sdk or wasmtime missing)"
 fi
 echo "CI matrix green"
