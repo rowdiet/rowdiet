@@ -104,6 +104,19 @@
   flagged; DML-only DO bodies now silent on both backends (sqlparser's per-DO skip-note noise is
   gone). Full plpgsql semantics deliberately out of scope.
 
+- Corpus extended to a third production codebase (agent): three-repo corpus now 80 dirs /
+  1,950 files. Third repo: 120 tables (no table-set drift at all), 69 with shallow avoidable
+  padding (max 12 B/row), zero unknown types. Rename-type folding (bf21e45) + DO-body scan
+  validated: unknown types across the whole corpus now 0; table-level numbers bit-identical
+  across binary versions. FIRST genuine numeric divergence found (reproducer R5 in the private
+  corpus results): a column typed with the SQL-standard `ARRAY` suffix on a custom type —
+  sqlparser cannot parse the ARRAY keyword form, skips loudly, and reports the table
+  natts-short/incomplete while pg-exact models it fully. A textual preprocess is unsafe
+  (`ARRAY[...]` constructor in DEFAULTs is token-identical to `type ARRAY[n]`), so the honest
+  state stands: pg-exact handles it, sqlparser degrades visibly; the real fix is contributing
+  ARRAY-suffix support upstream to sqlparser-rs.
+
 Next (gated on Sergey): publish-time bundle (remote, CI workflow, crates.io, prebuilt binaries,
 pre-commit hook, GH Action, hosted page), squawk upstream offer, domain purchases, Gradle-plugin
-build. Ungated backlog: grow the extension map (PostGIS, …).
+build. Ungated backlog: grow the extension map (PostGIS, …), upstream ARRAY-suffix parsing to
+sqlparser-rs (kills divergence class R5).
