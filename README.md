@@ -129,9 +129,9 @@ varlena (`bpchar`); an enum value is 4 bytes.
 
 ## Status & roadmap
 
-Shipped: **route 3 end to end** (`docs/wasm-plan.md` — the off-by-default `pg-exact` parser
-feature doubling as a differential oracle, the Rust-linked `wasm32-wasip1` module with the real
-PG17 parser, and the static paste-your-DDL page, now in its own repo, `rowdiet-web`);
+Shipped: the off-by-default `pg-exact` parser feature doubling as a differential oracle, the
+Rust-linked `wasm32-wasip1` module with the real PG17 parser (`docs/design.md` § Parser
+decision), and the static paste-your-DDL page (its own repo, `rowdiet-web`);
 partition children inheriting the parent's modeled layout; a source-verified extension map
 (pgvector, citext, hstore); an exact minimum-padding search when a table has several
 irregular-size columns; the `cargo rowdiet` subcommand; a wasm-opt size pass; and the full local

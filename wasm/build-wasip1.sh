@@ -2,7 +2,7 @@
 # Build rowdiet-wasm (reactor cdylib + smoke bin) for wasm32-wasip1 with the pinned wasi-sdk
 # recipe — see wasm/README.md for the why of every flag. WASI_SDK overrides the default path.
 set -eu
-WASI_SDK="${WASI_SDK:-$HOME/projs/rowdiet-spike/experiments/wasi-sdk-33.0-arm64-macos}"
+WASI_SDK="${WASI_SDK:-/opt/wasi-sdk-33.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export CC_wasm32_wasip1="$WASI_SDK/bin/clang"
 export AR_wasm32_wasip1="$WASI_SDK/bin/llvm-ar"

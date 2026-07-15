@@ -15,7 +15,7 @@ echo "== CLI without pg-exact"
 cargo check -p rowdiet --no-default-features
 echo "== core on wasm32-unknown-unknown (no default features)"
 cargo check -p rowdiet-core --no-default-features --target wasm32-unknown-unknown
-WASI_SDK="${WASI_SDK:-$HOME/projs/rowdiet-spike/experiments/wasi-sdk-33.0-arm64-macos}"
+WASI_SDK="${WASI_SDK:-/opt/wasi-sdk-33.0}"
 if [ -d "$WASI_SDK" ] && command -v wasmtime >/dev/null 2>&1; then
     echo "== wasip1 module + wasmtime smoke"
     ./wasm/build-wasip1.sh > /dev/null

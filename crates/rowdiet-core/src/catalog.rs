@@ -241,7 +241,7 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         })
     };
     match key {
-        // Verified against pg_type.dat in the spike research (64-bit, MAXALIGN 8).
+        // Verified against pg_type.dat (64-bit, MAXALIGN 8).
         "bool" => fixed(1, Align::Char),
         // The quoted one-byte "char" type; extract maps `"char"` to this key.
         "pgchar" => fixed(1, Align::Char),
@@ -275,7 +275,7 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
             known: true,
             implicit_not_null: false,
         }),
-        // Standard pg_type.dat values, not re-verified in the spike research.
+        // Standard pg_type.dat values, not independently re-verified.
         "lseg" | "box" => fixed(32, Align::Double),
         "line" | "circle" => fixed(24, Align::Double),
         "pg_lsn" => fixed(8, Align::Double),

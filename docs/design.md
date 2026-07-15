@@ -1,8 +1,6 @@
 # rowdiet design notes
 
-Distilled from the spike research (three max-effort research axes: parsers/WASM, padding
-consistency, prior art; artifacts live outside this repo in the spike bundle). This file records
-the decisions the code embodies and the reasoning that must survive refactors.
+The decisions the code embodies and the reasoning that must survive refactors.
 
 ## Pipeline
 
@@ -50,11 +48,10 @@ byte-guaranteed — payload lengths shift downstream pads in both orders. There 
 provable fact recorded here for a future refinement: with the tail sequence preserved, the
 realized recovery is **never negative** (induction over the walk: a running delta `D ≥ 0` before
 an item of alignment `a` becomes `D' = D + pad(x+D,a) − pad(x,a) ≥ 0`). So the current Estimate
-label is conservative, not wrong. The spike's research author confirmed this reading on the
-bridge (2026-07-23): AXIS 2's "guaranteed component over fixed columns alone" was a hypothetical
-for the *clustered* layout — in an interleaved table a fixed column's real offset rides on the
-preceding varlena's actual length — so the two-tier shape is a correction that **supersedes the
-research letter**, not a compromise against it.
+label is conservative, not wrong. A tempting third metric — "guaranteed padding computed over
+the fixed columns alone" — is deliberately absent: it only describes the *clustered* layout,
+while in an interleaved table a fixed column's real offset rides on the preceding varlena's
+actual length, so presenting that number as guaranteed for the as-written order would overclaim.
 
 Null bitmap: present per-row only when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it is display information only
@@ -80,14 +77,14 @@ keeps the original order whenever the suggestion doesn't strictly improve the me
 
 `catalog.rs` has two clearly-marked blocks:
 
-1. **Verified in the spike research against `pg_type.dat`** — the ~30 core entries (including
-   the lint-loud surprises: `uuid (16,c)`, `timetz (12,d)` irregular, `macaddr (6,i)` irregular,
-   `inet`/`cidr` varlena, `numeric` varlena, `char(1)` → varlena bpchar).
-2. **Standard `pg_type.dat` values, not re-verified in the spike** — geometric types, `pg_lsn`,
+1. **Verified against `pg_type.dat`** — the ~30 core entries (including the lint-loud
+   surprises: `uuid (16,c)`, `timetz (12,d)` irregular, `macaddr (6,i)` irregular, `inet`/`cidr`
+   varlena, `numeric` varlena, `char(1)` → varlena bpchar).
+2. **Standard `pg_type.dat` values, not independently re-verified** — geometric types, `pg_lsn`,
    `tsvector`/`tsquery`, multiranges, `tid`-family omissions. If any is ever found wrong, fix the
    table, not the walk.
 
-Derived rules (all from PG source, cited in the spike): enum → `(4,i)`; domain → base verbatim;
+Derived rules (all from PostgreSQL source): enum → `(4,i)`; domain → base verbatim;
 array/range/multirange → varlena, `d` iff element/subtype is `d`, else `i`; composite → `(-1,d)`;
 serial family → int type + implicit NOT NULL. `varchar(n≤31)`/`char(n≤31)` are *proven short*
 (≤ 4·31+1 = 125 B worst-case UTF-8, under the 127 B short-varlena cap) — stored unaligned.
@@ -125,24 +122,20 @@ recursively; ordering applies per directory.
 
 ## Parser decision (and the libpg_query question, settled)
 
-sqlparser-rs 0.62 is primary: typed AST, Apache governance, wasm32-unknown-unknown-clean
-(~400 KB gz measured in the spike). Its known statement-level gaps are contained by the
-splitter. `libpg_query` (the real PG parser) was empirically re-verified for wasm shipping at
-Sergey's request: it **builds and runs end-to-end** on `wasm32-unknown-emscripten` (374 KB gz +
-glue) and `wasm32-wasip1` + wasi-sdk 33 (388 KB gz, runs under wasmtime and Node's WASI), with
-PG's sigsetjmp error handling demonstrably working on both — but it is **structurally blocked**
-from `wasm32-unknown-unknown` (no libc, no setjmp/longjmp runtime) and wasm-bindgen supports no
-other wasm target. So it cannot be the one pure-Rust core behind the planned webpage; it remains
-the native differential-test oracle (roadmap), and a two-module hybrid (pganalyze's emscripten
-JS package + the Rust core wasm) is the recorded fallback if PG-exact web parsing is ever
-required. Full verdict with recipes: `research/libpg-query-wasm-verdict.md` in the spike bundle.
+sqlparser-rs 0.62 is the default parser: typed AST, Apache governance,
+wasm32-unknown-unknown-clean (~400 KB gzipped, measured). Its known statement-level gaps are
+contained by the splitter. `libpg_query` (the real PG parser) was tested empirically for wasm
+shipping: it builds and runs end-to-end on `wasm32-unknown-emscripten` and on `wasm32-wasip1` +
+wasi-sdk 33 (~390 KB gzipped, runs under wasmtime and Node's WASI), with PG's sigsetjmp error
+handling working on both — but it is structurally blocked from `wasm32-unknown-unknown` (no
+libc, no setjmp/longjmp runtime), and wasm-bindgen supports no other wasm target.
 
-**Decision update (2026-07-23, Sergey — confirmed in-session after driving the researcher
-directly):** route 3 is adopted for the web tier — a single Rust-linked `wasm32-wasip1` module
-with `libpg_query` behind an off-by-default `pg-exact` feature, WASI preferred over emscripten
-for toolchain-ownership reasons. sqlparser-rs remains the default parser and native-primary
-path; the differential oracle merges into the `pg-exact` backend's test suite. Plan:
-`docs/wasm-plan.md`; rowdiet-owned build recipe + stub headers: `wasm/`.
+The adopted shape: the web tier ships a single Rust-linked `wasm32-wasip1` module with
+`libpg_query` behind the off-by-default `pg-exact` feature (WASI over emscripten for
+toolchain-ownership reasons: frozen ABI, pin-a-tarball toolchain, no rustc↔linker version
+pairing). sqlparser-rs remains the default parser and the native-primary path, and the
+differential oracle lives in the `pg-exact` backend's test suite. Build recipe + stub headers:
+`wasm/`.
 
 ## Platform assumption
 

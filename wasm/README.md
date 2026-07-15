@@ -1,9 +1,8 @@
 # wasip1 build recipe (route 3: libpg_query in a Rust-linked wasm module)
 
-Proven end-to-end in the spike (`rowdiet-spike/experiments/ddlpgq-wasi`, runs under wasmtime 47
-and Node's V8 WASI; full friction log with verbatim errors in
-`rowdiet-spike/research/libpg-query-wasm-verdict.md`). This file is the rowdiet-owned copy of
-the working recipe so no future session depends on the spike bundle.
+Proven end-to-end: the module built with this recipe runs under wasmtime 47 and Node's WASI,
+including PostgreSQL's sigsetjmp error path. Every flag below earned its place against a real
+build failure.
 
 ## Pins
 
