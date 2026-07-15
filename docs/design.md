@@ -7,7 +7,7 @@ The decisions the code embodies and the reasoning that must survive refactors.
 ```
 split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touching module)
       →  fold (replay DDL over a schema model, version order)  →  layout (padding math)
-      →  report (tiered honesty)  →  CLI render (text | json | github)
+      →  report (exact | estimate tiers)  →  CLI render (text | json | github)
 ```
 
 - `split.rs` never fails: it understands PG quoting (dollar quotes with tags, E-string backslash
@@ -70,12 +70,12 @@ interposed smaller column would absorb (two `timetz` pad 4 between; `timetz, int
 zero) — when the sorted fixed block still pads, `refine_fixed_block` finds the exact scenario
 minimum with a memoized search over (alignment, len mod 8) classes × offset residue (ties prefer
 the heuristic's class order; capped at 24 fixed columns / 12 classes, falling back to the sort).
-The report stays honest because both layouts are *computed*, never assumed, and a safety guard
+The report never overclaims: both layouts are *computed*, never assumed, and a safety guard
 keeps the original order whenever the suggestion doesn't strictly improve the metric.
 
 ## Type catalog provenance
 
-`catalog.rs` has two clearly-marked blocks:
+`catalog.rs` marks the provenance of its built-in entries in two blocks:
 
 1. **Verified against `pg_type.dat`** — the ~30 core entries (including the lint-loud
    surprises: `uuid (16,c)`, `timetz (12,d)` irregular, `macaddr (6,i)` irregular, `inet`/`cidr`
@@ -93,7 +93,8 @@ Bare `char` is `char(1)`; bare `varchar` is unlimited. Quoted `"char"` is the 1-
 
 Unknown types: (varlena, `i`), flagged, teachable — per `CREATE TYPE`'s documented defaults
 (alignment defaults int4; varlena alignment must be ≥ 4). Never default to `d`: that fabricates
-waste. No unverified extension entries are hardcoded (curated map is roadmap).
+waste. No unverified extension entries are hardcoded; the curated extension entries that do
+exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definitions.
 
 ## Folding semantics
 
@@ -110,7 +111,7 @@ waste. No unverified extension entries are hardcoded (curated map is roadmap).
   ghost/incomplete.
 - `PARTITION OF parent`: the child inherits the parent's modeled columns verbatim (children
   cannot add columns), including the parent's incompleteness; an out-of-set parent leaves the
-  child honestly not-modeled. Plain `INHERITS` stays incomplete (inherited-plus-own semantics
+  child not modeled. Plain `INHERITS` stays incomplete (inherited-plus-own semantics
   are not modeled).
 
 ## Version ordering
@@ -120,7 +121,7 @@ waste. No unverified extension entries are hardcoded (curated map is roadmap).
 `R__` repeatables) after all versioned, lexicographic tiebreak. Directories are walked
 recursively; ordering applies per directory.
 
-## Parser decision (and the libpg_query question, settled)
+## Parser decision
 
 sqlparser-rs 0.62 is the default parser: typed AST, Apache governance,
 wasm32-unknown-unknown-clean (~400 KB gzipped, measured). Its known statement-level gaps are
@@ -130,7 +131,7 @@ wasi-sdk 33 (~390 KB gzipped, runs under wasmtime and Node's WASI), with PG's si
 handling working on both — but it is structurally blocked from `wasm32-unknown-unknown` (no
 libc, no setjmp/longjmp runtime), and wasm-bindgen supports no other wasm target.
 
-The adopted shape: the web tier ships a single Rust-linked `wasm32-wasip1` module with
+The adopted design: the web tier ships a single Rust-linked `wasm32-wasip1` module with
 `libpg_query` behind the off-by-default `pg-exact` feature (WASI over emscripten for
 toolchain-ownership reasons: frozen ABI, pin-a-tarball toolchain, no rustc↔linker version
 pairing). sqlparser-rs remains the default parser and the native-primary path, and the
@@ -139,6 +140,6 @@ differential oracle lives in the `pg-exact` backend's test suite. Build recipe +
 
 ## Platform assumption
 
-64-bit Postgres: `d` alignment = 8, `MAXALIGN` = 8. The docs hedge that `d` is "by no means all"
-machines; a 32-bit knob is deliberately out of scope for v1 and would be a `layout.rs` parameter,
-not a redesign.
+64-bit Postgres: `d` alignment = 8, `MAXALIGN` = 8. The Postgres docs hedge that `d` means
+8 bytes "on many machines, but by no means all"; a 32-bit knob is deliberately out of scope for
+v1 and would be a `layout.rs` parameter, not a redesign.

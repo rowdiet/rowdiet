@@ -1,4 +1,4 @@
-# wasip1 build recipe (route 3: libpg_query in a Rust-linked wasm module)
+# wasip1 build recipe: libpg_query in a Rust-linked wasm module
 
 Proven end-to-end: the module built with this recipe runs under wasmtime 47 and Node's WASI,
 including PostgreSQL's sigsetjmp error path. Every flag below earned its place against a real
@@ -7,9 +7,9 @@ build failure.
 ## Pins
 
 - `wasi-sdk` **33.0** (tarball install; arm64-macos proven — pin per-platform tarballs in CI)
-- `pg_query` **= 6.1.1** (PG17 grammar; version-locked to the PG major we claim)
+- `pg_query` **= 6.1.1** (PG17 grammar; version-locked to the claimed PG major)
 - Rust **stable** (1.96 proven), target `wasm32-wasip1` (`rustup target add wasm32-wasip1`)
-- wasmtime 47 for native smoke runs; `browser_wasi_shim` for the page (pin at Phase 2)
+- wasmtime 47 for native smoke runs; `@bjorn3/browser_wasi_shim` 0.4.2 for the page
 
 ## Stub headers (`stub-include/`)
 
@@ -55,27 +55,28 @@ Gotchas, learned the hard way:
   current wasmtime/V8. For an older browser floor, rebuild with legacy EH.
 - Measured size ballpark: ~2.2 MB raw / ~390 KB gzip.
 
-## Browser loader contract (pins + verified gotchas, 2026-07-23)
+## Browser loader contract
 
-- Pin `@bjorn3/browser_wasi_shim@0.4.2` (npm latest since 2025-06-22; no 2026 release exists).
+- Pin `@bjorn3/browser_wasi_shim@0.4.2` (the latest release at the time of writing).
 - Instantiate the reactor with `wasi.initialize(instance)`, never `wasi.start()` (throws on a
   reactor). The shim's README documents only the start() flow — do not follow it here.
   `initialize()` is mandatory even without an `_initialize` export (it records the instance every
-  syscall dereferences); our wasi-sdk link DOES export `_initialize`, which it calls if present.
+  syscall dereferences); this build's wasi-sdk link does export `_initialize`, and the shim calls
+  it when present.
 - `rowdiet_lint` returns a packed u64 — JS: `Number(v >> 32n)` / `Number(v & 0xffffffffn)`.
 - `memory.grow` invalidates views: build a fresh `Uint8Array(memory.buffer)` AFTER each
   `rowdiet_lint` call, before slicing the output. A cached view is the classic loader bug here.
 - Wrap export calls in try/catch: aborts surface as the shim's `WASIProcExit` exception
   (`initialize()` and direct calls do not catch it; only `start()` would).
 - go-pgquery is ABI-*shape* precedent only: its shipped module targets wazero/wasix (host-side
-  setjmp snapshots, no Wasm-EH) and is not browser-runnable. This repo's wasi-sdk-33 + wasm-EH
-  route is the browser-correct one.
+  setjmp snapshots, no wasm-EH) and is not browser-runnable. This repo's wasi-sdk-33 + wasm-EH
+  build is the browser-correct one.
 - libpg_query init: no explicit init export needed single-threaded — lazy init inside the parse
   call covered the wasmtime smoke run; revisit only for exotic multi-instance hosts.
 
-## Runtime shape (Phase 2 target)
+## Runtime shape
 
 Reactor-style library module, not a bin: `#[no_mangle] extern "C" fn rowdiet_lint(ptr, len) ->
-ptr` with JSON in/out plus exported alloc/free (go-pgquery precedent). Browser loads it via
-`browser_wasi_shim`; a ~100-line hand-rolled JS loader replaces wasm-bindgen (which refuses this
-target — that is the structural fact that forced route 3 in the first place).
+ptr` with JSON in/out plus exported alloc/free (go-pgquery precedent). The browser loads it via
+`browser_wasi_shim`; a ~100-line hand-rolled JS loader replaces wasm-bindgen, which supports
+only `wasm32-unknown-unknown` — the target libpg_query cannot build for.

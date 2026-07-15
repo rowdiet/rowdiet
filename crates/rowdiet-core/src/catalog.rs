@@ -291,9 +291,9 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         "serial" | "serial4" => serial(4, Align::Int),
         "bigserial" | "serial8" => serial(8, Align::Double),
         "smallserial" | "serial2" => serial(2, Align::Short),
-        // Curated extension types, verified 2026-07-23 from their CREATE TYPE definitions:
+        // Curated extension types, verified against their CREATE TYPE definitions:
         // pgvector sql/vector.sql, contrib/citext, contrib/hstore. None declare ALIGNMENT, so
-        // all take CREATE TYPE's int4 default with variable length — same storage class as our
+        // all take CREATE TYPE's int4 default with variable length — same storage class as the
         // unknown-type assumption, verified rather than assumed.
         "citext" | "hstore" | "vector" | "halfvec" | "sparsevec" => varlena(Align::Int),
         _ => None,

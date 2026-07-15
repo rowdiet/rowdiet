@@ -1,7 +1,7 @@
 # rowdiet — a static column-tetris linter for Postgres migrations
 
-**rowdiet** lints Postgres migration SQL for wasted alignment padding — the *column tetris*
-problem — **statically, with no database**. It parses your `CREATE TABLE` / `ALTER TABLE`
+**rowdiet** lints Postgres migration SQL for wasted alignment padding (the *column tetris*
+problem) **statically, with no database**. It parses your `CREATE TABLE` / `ALTER TABLE`
 statements, computes the on-disk row layout Postgres will actually use (postgres column padding,
 alignment, and ordering), and reports the bytes per row you can recover by reordering columns —
 **before** the migration is applied, while reordering is still free.
@@ -29,10 +29,10 @@ $ rowdiet migrations/ --rows 10000000 --suggest
 
 Postgres stores a row's columns in definition order and inserts invisible padding bytes so each
 value starts on its type's alignment boundary (1/2/4/8). A `boolean` before a `bigint` costs 7
-dead bytes on **every row**. Reordering columns to descending alignment recovers it — 10–21% of
-total disk in published fleet-wide runs ([2ndQuadrant, "On Rocks and Sand"][rocks] shows 21%;
-[Braintree/PayPal ran it across 100+ TB][braintree] for ~10%) — and fewer bytes per row also
-means more rows per 8 kB page, so the win compounds through cache and I/O.
+dead bytes on **every row**. Reordering columns to descending alignment recovers it: published
+fleet-wide runs report 10–21% of total disk ([2ndQuadrant, "On Rocks and Sand"][rocks]: 21%;
+[Braintree/PayPal, across 100+ TB][braintree]: ~10%). Fewer bytes per row also means more rows
+per 8 kB page, so the win compounds through cache and I/O.
 
 The catch: Postgres cannot reorder columns in place. After a migration is applied, the fix is a
 table rewrite. That makes column order a **pre-apply, CI-time** concern — exactly where a static
@@ -46,8 +46,9 @@ closed webpage with no CI story).
 - **Migration-series aware** — folds `CREATE TABLE` + later `ALTER TABLE ADD COLUMN` (and drops,
   renames, type changes) across files in version order (`V1__`, `V1_2__`, timestamps), so it
   lints the table's *final physical order*, not one statement at a time.
-- **Honest numbers** — see the two-tier reporting contract below; it never claims savings that
-  MAXALIGN rounding or varlena data-dependence can take away.
+- **Two-tier reporting** — byte-exact for fixed-width tables, labeled estimates when varlena is
+  involved (see below); it never claims savings that MAXALIGN rounding or varlena
+  data-dependence can take away.
 - **Embeddable** — a pure-Rust core crate (`rowdiet-core`, wasm32-clean) with a thin CLI; a
   numeric CI gate (`--fail-over`) no other tool offers.
 - **Loud degradation** — statements the parser can't handle are skipped *visibly*, and tables
@@ -81,11 +82,10 @@ fn migrations_are_byte_packed() {
 }
 ```
 
-Flyway users: run the CLI on the migrations directory in CI — that is the honest integration
-(Flyway has no non-JVM callback surface; a Java callback can shell out to `rowdiet` if you want
-runtime coupling).
+Flyway users: run the CLI on the migrations directory in CI (Flyway has no non-JVM callback
+surface; a Java callback can shell out to `rowdiet` if you want runtime coupling).
 
-## How it reports (the honesty contract)
+## How it reports
 
 Fixed-width columns (int/bigint/timestamp/uuid/bool/…) are **byte-exact from DDL alone** — they
 are never TOASTed or compressed. Varlena columns (text/varchar/numeric/jsonb/bytea/inet/arrays/…)
@@ -95,7 +95,7 @@ rowdiet therefore reports per table:
 
 - **exact tier** (only fixed-width columns): the headline is the **MAXALIGN-rounded footprint
   delta** and rows-per-8kB-page. A reorder that removes padding but doesn't cross an 8-byte rung
-  honestly reports **0 avoidable bytes** (raw padding is still shown).
+  reports **0 avoidable bytes** by design (raw padding is still shown).
 - **estimate tier** (any varlena): numbers describe the all-non-NULL, long-form scenario and are
   labeled as such — never guaranteed savings. `varchar(n≤31)` is upgraded to *proven short,
   unaligned* (typmod bounds the payload under the short-varlena limit).
@@ -129,17 +129,22 @@ varlena (`bpchar`); an enum value is 4 bytes.
 
 ## Status & roadmap
 
-Shipped: the off-by-default `pg-exact` parser feature doubling as a differential oracle, the
-Rust-linked `wasm32-wasip1` module with the real PG17 parser (`docs/design.md` § Parser
-decision), and the static paste-your-DDL page (its own repo, `rowdiet-web`);
-partition children inheriting the parent's modeled layout; a source-verified extension map
-(pgvector, citext, hstore); an exact minimum-padding search when a table has several
-irregular-size columns; the `cargo rowdiet` subcommand; a wasm-opt size pass; and the full local
-verification matrix (`scripts/ci.sh` — becomes the CI workflow at publish time).
+Implemented:
 
-Remaining: publish-time distribution (crates.io, prebuilt binaries, pre-commit hook, GitHub
-Action, hosted webpage), a grown extension map (PostGIS, …), and offering the rule upstream to
-squawk once rowdiet has proven out publicly.
+- the off-by-default `pg-exact` parser backend, which doubles as a differential oracle for the
+  default parser in the test suite;
+- the Rust-linked `wasm32-wasip1` module embedding the real PG17 parser (`docs/design.md`
+  § Parser decision) and the static paste-your-DDL page built on it (its own repo,
+  `rowdiet-web`);
+- partition children inheriting the parent's modeled layout;
+- a source-verified extension type map (pgvector, citext, hstore);
+- an exact minimum-padding search when a table has several irregular-size columns;
+- the `cargo rowdiet` subcommand and a wasm-opt size pass;
+- the full verification matrix in `scripts/ci.sh`.
+
+Planned: distribution (crates.io release, prebuilt binaries, pre-commit hook, GitHub Action,
+hosted webpage), a larger extension map (PostGIS, …), and offering the rule upstream to squawk
+once rowdiet has proven out publicly.
 
 ## License
 

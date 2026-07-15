@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 sqlparser.workspace = true
 serde = { workspace = true, optional = true }
-# PG17 grammar, native-only (C build); powers the pg-exact backend + differential oracle.
+# PG17 grammar, native-only (C build); used by the pg-exact backend and the differential oracle.
 pg_query = { version = "=6.1.1", optional = true }
 
 [dev-dependencies]

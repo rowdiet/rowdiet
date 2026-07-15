@@ -1,6 +1,6 @@
 //! The public result model, and the fold→layout assembly that fills it.
 //!
-//! Reporting contract (the honesty layer): for fixed-width-only tables everything is byte-exact —
+//! Reporting contract: for fixed-width-only tables everything is byte-exact —
 //! the headline is the MAXALIGN-rounded footprint delta, and a reorder that does not cross an
 //! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get long-form-scenario
 //! numbers, labeled as estimates and never claimed as guaranteed savings.

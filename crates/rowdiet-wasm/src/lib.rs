@@ -4,7 +4,7 @@
 //! `initialize()` path — never `start()` — and call `_initialize` (when exported) before any
 //! `rowdiet_*` export.
 //!
-//! ABI (v1, finalized 2026-07-23 per the empirically verified reactor-ABI research):
+//! ABI (v1):
 //! - `rowdiet_alloc(len) -> ptr` — allocate an input buffer, write UTF-8 JSON into it.
 //! - `rowdiet_lint(ptr, len) -> u64` — analyze; returns `(out_ptr << 32) | out_len` (a wasm32
 //!   contract — pointers are 32-bit there; JS receives a BigInt: `Number(v >> 32n)` /
@@ -13,7 +13,7 @@
 //! - `rowdiet_free(ptr, len)` — free either buffer: the input (its alloc len) and the output
 //!   (`out_len`).
 //!
-//! Loader gotchas (verified): re-derive views from `memory.buffer` AFTER `rowdiet_lint` returns
+//! Loader gotchas: re-derive views from `memory.buffer` AFTER `rowdiet_lint` returns
 //! (the parser may grow memory); wrap export calls in try/catch for the shim's `WASIProcExit`.
 //!
 //! Input JSON: `{"sources": [{"name": "...", "sql": "..."}], "assume": ["vector=varlena:d"],

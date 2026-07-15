@@ -1,7 +1,7 @@
 #!/bin/sh
-# The full local verification matrix — becomes the CI workflow verbatim when the repo ships.
-# Soft-skips the wasip1 leg when the wasi-sdk or node are absent (same spirit as adopters'
-# soft-skip gates: enforce where present, never block on missing tooling).
+# The full local verification matrix: fmt, clippy, tests, feature/target checks, wasm smoke.
+# Soft-skips the wasip1 leg when the wasi-sdk or wasmtime are absent: enforce where present,
+# never block on missing tooling.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

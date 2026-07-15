@@ -42,8 +42,8 @@ pub fn read_source(path: &Path) -> io::Result<SqlSource> {
     })
 }
 
-/// The five-line adopter integration: point it at a migrations directory (e.g. in a `#[test]` or
-/// right before the migration runner) and gate on the result.
+/// The five-line CI guard: point it at a migrations directory (e.g. in a `#[test]` or right
+/// before the migration runner) and gate on the result.
 pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
     let dir = dir.as_ref();
     let mut sources = Vec::new();
