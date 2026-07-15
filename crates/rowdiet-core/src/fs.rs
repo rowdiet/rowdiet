@@ -1,8 +1,11 @@
 //! Filesystem conveniences (not compiled for wasm targets — disable the default `fs` feature).
 
-use crate::{analyze_sources, Analysis, Config, SqlSource};
+use crate::{Analysis, Config, SqlSource};
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+mod tests;
 
 /// All `*.sql` files under `dir` (recursive), version-ordered within each directory.
 pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -43,8 +46,13 @@ pub fn read_source(path: &Path) -> io::Result<SqlSource> {
 }
 
 /// The five-line CI guard: point it at a migrations directory (e.g. in a `#[test]` or right
-/// before the migration runner) and gate on the result.
+/// before the migration runner) and gate on the result. Uses the default parser backend; use
+/// [`analyze_dir_with`] to pick one.
 pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
+    analyze_dir_with(crate::ParserBackend::Sqlparser, dir, config)
+}
+
+pub fn analyze_dir_with(backend: crate::ParserBackend, dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
     let dir = dir.as_ref();
     let mut sources = Vec::new();
     for path in collect_sql_files(dir)? {
@@ -55,5 +63,5 @@ pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysi
             sql: String::from_utf8_lossy(&bytes).into_owned(),
         });
     }
-    Ok(analyze_sources(&sources, config))
+    Ok(crate::analyze_sources_with(backend, &sources, config))
 }
