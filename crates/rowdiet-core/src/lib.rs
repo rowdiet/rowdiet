@@ -50,7 +50,8 @@ pub struct SqlSource {
     pub sql: String,
 }
 
-/// A statement whose text contains this marker is exempt from the gate (still listed, as ignored).
+/// A `CREATE TABLE` whose text contains this marker is exempt from the gate (still listed, as
+/// ignored); a `DO` statement carrying it is not scanned for DDL at all.
 pub const IGNORE_MARKER: &str = "rowdiet:ignore";
 
 /// Which parser produces the `DdlOp` stream. Both feed the identical fold/layout/report pipeline,
@@ -81,7 +82,11 @@ pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], confi
             };
             let ignore_marker = raw.text.contains(IGNORE_MARKER);
             if is_do_statement(&raw.text) {
-                scan_do_block(backend, &mut folder, &raw.text, &origin);
+                // The marker waives the body scan entirely — for DO blocks whose dynamic DDL a
+                // human has judged irrelevant to layout (e.g. partition-creation loops).
+                if !ignore_marker {
+                    scan_do_block(backend, &mut folder, &raw.text, &origin);
+                }
                 continue;
             }
             match extract_with(backend, &raw.text) {

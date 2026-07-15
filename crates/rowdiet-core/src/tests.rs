@@ -92,6 +92,13 @@ fn dynamic_sql_in_do_is_flagged() {
 }
 
 #[test]
+fn ignore_marker_waives_do_scanning() {
+    let sql = "DO $x$ BEGIN -- rowdiet:ignore\n EXECUTE format('CREATE TABLE p%s PARTITION OF t', i);\nEND $x$;";
+    let analysis = analyze_sources(&[src("V1__p.sql", sql)], &Config::default());
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+}
+
+#[test]
 fn exact_tier_footprint_and_rows_per_page() {
     let sql = "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);";
     let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
