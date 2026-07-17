@@ -121,9 +121,12 @@ varlena (`bpchar`); an enum value is 4 bytes.
   per-statement with a note; `CREATE UNLOGGED TABLE` is handled by keyword strip. The `pg-exact`
   backend (`--parser pg-exact`) parses all of these natively.
 - `DO $$…$$` bodies get a best-effort scan on both backends: type-creating DDL behind
-  idempotency guards is folded (the common enum-guard pattern), table DDL inside a DO is never
-  folded — it surfaces as a conditional-execution note and marks the table incomplete — and
-  dynamic SQL (`EXECUTE format(...)`) is flagged as not statically analyzable.
+  idempotency guards is folded (the common enum-guard pattern); table DDL inside a DO is never
+  folded — it surfaces as a conditional-execution note and marks the table incomplete. Dynamic
+  `EXECUTE format(...)` is classified by its literal template: partition-creation loops against
+  a modeled parent (the hand-rolled hash-partition idiom; pg_partman setups need nothing at all)
+  are recognized as layout-inert, dynamic DDL on a concrete table gets a targeted note, and only
+  genuinely opaque templates are flagged as not statically analyzable.
 - `--suggest` prints a reordered `CREATE TABLE` skeleton; it never rewrites files (editing an
   applied migration breaks Flyway checksums / refinery divergence checks).
 

@@ -138,6 +138,13 @@ fn scan_do_block(backend: ParserBackend, folder: &mut fold::Folder, text: &str, 
                     dispatch_do_op(folder, op, origin);
                 }
             }
+            FragmentOutcome::Dynamic(ops) => {
+                for op in ops {
+                    if !dispatch_dynamic_op(folder, op, origin) {
+                        unanalyzable += 1;
+                    }
+                }
+            }
             FragmentOutcome::Unanalyzable => unanalyzable += 1,
         }
     }
@@ -150,11 +157,21 @@ fn scan_do_block(backend: ParserBackend, folder: &mut fold::Folder, text: &str, 
 enum FragmentOutcome {
     NoDdl,
     Ops(Vec<extract::DdlOp>),
+    /// Ops recovered from a dynamic `EXECUTE [format(]'…'` template — classifiable, never
+    /// foldable (names may come from placeholders).
+    Dynamic(Vec<extract::DdlOp>),
     Unanalyzable,
 }
 
+/// Placeholder stand-in for `%I`/`%s` in dynamic templates. Distinctive on purpose: an op whose
+/// target still contains it had a placeholder where the table name goes.
+const DYNAMIC_TOKEN: &str = "rowdiet_dyn";
+
 /// plpgsql fragments carry control-flow prefixes (`BEGIN`, `IF … THEN`), so parse from each
-/// word-boundary CREATE/ALTER/DROP until one parses.
+/// word-boundary CREATE/ALTER/DROP until one parses. Fragments that resist direct parsing get
+/// one more chance as a dynamic `EXECUTE` template: substitute the format placeholders and
+/// parse that (`%I`/`%s` need an identifier in name positions but a number in value positions —
+/// e.g. hash-partition `REMAINDER %s` — so both substitutions are tried).
 fn scan_fragment(backend: ParserBackend, fragment: &str) -> FragmentOutcome {
     let mut from = 0usize;
     let mut saw_ddl_keyword = false;
@@ -166,10 +183,132 @@ fn scan_fragment(backend: ParserBackend, fragment: &str) -> FragmentOutcome {
         }
         from = start + 1;
     }
-    if saw_ddl_keyword {
-        FragmentOutcome::Unanalyzable
-    } else {
-        FragmentOutcome::NoDdl
+    if !saw_ddl_keyword {
+        return FragmentOutcome::NoDdl;
+    }
+    if let Some(template) = execute_template(fragment) {
+        for token in [DYNAMIC_TOKEN, "0"] {
+            let substituted = substitute_format(&template, token);
+            if let Ok(ops) = extract_with(backend, &substituted) {
+                return FragmentOutcome::Dynamic(ops);
+            }
+        }
+    }
+    FragmentOutcome::Unanalyzable
+}
+
+/// The first single-quoted literal after a word-boundary `EXECUTE` — the SQL template of the
+/// `EXECUTE format('…', …)` / `EXECUTE '…'` idioms ('' unescaped). Concatenation-built dynamic
+/// SQL stays unanalyzable.
+fn execute_template(fragment: &str) -> Option<String> {
+    let b = fragment.as_bytes();
+    let kw = b"execute";
+    let mut at = None;
+    let mut i = 0usize;
+    while i + kw.len() <= b.len() {
+        let before = i == 0 || !split::ident_byte(b[i - 1]);
+        let after = b.get(i + kw.len()).is_none_or(|&c| !split::ident_byte(c));
+        if before && after && b[i..i + kw.len()].eq_ignore_ascii_case(kw) {
+            at = Some(i + kw.len());
+            break;
+        }
+        i += 1;
+    }
+    let mut i = at?;
+    while i < b.len() && b[i] != b'\'' {
+        i += 1;
+    }
+    i += 1;
+    let mut template: Vec<u8> = Vec::new();
+    while i < b.len() {
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\'') {
+                template.push(b'\'');
+                i += 2;
+            } else {
+                return Some(String::from_utf8_lossy(&template).into_owned());
+            }
+        } else {
+            template.push(b[i]);
+            i += 1;
+        }
+    }
+    None
+}
+
+/// `%I`/`%s` (and `%n$I`/`%n$s`) → `token`, `%L` → `'0'`, `%%` → `%`.
+fn substitute_format(template: &str, token: &str) -> String {
+    let b = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && b.get(j) == Some(&b'$') {
+                j += 1;
+            }
+            match b.get(j) {
+                Some(b'I' | b'i' | b's') => {
+                    out.push_str(token);
+                    i = j + 1;
+                    continue;
+                }
+                Some(b'L' | b'l') => {
+                    out.push_str("'0'");
+                    i = j + 1;
+                    continue;
+                }
+                Some(b'%') if j == i + 1 => {
+                    out.push('%');
+                    i = j + 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let ch_len = utf8_len(b[i]);
+        out.push_str(&template[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// Dynamic ops are classified, never folded. Returns false when the op stays unanalyzable.
+/// Partition children of a modeled parent are layout-inert (they inherit the parent verbatim),
+/// so the ubiquitous `EXECUTE format('CREATE TABLE … PARTITION OF …')` loop earns silence.
+fn dispatch_dynamic_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &Origin) -> bool {
+    use extract::DdlOp;
+    let concrete = |name: &extract::RawName| !name.key.contains(DYNAMIC_TOKEN);
+    match &op {
+        DdlOp::CreateTable {
+            partition_of: Some(parent),
+            ..
+        } if concrete(parent) => folder.has_table(&parent.key),
+        DdlOp::AddColumn { table, .. }
+        | DdlOp::DropColumns { table, .. }
+        | DdlOp::RenameColumn { table, .. }
+        | DdlOp::RenameTable { table, .. }
+        | DdlOp::SetColumnType { table, .. }
+        | DdlOp::SetNotNull { table, .. }
+            if concrete(table) =>
+        {
+            dispatch_do_op(folder, op, origin);
+            true
+        }
+        DdlOp::Irrelevant => true,
+        _ => false,
     }
 }
 

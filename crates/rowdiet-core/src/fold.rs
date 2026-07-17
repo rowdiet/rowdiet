@@ -393,6 +393,10 @@ impl Folder {
         false
     }
 
+    pub fn has_table(&self, key: &str) -> bool {
+        self.tables.contains_key(key)
+    }
+
     /// Table DDL found inside a DO body: execution is conditional, so it is never folded — the
     /// table (when known) is marked incomplete and the finding surfaces as a note.
     pub fn conditional_table_ddl(&mut self, table: &RawName, verb: &str, origin: &Origin) {

@@ -92,6 +92,38 @@ fn dynamic_sql_in_do_is_flagged() {
 }
 
 #[test]
+fn dynamic_partition_loop_is_layout_inert() {
+    let sql = "CREATE TABLE chunk (a bigint NOT NULL, b boolean NOT NULL) PARTITION BY HASH (a);\nDO $$ BEGIN\n FOR r IN 0..15 LOOP\n EXECUTE format('CREATE TABLE chunk_p%s PARTITION OF chunk FOR VALUES WITH (MODULUS 16, REMAINDER %s)', r, r);\n END LOOP;\nEND $$;";
+    let analysis = analyze_sources(&[src("V1__c.sql", sql)], &Config::default());
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    assert_eq!(analysis.tables.len(), 1);
+}
+
+#[test]
+fn dynamic_partition_with_ident_placeholder_name() {
+    let sql = "CREATE TABLE evt (a bigint NOT NULL) PARTITION BY RANGE (a);\nDO $$ BEGIN\n EXECUTE format('CREATE TABLE %I PARTITION OF evt FOR VALUES FROM (1) TO (2)', name);\nEND $$;";
+    let analysis = analyze_sources(&[src("V1__e.sql", sql)], &Config::default());
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+}
+
+#[test]
+fn dynamic_partition_of_unknown_parent_stays_flagged() {
+    let sql = "DO $$ BEGIN\n EXECUTE format('CREATE TABLE p%s PARTITION OF elsewhere FOR VALUES WITH (MODULUS 4, REMAINDER %s)', i, i);\nEND $$;";
+    let analysis = analyze_sources(&[src("V1__u.sql", sql)], &Config::default());
+    assert_eq!(analysis.notes.len(), 1);
+    assert_eq!(analysis.notes[0].kind, NoteKind::DoBlockDdl);
+}
+
+#[test]
+fn dynamic_alter_with_concrete_target_notes_that_table() {
+    let sql = "CREATE TABLE payments (id bigint NOT NULL);\nDO $$ BEGIN\n EXECUTE format('ALTER TABLE payments ADD COLUMN %I int', col);\nEND $$;";
+    let analysis = analyze_sources(&[src("V1__pay.sql", sql)], &Config::default());
+    assert!(analysis.tables[0].incomplete);
+    assert_eq!(analysis.notes.len(), 1);
+    assert!(analysis.notes[0].detail.contains("payments"), "{:?}", analysis.notes);
+}
+
+#[test]
 fn ignore_marker_waives_do_scanning() {
     let sql = "DO $x$ BEGIN -- rowdiet:ignore\n EXECUTE format('CREATE TABLE p%s PARTITION OF t', i);\nEND $x$;";
     let analysis = analyze_sources(&[src("V1__p.sql", sql)], &Config::default());

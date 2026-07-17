@@ -24,8 +24,15 @@ split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touchi
   folded (idempotency-guard pattern — a column using the type implies it exists; wrong only if
   the guard would have *not* created it, in which case PG itself would have errored). Table DDL
   is never folded: conditional execution is unknowable, so it becomes a `do-block` note +
-  incomplete flag. DDL-looking fragments that resist parsing (dynamic `EXECUTE format`) produce
-  one summary note. DML-only DO bodies are silent — same as any other DML.
+  incomplete flag. Dynamic `EXECUTE [format(]'…'` fragments get template classification: the
+  literal template is parsed with placeholders substituted (`%I`/`%s` tried as identifier and as
+  number — hash-partition `REMAINDER %s` needs the latter). `CREATE TABLE … PARTITION OF` a
+  modeled parent is layout-inert (children inherit the parent verbatim) and earns silence — this
+  covers the ubiquitous hand-rolled partition-creation loop; pg_partman's own
+  `create_parent(...)` calls contain no DDL keywords and were always silent. Dynamic DDL against
+  a concrete table becomes a targeted conditional note; placeholder-targeted or unparseable
+  templates keep the loud summary note. DML-only DO bodies are silent — same as any other DML.
+  A `rowdiet:ignore` marker inside a DO waives its scan entirely.
 
 ## The scenario model (what the numbers mean)
 
