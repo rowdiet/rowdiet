@@ -291,11 +291,19 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         "serial" | "serial4" => serial(4, Align::Int),
         "bigserial" | "serial8" => serial(8, Align::Double),
         "smallserial" | "serial2" => serial(2, Align::Short),
-        // Curated extension types, verified against their CREATE TYPE definitions:
-        // pgvector sql/vector.sql, contrib/citext, contrib/hstore. None declare ALIGNMENT, so
-        // all take CREATE TYPE's int4 default with variable length — same storage class as the
-        // unknown-type assumption, verified rather than assumed.
-        "citext" | "hstore" | "vector" | "halfvec" | "sparsevec" => varlena(Align::Int),
+        // Curated extension types, verified against their CREATE TYPE definitions (pgvector
+        // sql/vector.sql; contrib citext/hstore/ltree; contrib cube; PostGIS postgis.sql.in and
+        // geography.sql.in). The int-aligned group declares no ALIGNMENT and takes CREATE TYPE's
+        // int4 default — same storage class as the unknown-type assumption, verified rather than
+        // assumed. The double-aligned group declares `alignment = double`, which changes where
+        // these cluster among varlenas — the entries that alter numbers, not just confidence.
+        "citext" | "hstore" | "vector" | "halfvec" | "sparsevec" | "ltree" | "lquery" | "ltxtquery" => {
+            varlena(Align::Int)
+        }
+        "geometry" | "geography" | "cube" => varlena(Align::Double),
+        // PostGIS box3d: fixed 52 bytes, double-aligned — irregular (52 % 8 != 0), so the
+        // exact-search places it at the end of its alignment group.
+        "box3d" => fixed(52, Align::Double),
         _ => None,
     }
 }

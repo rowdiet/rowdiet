@@ -195,7 +195,16 @@ fn assume_specs_parse() {
 
 #[test]
 fn curated_extension_types_are_verified() {
-    for key in ["citext", "hstore", "vector", "halfvec", "sparsevec"] {
+    for key in [
+        "citext",
+        "hstore",
+        "vector",
+        "halfvec",
+        "sparsevec",
+        "ltree",
+        "lquery",
+        "ltxtquery",
+    ] {
         let r = cat().resolve(&t(key));
         assert_eq!(
             r.kind,
@@ -207,6 +216,27 @@ fn curated_extension_types_are_verified() {
         );
         assert!(r.known, "{key}");
     }
+    for key in ["geometry", "geography", "cube"] {
+        let r = cat().resolve(&t(key));
+        assert_eq!(
+            r.kind,
+            ColumnKind::Varlena {
+                align: Align::Double,
+                proven_short: false
+            },
+            "{key}"
+        );
+        assert!(r.known, "{key}");
+    }
+    let box3d = cat().resolve(&t("box3d"));
+    assert_eq!(
+        box3d.kind,
+        ColumnKind::Fixed {
+            len: 52,
+            align: Align::Double
+        }
+    );
+    assert!(box3d.kind.irregular());
 }
 
 #[test]
