@@ -5,9 +5,11 @@ mod render;
 
 use clap::{Parser, ValueEnum};
 use rowdiet_core::catalog::parse_assume_spec;
-use rowdiet_core::{analyze_sources_with, fs as core_fs, Analysis, Config, ParserBackend, SqlSource};
+use rowdiet_core::{
+    analyze_sources_with, baseline, fs as core_fs, Analysis, Baseline, Config, ParserBackend, SqlSource,
+};
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -37,6 +39,15 @@ struct Cli {
     /// Parser backend: pure-Rust sqlparser (default) or the real PG17 grammar via libpg_query
     #[arg(long, value_enum, default_value_t = ParserChoice::Sqlparser)]
     parser: ParserChoice,
+    /// Baseline file with per-table accepted-debt allowances (brownfield freeze-known-debt gating)
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+    /// Rewrite the baseline from the current analysis (entries for tables over the fail-over)
+    #[arg(long, requires = "baseline", conflicts_with = "accept")]
+    update_baseline: bool,
+    /// Accept one table's current state into the baseline, leaving other entries untouched; repeatable
+    #[arg(long, value_name = "TABLE", requires = "baseline")]
+    accept: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -77,24 +88,74 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
     let config = build_config(&cli.assume_type)?;
     let sources = gather_sources(&cli.paths)?;
     let analysis = analyze_sources_with(backend(cli.parser)?, &sources, &config);
-    let gate = gate_exceeded(&analysis, cli.fail_over);
+    if cli.update_baseline || !cli.accept.is_empty() {
+        let path = cli.baseline.as_deref().ok_or("--baseline FILE is required")?;
+        return maintain_baseline(cli, path, &analysis);
+    }
+    let loaded = match &cli.baseline {
+        Some(path) => Some(load_baseline(path)?),
+        None => None,
+    };
+    let gate = baseline::evaluate(&analysis, cli.fail_over, loaded.as_ref());
+    let shown_fail_over = cli.fail_over.or(loaded.as_ref().map(|b| b.fail_over));
     let output = match cli.format {
-        Format::Text => render::text(&analysis, cli.rows, cli.suggest, cli.fail_over),
-        Format::Json => render::json(&analysis, cli.fail_over, gate)?,
-        Format::Github => render::github(&analysis, cli.fail_over),
+        Format::Text => render::text(&analysis, cli.rows, cli.suggest, &gate),
+        Format::Json => render::json(&analysis, shown_fail_over, &gate)?,
+        Format::Github => render::github(&analysis, &gate),
     };
     print!("{output}");
-    Ok(if gate { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    Ok(if gate.exceeded {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
-fn gate_exceeded(analysis: &Analysis, fail_over: Option<u64>) -> bool {
-    match fail_over {
-        Some(limit) => analysis
-            .tables
-            .iter()
-            .any(|t| !t.ignored && t.avoidable_bytes_per_row > limit),
-        None => false,
-    }
+/// The maintenance operations: `--update-baseline` rewrites the file wholesale;
+/// `--accept <table>` refreshes exactly the named entries. Both exit 0 without gating.
+fn maintain_baseline(cli: &Cli, path: &Path, analysis: &Analysis) -> Result<ExitCode, String> {
+    let existing = if path.exists() {
+        Some(load_baseline(path)?)
+    } else {
+        None
+    };
+    let written = if cli.update_baseline {
+        let fail_over = cli
+            .fail_over
+            .or(existing.as_ref().map(|b| b.fail_over))
+            .ok_or("--update-baseline needs --fail-over (there is no existing baseline to take it from)")?;
+        let updated = baseline::build_from(analysis, fail_over, env!("CARGO_PKG_VERSION"));
+        write_baseline(path, &updated)?;
+        updated
+    } else {
+        let mut updated = existing.ok_or_else(|| {
+            format!(
+                "--accept needs an existing baseline file (create one with --update-baseline): {}",
+                path.display()
+            )
+        })?;
+        baseline::accept_tables(&mut updated, analysis, &cli.accept)?;
+        updated.rowdiet = env!("CARGO_PKG_VERSION").to_string();
+        write_baseline(path, &updated)?;
+        updated
+    };
+    println!(
+        "baseline written: {} — {} table(s) with accepted debt, fail-over {}",
+        path.display(),
+        written.tables.len(),
+        written.fail_over
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn load_baseline(path: &Path) -> Result<Baseline, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{}: bad baseline JSON: {e}", path.display()))
+}
+
+fn write_baseline(path: &Path, baseline: &Baseline) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(baseline).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn build_config(specs: &[String]) -> Result<Config, String> {

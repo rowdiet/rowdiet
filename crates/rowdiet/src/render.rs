@@ -1,13 +1,13 @@
 //! Output renderers: human text, GitHub Actions annotations, JSON.
 
-use rowdiet_core::{Analysis, ColumnReport, NoteKind, OrderStats, TableReport, Tier};
+use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, fail_over: Option<u64>) -> String {
+pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOutcome) -> String {
     let mut out = String::new();
     for table in &analysis.tables {
-        render_table(&mut out, table, rows, suggest);
+        render_table(&mut out, table, rows, suggest, gate.verdicts.get(&table.name).copied());
     }
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "notes:");
@@ -31,20 +31,65 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, fail_over: Op
         "{} table(s) analyzed — {wasteful} with avoidable waste, {skipped} statement(s) skipped",
         analysis.tables.len()
     );
-    if let Some(limit) = fail_over {
-        let tripped = analysis
-            .tables
-            .iter()
-            .filter(|t| !t.ignored && t.avoidable_bytes_per_row > limit)
-            .count();
-        if tripped > 0 {
-            let _ = writeln!(out, "FAIL: {tripped} table(s) above the --fail-over {limit} B/row gate");
-        }
-    }
+    render_gate_summary(&mut out, gate);
     out
 }
 
-fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool) {
+fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
+    let mut new_violations = 0u32;
+    let mut regressions = 0u32;
+    let mut grown = 0u32;
+    let mut modified = 0u32;
+    let mut ratchets = 0u32;
+    for verdict in gate.verdicts.values() {
+        match verdict {
+            TableVerdict::NewViolation { .. } => new_violations += 1,
+            TableVerdict::Regression { .. } => regressions += 1,
+            TableVerdict::GrownSinceBaseline { .. } => grown += 1,
+            TableVerdict::ModifiedSinceBaseline { .. } => modified += 1,
+            TableVerdict::RatchetOpportunity { .. } => ratchets += 1,
+            TableVerdict::Pass => {}
+        }
+    }
+    if gate.exceeded {
+        let mut parts = Vec::new();
+        if new_violations > 0 {
+            parts.push(format!("{new_violations} table(s) over the fail-over gate"));
+        }
+        if regressions > 0 {
+            parts.push(format!("{regressions} regression(s) vs baseline"));
+        }
+        if grown > 0 {
+            parts.push(format!("{grown} grown since baseline"));
+        }
+        if modified > 0 {
+            parts.push(format!("{modified} modified since baseline"));
+        }
+        let _ = writeln!(out, "FAIL: {}", parts.join(", "));
+    }
+    if ratchets > 0 {
+        let _ = writeln!(
+            out,
+            "baseline: {ratchets} table(s) now beat their allowance — tighten via --accept <table> or --update-baseline"
+        );
+    }
+    if !gate.orphaned.is_empty() {
+        let _ = writeln!(
+            out,
+            "baseline: orphaned entries (no matching table): {}",
+            gate.orphaned.join(", ")
+        );
+    }
+    if !gate.expired.is_empty() {
+        let _ = writeln!(
+            out,
+            "baseline: expired entries (layout changed, table within fail-over): {}",
+            gate.expired.join(", ")
+        );
+    }
+}
+
+fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, verdict: Option<TableVerdict>) {
     let loc = format!("{}:{}", t.origin.source, t.origin.line);
     if t.ignored {
         let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.name);
@@ -65,6 +110,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         };
         let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.name, tier_label(t.tier));
         render_flags(out, t);
+        render_verdict(out, t, verdict);
         return;
     }
     let _ = writeln!(
@@ -90,8 +136,43 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         );
     }
     render_flags(out, t);
+    render_verdict(out, t, verdict);
     if suggest {
         render_suggestion(out, t);
+    }
+}
+
+fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdict>) {
+    match verdict {
+        Some(TableVerdict::Regression { avoidable, allowed }) => {
+            let _ = writeln!(
+                out,
+                "  ✗ regression: {avoidable} B/row exceeds the baselined allowance of {allowed}"
+            );
+        }
+        Some(TableVerdict::GrownSinceBaseline { allowed, .. }) => {
+            let _ = writeln!(
+                out,
+                "  ✗ grown since baseline: appended columns push waste past the allowance of {allowed} — \
+                 reorder them in the appending migration, or --accept {}",
+                t.name
+            );
+        }
+        Some(TableVerdict::ModifiedSinceBaseline { .. }) => {
+            let _ = writeln!(
+                out,
+                "  ✗ modified since baseline: the allowance expired — meet fail-over or re-accept with --accept {}",
+                t.name
+            );
+        }
+        Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
+            let _ = writeln!(
+                out,
+                "  ↓ ratchet: allowance {allowed} can tighten to {avoidable} — --accept {}",
+                t.name
+            );
+        }
+        Some(TableVerdict::Pass | TableVerdict::NewViolation { .. }) | None => {}
     }
 }
 
@@ -181,20 +262,27 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn github(analysis: &Analysis, fail_over: Option<u64>) -> String {
+pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
     let mut out = String::new();
     for t in &analysis.tables {
         if t.ignored || t.avoidable_bytes_per_row == 0 {
             continue;
         }
-        let level = if fail_over.is_some_and(|limit| t.avoidable_bytes_per_row > limit) {
+        let verdict = gate.verdicts.get(&t.name).copied();
+        let level = if verdict.is_some_and(TableVerdict::failing) {
             "error"
         } else {
             "warning"
         };
+        let title = match verdict {
+            Some(TableVerdict::Regression { .. }) => "rowdiet regression",
+            Some(TableVerdict::GrownSinceBaseline { .. }) => "rowdiet grown-since-baseline",
+            Some(TableVerdict::ModifiedSinceBaseline { .. }) => "rowdiet modified-since-baseline",
+            _ => "rowdiet",
+        };
         let _ = writeln!(
             out,
-            "::{level} file={},line={},title=rowdiet::table {}: {} B/row avoidable ({}) — suggested order: {}",
+            "::{level} file={},line={},title={title}::table {}: {} B/row avoidable ({}) — suggested order: {}",
             t.origin.source,
             t.origin.line,
             t.name,
@@ -220,11 +308,12 @@ pub fn github(analysis: &Analysis, fail_over: Option<u64>) -> String {
     out
 }
 
-pub fn json(analysis: &Analysis, fail_over: Option<u64>, gate_exceeded: bool) -> Result<String, String> {
+pub fn json(analysis: &Analysis, fail_over: Option<u64>, gate: &GateOutcome) -> Result<String, String> {
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "fail_over": fail_over,
-        "gate_exceeded": gate_exceeded,
+        "gate_exceeded": gate.exceeded,
+        "gate": serde_json::to_value(gate).map_err(|e| e.to_string())?,
         "analysis": serde_json::to_value(analysis).map_err(|e| e.to_string())?,
     });
     serde_json::to_string_pretty(&value)

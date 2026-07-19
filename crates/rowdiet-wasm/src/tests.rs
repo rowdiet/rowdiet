@@ -55,3 +55,21 @@ fn packed_return_layout() {
     assert_eq!(pack(0x1234, 0x56), 0x0000_1234_0000_0056);
     assert_eq!(pack(u32::MAX, u32::MAX), u64::MAX);
 }
+
+#[test]
+fn baseline_input_gates_and_reports_verdicts() {
+    let baselined = r#"{
+      "sources": [{"name": "V1__m.sql", "sql": "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);"}],
+      "baseline": {"fail_over": 0, "tables": {"m": {"bytes": 8, "layout": "f4i,f8d,f4i,f8d"}}}
+    }"#;
+    let out: serde_json::Value = serde_json::from_str(&lint_json(baselined)).unwrap();
+    assert_eq!(out["gate_exceeded"], false);
+    assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "pass");
+    assert_eq!(out["fail_over"], 0);
+    assert_eq!(out["analysis"]["tables"][0]["layout_signature"], "f4i,f8d,f4i,f8d");
+    let tightened = baselined.replace("\"bytes\": 8", "\"bytes\": 4");
+    let out: serde_json::Value = serde_json::from_str(&lint_json(&tightened)).unwrap();
+    assert_eq!(out["gate_exceeded"], true);
+    assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "regression");
+    assert_eq!(out["gate"]["verdicts"]["m"]["allowed"], 4);
+}

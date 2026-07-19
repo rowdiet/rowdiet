@@ -66,10 +66,29 @@ rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
 rowdiet migrations/ --assume-type vector=varlena:d   # teach extension types
 rowdiet migrations/ --parser pg-exact        # parse with the real PG17 grammar (libpg_query)
+rowdiet migrations/ --baseline rowdiet-baseline.json                    # gate against accepted debt
+rowdiet migrations/ --baseline rowdiet-baseline.json --fail-over 0 --update-baseline   # (re)write it
+rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # accept one table's growth
 ```
 
 Exit codes: `0` clean, `1` gate exceeded, `2` operational error. Exempt a deliberate layout with
 a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement.
+
+### Brownfield adoption: the baseline
+
+A zero-tolerance gate is useless on a schema that already carries debt — applied tables are
+expensive to rewrite. `--update-baseline` freezes the current state into a reviewed JSON file:
+one entry per table over the fail-over, recording its avoidable bytes and a layout signature
+(the ordered column storage kinds). From then on, `--baseline` gates **new tables** at the
+fail-over, **baselined tables** at their recorded allowance, and reports tables that improved as
+ratchet opportunities — tightening is always an explicit act, never automatic.
+
+Allowances stick to the layout, not just the name. `ADD COLUMN` appends, so an append keeps the
+allowance alive and only the added waste can fail the gate (`grown since baseline`) — accept it
+with `--accept <table>` (a one-entry, reviewable baseline diff) or reorder the columns in the
+new migration before it ships. Any other layout change (reorder, drop, type change) expires the
+allowance (`modified since baseline`): the table was rewritten anyway, so it either meets the
+fail-over or gets re-accepted deliberately.
 
 ### As a library (refinery guard, five lines)
 
@@ -143,6 +162,8 @@ Implemented:
 - a source-verified extension type map (pgvector, citext, hstore);
 - an exact minimum-padding search when a table has several irregular-size columns;
 - the `cargo rowdiet` subcommand and a wasm-opt size pass;
+- baseline gating for brownfield adoption (`--baseline` / `--update-baseline` / `--accept`),
+  with layout-signature-pinned allowances and the append-tolerant prefix rule;
 - the full verification matrix in `scripts/ci.sh`.
 
 Planned: distribution (crates.io release, prebuilt binaries, pre-commit hook, GitHub Action,

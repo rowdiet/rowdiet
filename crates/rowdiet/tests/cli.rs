@@ -127,3 +127,94 @@ fn pg_exact_parser_matches_default() {
     );
     assert_eq!(d["analysis"]["tables"][0]["natts"], e["analysis"]["tables"][0]["natts"]);
 }
+
+#[test]
+fn baseline_lifecycle() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-baseline-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("baseline.json");
+    let boot = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--fail-over", "0", "--update-baseline", "--baseline"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(boot.status.code(), Some(0), "{}", String::from_utf8_lossy(&boot.stderr));
+    assert!(String::from_utf8_lossy(&boot.stdout).contains("baseline written"));
+    let green = bin()
+        .arg(fixtures("wasteful"))
+        .arg("--baseline")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(
+        green.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&green.stdout)
+    );
+    let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    value["tables"]["account"]["bytes"] = 0.into();
+    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
+    let regressed = bin()
+        .arg(fixtures("wasteful"))
+        .arg("--baseline")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(regressed.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&regressed.stdout).contains("regression"));
+    // Not a comma-boundary prefix of the real signature — a true non-append change. (A prefix
+    // value here, e.g. "f1c", would legitimately pass via the grown-since-baseline rule.)
+    value["tables"]["account"]["layout"] = "f16c".into();
+    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
+    let modified = bin()
+        .arg(fixtures("wasteful"))
+        .arg("--baseline")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(modified.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&modified.stdout).contains("modified since baseline"));
+    let accepted = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--accept", "account", "--baseline"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let regated = bin()
+        .arg(fixtures("wasteful"))
+        .arg("--baseline")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(
+        regated.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&regated.stdout)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn baseline_flag_conflicts_and_requirements() {
+    let both = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--baseline", "b.json", "--update-baseline", "--accept", "account"])
+        .output()
+        .unwrap();
+    assert_eq!(both.status.code(), Some(2));
+    let orphan_flag = bin()
+        .arg(fixtures("wasteful"))
+        .arg("--update-baseline")
+        .output()
+        .unwrap();
+    assert_eq!(orphan_flag.status.code(), Some(2));
+}

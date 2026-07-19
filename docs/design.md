@@ -121,6 +121,49 @@ exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definit
   child not modeled. Plain `INHERITS` stays incomplete (inherited-plus-own semantics
   are not modeled).
 
+## Baseline gate (brownfield adoption)
+
+Real schemas arrive with debt, and applied tables are exactly the ones a linter cannot ask
+anyone to rewrite. The baseline file freezes that debt per table so the gate can still be strict
+about everything new. Design points, in the order they were decided:
+
+- **Core owns the gate.** The cross-implementation parity of table reports (native CLI, both
+  parser backends, the wasm module and everything built on it) is the project's strongest
+  correctness property; if wrappers implemented their own gate arithmetic, parity would stop
+  covering the pass/fail decision itself. `baseline::evaluate` is the single implementation;
+  wrappers only read and write the file.
+- **An entry overrides the fail-over; it never joins it.** The effective limit for a baselined
+  table is `entry.bytes`, full stop — not `max(fail_over, bytes)`, which would loosen every
+  allowance whenever the global gate is relaxed and silently break the ratchet promise.
+- **Allowances are pinned to a layout signature, not just a name.** A number-only ceiling is a
+  budget: drop 20 B/row of legacy columns, add 18 B/row of new sloppy ones, still "under
+  baseline" — while the same new columns would fail on any fresh table. Entries record
+  `{bytes, layout}` where `layout` is the ordered resolved-kind sequence (`f{len}{align}` per
+  fixed column, `v{align}` + `p` for proven-short varlena, comma-joined: `f8d,f4i,vi,vip`) —
+  exactly the inputs of the avoidable computation, so the pin expires precisely when those
+  change. Column names and nullability are excluded on purpose: renames and `SET/DROP NOT NULL`
+  do not move a single reported byte, so they must not expire an allowance. The signature is
+  stored as that readable string rather than a hash: a baseline diff then *shows* what changed,
+  and there is no hash-stability liability across releases.
+- **Appends keep the allowance alive (the prefix rule).** `ADD COLUMN` appends physically, so
+  after one the old signature survives as a comma-boundary prefix of the new one — structurally
+  distinguishable from reorders, drops, and type changes. Expiring the allowance there would
+  demand a full-table rewrite of an applied table, the very cost this tool exists to avoid; so
+  the allowance stays in force and only the appended waste can fail the gate, as
+  `grown since baseline` — actionable while the appending migration is still unapplied. All
+  non-prefix changes imply a rewriting migration was taken anyway; they expire the entry
+  (`modified since baseline`) and force a deliberate re-accept.
+- **Improvements never auto-tighten.** A table now beating its allowance is reported as a
+  ratchet opportunity; recording the better number is an explicit maintenance act —
+  `--update-baseline` rewrites the whole file from the current analysis, `--accept <table>`
+  refreshes exactly one entry (the reviewable one-line diff for accepting one table's growth,
+  and the same mechanism prunes an entry once its table comes clean).
+
+Verdicts per non-ignored table: `pass`, `new_violation` (no entry, over fail-over),
+`regression` (over its allowance), `grown_since_baseline`, `modified_since_baseline`,
+`ratchet_opportunity`; entries with no matching table are listed as `orphaned`, expired-but-
+passing ones as `expired`. Ignored tables stay outside both gate and baseline.
+
 ## Version ordering
 
 `version.rs`: optional `V/U/B` prefix, digit segments separated by `_` or `.` (sub-versions like

@@ -17,11 +17,15 @@
 //! (the parser may grow memory); wrap export calls in try/catch for the shim's `WASIProcExit`.
 //!
 //! Input JSON: `{"sources": [{"name": "...", "sql": "..."}], "assume": ["vector=varlena:d"],
-//! "fail_over": 0}` (`assume`/`fail_over` optional). Output JSON mirrors the CLI's `--format
-//! json` envelope, plus a `"parser"` field; errors come back as `{"error": "..."}`.
+//! "fail_over": 0, "baseline": {"fail_over": 0, "tables": {"t": {"bytes": 8, "layout":
+//! "f4i,f8d"}}}}` (`assume`/`fail_over`/`baseline` optional; an explicit `fail_over` overrides
+//! the baseline's recorded one). Output JSON mirrors the CLI's `--format json` envelope — the
+//! gate outcome under `"gate"` (per-table verdicts, orphaned/expired entries) plus the
+//! `"gate_exceeded"` shorthand — with an extra `"parser"` field; errors come back as
+//! `{"error": "..."}`.
 
 use rowdiet_core::catalog::parse_assume_spec;
-use rowdiet_core::{analyze_sources_with, Config, ParserBackend, SqlSource};
+use rowdiet_core::{analyze_sources_with, baseline, Baseline, Config, ParserBackend, SqlSource};
 
 #[derive(serde::Deserialize)]
 struct Input {
@@ -30,6 +34,8 @@ struct Input {
     assume: Vec<String>,
     #[serde(default)]
     fail_over: Option<u64>,
+    #[serde(default)]
+    baseline: Option<Baseline>,
 }
 
 #[derive(serde::Deserialize)]
@@ -61,18 +67,14 @@ fn lint(input: &str) -> Result<String, String> {
         })
         .collect();
     let analysis = analyze_sources_with(backend(), &sources, &config);
-    let gate_exceeded = match input.fail_over {
-        Some(limit) => analysis
-            .tables
-            .iter()
-            .any(|t| !t.ignored && t.avoidable_bytes_per_row > limit),
-        None => false,
-    };
+    let gate = baseline::evaluate(&analysis, input.fail_over, input.baseline.as_ref());
+    let shown_fail_over = input.fail_over.or(input.baseline.as_ref().map(|b| b.fail_over));
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "parser": parser_name(),
-        "fail_over": input.fail_over,
-        "gate_exceeded": gate_exceeded,
+        "fail_over": shown_fail_over,
+        "gate_exceeded": gate.exceeded,
+        "gate": serde_json::to_value(&gate).map_err(|e| e.to_string())?,
         "analysis": serde_json::to_value(&analysis).map_err(|e| e.to_string())?,
     });
     serde_json::to_string(&value).map_err(|e| e.to_string())
