@@ -183,3 +183,120 @@ mod dollar_body {
         assert_eq!(dollar_quoted_body("SELECT $1 + 2"), None);
     }
 }
+
+#[test]
+fn eof_inside_line_comment_does_not_overrun() {
+    // No trailing newline: the comment skip must stop at len, not index past it.
+    assert!(split("-- comment at eof").is_empty());
+    assert_eq!(split("SELECT 1; -- trailing at eof")[0].text, "SELECT 1");
+}
+
+#[test]
+fn lone_star_and_slash_inside_block_comments_are_data() {
+    let stmts = split("/* a * b / c */ SELECT 1;");
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0].text, "SELECT 1");
+    let nested = split("/* o /* i */ tail * / */ SELECT 2;");
+    assert_eq!(nested.len(), 1);
+    assert_eq!(nested[0].text, "SELECT 2");
+}
+
+#[test]
+fn statement_initial_quotes_do_not_underflow() {
+    // Statements that BEGIN with quoting exercise the i==0 guards of the E-string detector.
+    assert_eq!(split("'lead'; SELECT 1").len(), 2);
+    assert_eq!(split("E'a\\';x'; SELECT 1").len(), 2);
+    assert_eq!(split("e'a\\';x'; SELECT 1").len(), 2);
+    assert_eq!(split("\"q\"; SELECT 1").len(), 2);
+    assert_eq!(split("$$b$$; SELECT 1").len(), 2);
+}
+
+#[test]
+fn trailing_blank_runs_do_not_shift_statement_lines() {
+    // Whitespace between statements must not mark content: the space before the newline would
+    // otherwise pin the next statement to the previous line.
+    let stmts = split("SELECT 1;   \n\t \nSELECT 2;");
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[1].line, 3);
+}
+
+#[test]
+fn nested_comment_close_positions_are_exact() {
+    // The nest bookkeeping must resume content exactly after the true close.
+    let stmts = split("/* x /* y */ z */abc; SELECT 1;");
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[0].text, "abc");
+}
+
+/// Property: for generated scripts assembled from known statements wrapped in random quoting
+/// and comment decorations, split() recovers exactly the statement texts and 1-based lines.
+/// Complements the deterministic gauntlet with breadth — scanner arithmetic that survives
+/// point tests corrupts some generated case instead.
+mod round_trip_property {
+    use super::super::split;
+    use proptest::prelude::*;
+
+    fn newlines(s: &str) -> u32 {
+        s.matches('\n').count() as u32
+    }
+
+    fn piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-z][a-z0-9_]{0,5}".prop_map(|w| w),
+            Just("1 - 2 / 3".to_string()),
+            "[a-z ;]{0,8}".prop_map(|inner| format!("'{inner}'")),
+            proptest::collection::vec(
+                prop_oneof![Just("ab".to_string()), Just("\\'".to_string()), Just(";".to_string())],
+                0..4
+            )
+            .prop_map(|parts| format!("E'{}'", parts.concat())),
+            "[a-z;]{1,6}".prop_map(|i| format!("\"{i}\"")),
+            (prop_oneof![Just(""), Just("x"), Just("fn")], "[a-z ;]{0,10}")
+                .prop_map(|(tag, inner)| format!("${tag}${inner}${tag}$")),
+        ]
+    }
+
+    fn statement() -> impl Strategy<Value = String> {
+        proptest::collection::vec(piece(), 1..=3).prop_map(|pieces| pieces.join(" "))
+    }
+
+    fn filler() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(" ".to_string()),
+            Just("\n".to_string()),
+            Just("  \n\t ".to_string()),
+            "[a-z ;]{0,6}".prop_map(|c| format!("-- {c}\n")),
+            "[a-z ;]{0,6}".prop_map(|c| format!("/* {c} */ ")),
+            "[a-z ;]{0,4}".prop_map(|c| format!("/* a /* {c} */ b */\n")),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn split_round_trips_generated_scripts(
+            stmts in proptest::collection::vec((proptest::collection::vec(filler(), 0..3), statement()), 1..5),
+            trailing in proptest::option::of(filler()),
+        ) {
+            let mut script = String::new();
+            let mut expected: Vec<(String, u32)> = Vec::new();
+            let mut line = 1u32;
+            for (fillers, text) in &stmts {
+                for f in fillers {
+                    script.push_str(f);
+                    line += newlines(f);
+                }
+                expected.push((text.clone(), line));
+                script.push_str(text);
+                line += newlines(text);
+                script.push_str(";\n");
+                line += 1;
+            }
+            if let Some(t) = trailing {
+                script.push_str(&t);
+            }
+            let got: Vec<(String, u32)> = split(&script).into_iter().map(|s| (s.text, s.line)).collect();
+            prop_assert_eq!(got, expected, "script: {:?}", script);
+        }
+    }
+}

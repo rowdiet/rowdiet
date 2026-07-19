@@ -506,8 +506,16 @@ mod dynamic_template_units {
         assert_eq!(substitute_format("%x %", "t"), "%x %");
         // A digit run without `$` is not positional syntax; nothing is substituted.
         assert_eq!(substitute_format("%42", "t"), "%42");
-        // Multi-byte characters around placeholders survive byte-exact.
+        // A digitless `$` is not positional syntax, and `%%` collapses only immediately after
+        // the `%` — digits in between make both literal.
+        assert_eq!(substitute_format("%$I", "t"), "%$I");
+        assert_eq!(substitute_format("%4%", "t"), "%4%");
+        // Multi-byte characters around placeholders survive byte-exact. The adjacent-placeholder
+        // cases matter: a wrong char-width only misbehaves when a placeholder sits inside the
+        // mis-sliced span (verbatim spans copy correctly at any claimed width).
         assert_eq!(substitute_format("héllo %I wörld", "t"), "héllo t wörld");
+        assert_eq!(substitute_format("é%s!", "t"), "ét!");
+        assert_eq!(substitute_format("€%s!", "t"), "€t!");
         assert_eq!(substitute_format("𝄞%s𝄞", "t"), "𝄞t𝄞");
     }
 
@@ -625,4 +633,31 @@ fn statement_origins_carry_real_line_numbers() {
     let analysis = analyze_sources(&[src("V1__t.sql", tricky)], &Config::default());
     assert_eq!(analysis.tables.len(), 2);
     assert_eq!(analysis.tables[1].origin.line, 2);
+}
+
+#[test]
+fn dynamic_layout_inert_ddl_is_silent() {
+    // A dynamic template that parses to layout-irrelevant DDL (CREATE INDEX) is neither noted
+    // nor counted unanalyzable — deleting the Irrelevant arm in dispatch_dynamic_op survived
+    // the suite because no test exercised a benign dynamic statement.
+    let sql = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
+        DO $$ BEGIN EXECUTE format('CREATE INDEX %I ON t (a)', nm); END $$;";
+    let analysis = analyze_sources(&[src("V1__ix.sql", sql)], &Config::default());
+    assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    assert!(!analysis.tables[0].incomplete);
+}
+
+/// Property: a template with no `%` passes through substitute_format byte-identical — over
+/// arbitrary unicode, which pins the char-width walk far wider than fixed samples.
+mod format_identity_property {
+    use crate::substitute_format;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn substitute_format_is_identity_without_percent(template in "[^%]{0,24}") {
+            prop_assert_eq!(substitute_format(&template, "tok"), template);
+        }
+    }
 }

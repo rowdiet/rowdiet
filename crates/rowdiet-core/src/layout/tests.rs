@@ -314,3 +314,39 @@ fn brute_force_min_padding(kinds: &[ColumnKind]) -> u64 {
     go(kinds, &mut Vec::new(), &mut vec![false; kinds.len()], &mut best);
     best
 }
+
+/// Property form of the brute-force cross-check: random small multisets from the realistic
+/// kind pool, minimality asserted against exhaustive permutation search.
+mod minimality_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn suggested_order_is_minimal_on_random_fixed_multisets(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 16, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 52, align: Align::Double }),
+                ],
+                3..=7
+            )
+        ) {
+            let order = suggested_order(&kinds);
+            let mut seen = vec![false; kinds.len()];
+            for &i in &order {
+                prop_assert!(!seen[i], "not a permutation: {:?}", order);
+                seen[i] = true;
+            }
+            let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+            prop_assert_eq!(walk(&ordered).padding, brute_force_min_padding(&kinds), "kinds: {:?}", kinds);
+        }
+    }
+}
