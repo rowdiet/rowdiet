@@ -239,6 +239,100 @@ fn curated_extension_types_are_verified() {
     assert!(box3d.kind.irregular());
 }
 
+/// Every builtin entry, asserted against pg_type.dat facts stated independently of the source
+/// table. The catalog is vendored data: a typo in one arm silently mis-models every layout
+/// using that type, and no other test necessarily touches the entry (mutation testing found
+/// exactly that — deleted arms for money/date/interval/… survived the suite).
+#[test]
+fn builtin_table_is_pinned_entry_by_entry() {
+    let fixed = |len, align| ColumnKind::Fixed { len, align };
+    let varlena = |align| ColumnKind::Varlena {
+        align,
+        proven_short: false,
+    };
+    let expectations: &[(&str, ColumnKind)] = &[
+        ("bool", fixed(1, Align::Char)),
+        ("pgchar", fixed(1, Align::Char)),
+        ("int2", fixed(2, Align::Short)),
+        ("int4", fixed(4, Align::Int)),
+        ("int8", fixed(8, Align::Double)),
+        ("float4", fixed(4, Align::Int)),
+        ("float8", fixed(8, Align::Double)),
+        ("money", fixed(8, Align::Double)),
+        ("oid", fixed(4, Align::Int)),
+        ("regclass", fixed(4, Align::Int)),
+        ("date", fixed(4, Align::Int)),
+        ("time", fixed(8, Align::Double)),
+        ("timetz", fixed(12, Align::Double)),
+        ("timestamp", fixed(8, Align::Double)),
+        ("timestamptz", fixed(8, Align::Double)),
+        ("interval", fixed(16, Align::Double)),
+        ("uuid", fixed(16, Align::Char)),
+        ("macaddr", fixed(6, Align::Int)),
+        ("macaddr8", fixed(8, Align::Int)),
+        ("name", fixed(64, Align::Char)),
+        ("point", fixed(16, Align::Double)),
+        ("lseg", fixed(32, Align::Double)),
+        ("box", fixed(32, Align::Double)),
+        ("line", fixed(24, Align::Double)),
+        ("circle", fixed(24, Align::Double)),
+        ("pg_lsn", fixed(8, Align::Double)),
+        ("serial", fixed(4, Align::Int)),
+        ("serial4", fixed(4, Align::Int)),
+        ("bigserial", fixed(8, Align::Double)),
+        ("serial8", fixed(8, Align::Double)),
+        ("smallserial", fixed(2, Align::Short)),
+        ("serial2", fixed(2, Align::Short)),
+        ("box3d", fixed(52, Align::Double)),
+        ("numeric", varlena(Align::Int)),
+        ("text", varlena(Align::Int)),
+        ("bytea", varlena(Align::Int)),
+        ("json", varlena(Align::Int)),
+        ("jsonb", varlena(Align::Int)),
+        ("xml", varlena(Align::Int)),
+        ("inet", varlena(Align::Int)),
+        ("cidr", varlena(Align::Int)),
+        ("bit", varlena(Align::Int)),
+        ("varbit", varlena(Align::Int)),
+        ("varchar", varlena(Align::Int)),
+        ("bpchar", varlena(Align::Int)),
+        ("tsvector", varlena(Align::Int)),
+        ("tsquery", varlena(Align::Int)),
+        ("int4range", varlena(Align::Int)),
+        ("numrange", varlena(Align::Int)),
+        ("daterange", varlena(Align::Int)),
+        ("int4multirange", varlena(Align::Int)),
+        ("nummultirange", varlena(Align::Int)),
+        ("datemultirange", varlena(Align::Int)),
+        ("int8range", varlena(Align::Double)),
+        ("tsrange", varlena(Align::Double)),
+        ("tstzrange", varlena(Align::Double)),
+        ("int8multirange", varlena(Align::Double)),
+        ("tsmultirange", varlena(Align::Double)),
+        ("tstzmultirange", varlena(Align::Double)),
+        ("path", varlena(Align::Double)),
+        ("polygon", varlena(Align::Double)),
+        ("citext", varlena(Align::Int)),
+        ("hstore", varlena(Align::Int)),
+        ("vector", varlena(Align::Int)),
+        ("halfvec", varlena(Align::Int)),
+        ("sparsevec", varlena(Align::Int)),
+        ("ltree", varlena(Align::Int)),
+        ("lquery", varlena(Align::Int)),
+        ("ltxtquery", varlena(Align::Int)),
+        ("geometry", varlena(Align::Double)),
+        ("geography", varlena(Align::Double)),
+        ("cube", varlena(Align::Double)),
+    ];
+    for (key, expected) in expectations {
+        let resolved = cat().resolve(&t(key));
+        assert_eq!(resolved.kind, *expected, "{key}");
+        assert!(resolved.known, "{key}");
+        let serial_family = key.contains("serial");
+        assert_eq!(resolved.implicit_not_null, serial_family, "{key}");
+    }
+}
+
 #[test]
 fn assume_map_overrides_builtin() {
     let mut assume = BTreeMap::new();

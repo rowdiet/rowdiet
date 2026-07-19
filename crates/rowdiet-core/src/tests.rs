@@ -468,3 +468,161 @@ mod differential {
         }
     }
 }
+
+/// Focused unit tests for the dynamic-template machinery. These functions run on hostile input
+/// (arbitrary plpgsql fragments), and their boundary arithmetic was the largest surviving-mutant
+/// cluster in the first cargo-mutants campaign — happy-path DO tests never pinned the edges.
+mod dynamic_template_units {
+    use crate::{execute_template, find_ddl_keyword, substitute_format};
+
+    #[test]
+    fn execute_template_extracts_and_unescapes() {
+        let t = execute_template("EXECUTE format('CREATE TABLE %I (id int)', name);").unwrap();
+        assert_eq!(t, "CREATE TABLE %I (id int)");
+        let doubled = execute_template("EXECUTE 'it''s %I';").unwrap();
+        assert_eq!(doubled, "it's %I");
+    }
+
+    #[test]
+    fn execute_template_rejects_missing_or_unterminated_literals() {
+        assert_eq!(execute_template("EXECUTE make_sql(tbl);"), None);
+        assert_eq!(execute_template("EXECUTE 'unterminated"), None);
+        assert_eq!(execute_template("EXECUTE 'trailing escape''"), None);
+        // `execute` must stand alone as a word — an identifier containing it is not the keyword.
+        assert_eq!(execute_template("SELECT reexecute('CREATE TABLE x');"), None);
+        assert_eq!(execute_template("SELECT executed('CREATE TABLE x');"), None);
+    }
+
+    #[test]
+    fn substitute_format_handles_every_placeholder_form() {
+        assert_eq!(
+            substitute_format("CREATE TABLE %I (n %s)", "tok"),
+            "CREATE TABLE tok (n tok)"
+        );
+        assert_eq!(substitute_format("%1$I keeps %2$s order", "t"), "t keeps t order");
+        assert_eq!(substitute_format("DEFAULT %L", "t"), "DEFAULT '0'");
+        assert_eq!(substitute_format("100%% done", "t"), "100% done");
+        // Unknown verbs and a trailing bare % pass through untouched.
+        assert_eq!(substitute_format("%x %", "t"), "%x %");
+        // A digit run without `$` is not positional syntax; nothing is substituted.
+        assert_eq!(substitute_format("%42", "t"), "%42");
+        // Multi-byte characters around placeholders survive byte-exact.
+        assert_eq!(substitute_format("héllo %I wörld", "t"), "héllo t wörld");
+        assert_eq!(substitute_format("𝄞%s𝄞", "t"), "𝄞t𝄞");
+    }
+
+    #[test]
+    fn find_ddl_keyword_respects_word_boundaries() {
+        assert_eq!(find_ddl_keyword("create table t"), Some(0));
+        assert_eq!(find_ddl_keyword("IF done THEN ALTER TABLE t"), Some(13));
+        assert_eq!(find_ddl_keyword("procreate() drop x"), Some(12));
+        assert_eq!(find_ddl_keyword("procreated alterations dropped"), None);
+        assert_eq!(find_ddl_keyword("nothing here"), None);
+    }
+}
+
+#[test]
+fn do_block_counts_directly_unanalyzable_fragments() {
+    // Fragments with a DDL keyword that neither parse nor yield an EXECUTE template take the
+    // direct Unanalyzable arm — distinct from the dynamic-dispatch fallthrough, and previously
+    // reachable by no test (both `+=` mutants on its counter survived).
+    let sql = r#"
+        DO $$ BEGIN
+            EXECUTE 'CREATE ' || kind || ' whatever';
+            EXECUTE 'ALTER ' || kind || ' whatever';
+        END $$;
+    "#;
+    let analysis = analyze_sources(&[src("V1__dyn.sql", sql)], &Config::default());
+    let note = analysis
+        .notes
+        .iter()
+        .find(|n| n.detail.contains("not statically analyzable"))
+        .expect("summary note");
+    assert!(note.detail.contains("2 DDL-like"), "{}", note.detail);
+}
+
+/// Guard pins for the pg-exact protobuf mapping — non-type statements that share a protobuf
+/// shape with type DDL must map to Irrelevant, not register phantom types. (Both guards showed
+/// up as surviving replace-with-true mutants before these tests.)
+#[cfg(feature = "pg-exact")]
+mod pgq_guards {
+    use crate::extract::DdlOp;
+    use crate::extract_pgq;
+
+    #[test]
+    fn non_type_define_stmts_are_irrelevant() {
+        let ops = extract_pgq::extract("CREATE AGGREGATE sum2 (int) (sfunc = int4pl, stype = int4);").unwrap();
+        assert_eq!(ops, vec![DdlOp::Irrelevant]);
+        let ops = extract_pgq::extract("CREATE COLLATION nocase (provider = icu, locale = 'und');").unwrap();
+        assert_eq!(ops, vec![DdlOp::Irrelevant]);
+    }
+
+    #[test]
+    fn range_subtype_found_among_other_params() {
+        let ops = extract_pgq::extract(
+            "CREATE TYPE r8 AS RANGE (subtype_opclass = int8_ops, subtype = int8, collation = \"C\");",
+        )
+        .unwrap();
+        match &ops[..] {
+            [DdlOp::CreateRange {
+                name,
+                subtype: Some(sub),
+            }] => {
+                assert_eq!(name.key, "r8");
+                assert_eq!(sub.key, "int8");
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn float_precision_selects_storage_width() {
+    // Postgres: float(1..=24) is float4, float(25..=53) is float8 — a modeling fact, not a
+    // display nicety (4 vs 8 bytes, i vs d alignment).
+    let sql = "CREATE TABLE f (a float(24) NOT NULL, b float(25) NOT NULL, c float NOT NULL, id bigint NOT NULL);";
+    let analysis = analyze_sources(&[src("V1__f.sql", sql)], &Config::default());
+    let kinds: Vec<ColumnKind> = analysis.tables[0].columns.iter().map(|c| c.kind).collect();
+    assert_eq!(
+        kinds[0],
+        ColumnKind::Fixed {
+            len: 4,
+            align: Align::Int
+        }
+    );
+    assert_eq!(
+        kinds[1],
+        ColumnKind::Fixed {
+            len: 8,
+            align: Align::Double
+        }
+    );
+    assert_eq!(
+        kinds[2],
+        ColumnKind::Fixed {
+            len: 8,
+            align: Align::Double
+        }
+    );
+}
+
+#[test]
+fn statement_origins_carry_real_line_numbers() {
+    // Line accounting includes comment and in-statement newlines; a single-statement file
+    // cannot distinguish a broken counter from a working one (everything is line 1).
+    let sql = "-- header comment\n\nCREATE TABLE a (x int NOT NULL,\n  y bigint NOT NULL);\n/* block\n   comment */\nCREATE TABLE b (z int NOT NULL);\n";
+    let analysis = analyze_sources(&[src("V1__lines.sql", sql)], &Config::default());
+    let by_name: std::collections::BTreeMap<&str, u32> = analysis
+        .tables
+        .iter()
+        .map(|t| (t.name.as_str(), t.origin.line))
+        .collect();
+    assert_eq!(by_name["a"], 3);
+    assert_eq!(by_name["b"], 7);
+    // Hyphens and slashes that are NOT comment openers must not swallow text.
+    let tricky =
+        "CREATE TABLE c (x int NOT NULL); INSERT INTO c SELECT 1 - 2 / 3;\nCREATE TABLE d (y bigint NOT NULL);";
+    let analysis = analyze_sources(&[src("V1__t.sql", tricky)], &Config::default());
+    assert_eq!(analysis.tables.len(), 2);
+    assert_eq!(analysis.tables[1].origin.line, 2);
+}

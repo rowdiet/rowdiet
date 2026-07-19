@@ -233,3 +233,84 @@ fn null_bitmap_thresholds() {
     assert_eq!(null_thoff(72), 32);
     assert_eq!(null_thoff(73), 40);
 }
+
+/// Exhaustive cross-check of the fixed-block ordering against brute force: for small all-fixed
+/// multisets, the suggested order's padding must equal the true minimum over every permutation.
+/// This pins the DP's interior arithmetic (residue classes, cost recurrence, better-than-sorted
+/// acceptance), which single-point tests left unobserved — its surviving mutants motivated this.
+#[test]
+fn suggested_order_matches_brute_force_minimum_on_fixed_sets() {
+    let f = |len, align| ColumnKind::Fixed { len, align };
+    let cases: Vec<Vec<ColumnKind>> = vec![
+        vec![f(12, Align::Double), f(12, Align::Double), f(4, Align::Int)],
+        vec![
+            f(12, Align::Double),
+            f(6, Align::Int),
+            f(1, Align::Char),
+            f(8, Align::Double),
+        ],
+        vec![
+            f(52, Align::Double),
+            f(12, Align::Double),
+            f(4, Align::Int),
+            f(2, Align::Short),
+        ],
+        vec![
+            f(8, Align::Double),
+            f(4, Align::Int),
+            f(4, Align::Int),
+            f(2, Align::Short),
+            f(1, Align::Char),
+        ],
+        vec![
+            f(12, Align::Double),
+            f(12, Align::Double),
+            f(6, Align::Int),
+            f(6, Align::Int),
+            f(1, Align::Char),
+        ],
+        vec![
+            f(16, Align::Char),
+            f(12, Align::Double),
+            f(2, Align::Short),
+            f(4, Align::Int),
+            f(8, Align::Double),
+        ],
+        vec![
+            f(52, Align::Double),
+            f(6, Align::Int),
+            f(12, Align::Double),
+            f(1, Align::Char),
+            f(2, Align::Short),
+            f(4, Align::Int),
+        ],
+    ];
+    for kinds in cases {
+        let order = suggested_order(&kinds);
+        let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+        let suggested_padding = walk(&ordered).padding;
+        let brute = brute_force_min_padding(&kinds);
+        assert_eq!(suggested_padding, brute, "kinds: {kinds:?}, order: {order:?}");
+    }
+}
+
+fn brute_force_min_padding(kinds: &[ColumnKind]) -> u64 {
+    fn go(kinds: &[ColumnKind], current: &mut Vec<ColumnKind>, used: &mut Vec<bool>, best: &mut u64) {
+        if current.len() == kinds.len() {
+            *best = (*best).min(walk(current).padding);
+            return;
+        }
+        for i in 0..kinds.len() {
+            if !used[i] {
+                used[i] = true;
+                current.push(kinds[i]);
+                go(kinds, current, used, best);
+                current.pop();
+                used[i] = false;
+            }
+        }
+    }
+    let mut best = u64::MAX;
+    go(kinds, &mut Vec::new(), &mut vec![false; kinds.len()], &mut best);
+    best
+}
