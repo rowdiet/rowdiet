@@ -264,6 +264,7 @@ fn human_bytes(bytes: u64) -> String {
 
 pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
     let mut out = String::new();
+    let mut budget = AnnotationBudget::new();
     for t in &analysis.tables {
         if t.ignored || t.avoidable_bytes_per_row == 0 {
             continue;
@@ -280,15 +281,23 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "rowdiet modified-since-baseline",
             _ => "rowdiet",
         };
-        let _ = writeln!(
-            out,
-            "::{level} file={},line={},title={title}::table {}: {} B/row avoidable ({}) — suggested order: {}",
-            t.origin.source,
-            t.origin.line,
+        let message = format!(
+            "table {}: {} B/row avoidable ({}) — suggested order: {}",
             t.name,
             t.avoidable_bytes_per_row,
             tier_label(t.tier),
             t.suggested_order.join(", ")
+        );
+        budget.emit(
+            &mut out,
+            level,
+            &format!(
+                "::{level} file={},line={},title={}::{}",
+                escape_property(&t.origin.source),
+                t.origin.line,
+                escape_property(title),
+                escape_message(&message)
+            ),
         );
     }
     for note in &analysis.notes {
@@ -296,16 +305,164 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             NoteKind::SkippedStatement => "warning",
             _ => "notice",
         };
-        let _ = writeln!(
-            out,
-            "::{level} file={},line={},title=rowdiet {}::{}",
-            note.origin.source,
-            note.origin.line,
-            kind_label(note.kind),
-            note.detail
+        budget.emit(
+            &mut out,
+            level,
+            &format!(
+                "::{level} file={},line={},title={}::{}",
+                escape_property(&note.origin.source),
+                note.origin.line,
+                escape_property(&format!("rowdiet {}", kind_label(note.kind))),
+                escape_message(&note.detail)
+            ),
         );
     }
+    budget.finish(&mut out);
     out
+}
+
+/// The Actions runner decodes `%25`/`%0D`/`%0A` in annotation message data — a literal `%`
+/// (e.g. a `format('%I')` template quoted in a note) mis-decodes unless escaped, and newlines
+/// terminate the command.
+fn escape_message(s: &str) -> String {
+    let truncated = if s.len() > MESSAGE_CAP {
+        let mut end = MESSAGE_CAP;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
+    } else {
+        s
+    };
+    truncated.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
+}
+
+/// Property values (`file=`, `title=`) additionally decode `%3A`/`%2C`, so a comma or colon in
+/// a source path silently corrupts property parsing unless escaped.
+fn escape_property(s: &str) -> String {
+    escape_message(s).replace(':', "%3A").replace(',', "%2C")
+}
+
+/// The runner keeps at most 10 annotations per severity per step and drops overflow silently;
+/// messages are capped at 4096 chars. Truncation here is loud instead: a final notice reports
+/// the count, and the step summary (uncapped) carries the full report.
+const ANNOTATION_CAP: usize = 10;
+const MESSAGE_CAP: usize = 4000;
+
+struct AnnotationBudget {
+    errors: usize,
+    warnings: usize,
+    notices: usize,
+    dropped: usize,
+}
+
+impl AnnotationBudget {
+    fn new() -> Self {
+        AnnotationBudget {
+            errors: 0,
+            warnings: 0,
+            notices: 0,
+            dropped: 0,
+        }
+    }
+
+    fn emit(&mut self, out: &mut String, level: &str, line: &str) {
+        let count = match level {
+            "error" => &mut self.errors,
+            "warning" => &mut self.warnings,
+            _ => &mut self.notices,
+        };
+        // Notices stop one early so the suppression notice below always fits the runner cap.
+        let cap = if level == "notice" {
+            ANNOTATION_CAP - 1
+        } else {
+            ANNOTATION_CAP
+        };
+        if *count < cap {
+            *count += 1;
+            let _ = writeln!(out, "{line}");
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    fn finish(&mut self, out: &mut String) {
+        if self.dropped > 0 {
+            let _ = writeln!(
+                out,
+                "::notice title=rowdiet::{} annotation(s) suppressed (the runner keeps 10 per severity per step) — \
+                 the full report is in the step summary and the text/json output",
+                self.dropped
+            );
+        }
+    }
+}
+
+/// Markdown for `$GITHUB_STEP_SUMMARY`: the full, uncapped report — the annotation budget
+/// above stays honest because everything it drops is here.
+pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "## rowdiet\n");
+    let _ = writeln!(out, "| table | avoidable B/row | tier | verdict | origin |");
+    let _ = writeln!(out, "|---|---:|---|---|---|");
+    for t in &analysis.tables {
+        if t.ignored {
+            continue;
+        }
+        let verdict = match gate.verdicts.get(&t.name).copied() {
+            Some(TableVerdict::Pass) | None => "pass".to_string(),
+            Some(TableVerdict::NewViolation { .. }) => "**new violation**".to_string(),
+            Some(TableVerdict::Regression { allowed, .. }) => format!("**regression** (allowed {allowed})"),
+            Some(TableVerdict::GrownSinceBaseline { allowed, .. }) => {
+                format!("**grown since baseline** (allowed {allowed})")
+            }
+            Some(TableVerdict::ModifiedSinceBaseline { .. }) => "**modified since baseline**".to_string(),
+            Some(TableVerdict::RatchetOpportunity { allowed, .. }) => format!("ratchet (allowed {allowed})"),
+        };
+        let tier = match t.tier {
+            Tier::Exact => "exact",
+            Tier::Estimate => "estimate",
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {tier} | {verdict} | {}:{} |",
+            markdown_cell(&t.name),
+            t.avoidable_bytes_per_row,
+            markdown_cell(&t.origin.source),
+            t.origin.line
+        );
+    }
+    let ignored = analysis.tables.iter().filter(|t| t.ignored).count();
+    let _ = writeln!(out);
+    if ignored > 0 {
+        let _ = writeln!(out, "{ignored} table(s) ignored via rowdiet:ignore.\n");
+    }
+    if !analysis.notes.is_empty() {
+        let _ = writeln!(out, "<details><summary>{} note(s)</summary>\n", analysis.notes.len());
+        for note in &analysis.notes {
+            let _ = writeln!(
+                out,
+                "- `{}:{}` [{}] {}",
+                markdown_cell(&note.origin.source),
+                note.origin.line,
+                kind_label(note.kind),
+                markdown_cell(&note.detail)
+            );
+        }
+        let _ = writeln!(out, "\n</details>\n");
+    }
+    let mut gate_line = String::new();
+    render_gate_summary(&mut gate_line, gate);
+    if gate_line.is_empty() {
+        let _ = writeln!(out, "Gate: ok.");
+    } else {
+        let _ = writeln!(out, "```\n{}```", gate_line);
+    }
+    out
+}
+
+fn markdown_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
 }
 
 pub fn json(analysis: &Analysis, fail_over: Option<u64>, gate: &GateOutcome) -> Result<String, String> {

@@ -104,11 +104,35 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         Format::Github => render::github(&analysis, &gate),
     };
     print!("{output}");
+    if matches!(cli.format, Format::Github) {
+        append_step_summary(&analysis, &gate);
+    }
     Ok(if gate.exceeded {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Under GitHub Actions the annotation stream is capped by the runner (10 per severity per
+/// step), so `--format github` also appends the full report to `$GITHUB_STEP_SUMMARY` when the
+/// environment provides it. Best-effort: a broken summary path must not change the exit code.
+fn append_step_summary(analysis: &Analysis, gate: &rowdiet_core::GateOutcome) {
+    let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let summary = render::github_step_summary(analysis, gate);
+    let written = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, summary.as_bytes()));
+    if let Err(e) = written {
+        eprintln!("rowdiet: could not append the step summary ({path}: {e})");
+    }
 }
 
 /// The maintenance operations: `--update-baseline` rewrites the file wholesale;

@@ -218,3 +218,23 @@ fn baseline_flag_conflicts_and_requirements() {
         .unwrap();
     assert_eq!(orphan_flag.status.code(), Some(2));
 }
+
+#[test]
+fn github_step_summary_file_is_appended() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-summary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let summary = dir.join("summary.md");
+    std::fs::write(&summary, "# existing\n").unwrap();
+    let out = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--format", "github", "--fail-over", "0"])
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let content = std::fs::read_to_string(&summary).unwrap();
+    assert!(content.starts_with("# existing\n"), "{content}");
+    assert!(content.contains("## rowdiet"), "{content}");
+    assert!(content.contains("| account |"), "{content}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

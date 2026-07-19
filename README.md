@@ -74,6 +74,11 @@ rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # accept
 Exit codes: `0` clean, `1` gate exceeded, `2` operational error. Exempt a deliberate layout with
 a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement.
 
+`--format github` emits runner-safe annotations: property values and messages are
+workflow-command-escaped, and output respects the runner's 10-annotations-per-severity cap with
+a loud suppression notice instead of silent loss. When `$GITHUB_STEP_SUMMARY` is set (any
+GitHub Actions job), the full uncapped report is also appended to the job summary.
+
 ### Brownfield adoption: the baseline
 
 A zero-tolerance gate is useless on a schema that already carries debt — applied tables are

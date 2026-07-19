@@ -171,3 +171,64 @@ fn quoting_only_when_needed() {
     assert_eq!(maybe_quote("select"), "select");
     assert_eq!(maybe_quote("1st"), "\"1st\"");
 }
+
+#[test]
+fn github_escapes_properties_and_messages() {
+    let analysis = analyze_sources(
+        &[SqlSource {
+            name: "V1__a,b:c.sql".into(),
+            sql: r#"CREATE TABLE "we%ird" (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);"#
+                .into(),
+        }],
+        &Config::default(),
+    );
+    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    assert!(rendered.contains("file=V1__a%2Cb%3Ac.sql"), "{rendered}");
+    assert!(rendered.contains("we%25ird"), "{rendered}");
+    assert!(!rendered.contains("we%ird "), "{rendered}");
+}
+
+#[test]
+fn github_budget_truncates_loudly() {
+    let sql: String = (0..13)
+        .map(|i| {
+            format!("CREATE TABLE t{i:02} (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);\n")
+        })
+        .collect();
+    let analysis = analyze(&sql);
+    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    assert_eq!(rendered.matches("::error ").count(), 10, "{rendered}");
+    assert!(rendered.contains("3 annotation(s) suppressed"), "{rendered}");
+    let under = github(&analysis, &gate(&analysis, None));
+    assert_eq!(under.matches("::warning ").count(), 10, "{under}");
+    assert!(under.contains("suppressed"), "{under}");
+}
+
+#[test]
+fn github_step_summary_carries_the_full_report() {
+    let sql: String = (0..13)
+        .map(|i| {
+            format!("CREATE TABLE t{i:02} (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);\n")
+        })
+        .collect();
+    let analysis = analyze(&sql);
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0)));
+    for i in 0..13 {
+        assert!(
+            summary.contains(&format!("| t{i:02} | 8 | exact | **new violation** |")),
+            "{summary}"
+        );
+    }
+    assert!(
+        summary.contains("FAIL: 13 table(s) over the fail-over gate"),
+        "{summary}"
+    );
+    let baselined_summary = github_step_summary(
+        &analysis,
+        &baselined(&analysis, &[("t00", 4, &analysis.tables[0].layout_signature)]),
+    );
+    assert!(
+        baselined_summary.contains("**regression** (allowed 4)"),
+        "{baselined_summary}"
+    );
+}
