@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Superseded runs are cancelled — on a private repo every minute is metered.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WASI_SDK: ${{ github.workspace }}/.toolchains/wasi-sdk-33.0-x86_64-linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain + wasm targets
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: cache wasm toolchains
+        id: toolchains
+        uses: actions/cache@v4
+        with:
+          path: .toolchains
+          key: wasi-sdk-33.0_binaryen-131_x86_64-linux
+      - name: install wasi-sdk + binaryen
+        if: steps.toolchains.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .toolchains
+          curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz | tar -xz -C .toolchains
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-x86_64-linux.tar.gz | tar -xz -C .toolchains
+      - name: install wasmtime, expose tool paths
+        run: |
+          curl -sSfL https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+          echo "${{ github.workspace }}/.toolchains/binaryen-version_131/bin" >> "$GITHUB_PATH"
+      - name: toolchain sanity — the wasip1 leg must never silently skip
+        run: |
+          test -x "$WASI_SDK/bin/clang"
+          wasmtime --version
+          wasm-opt --version
+      - name: full verification matrix
+        run: ./scripts/ci.sh
