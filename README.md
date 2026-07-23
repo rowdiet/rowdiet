@@ -25,7 +25,7 @@ $ rowdiet migrations/ --rows 10000000 --suggest
 1 table(s) analyzed — 1 with avoidable waste, 0 statement(s) skipped
 ```
 
-## Why
+## Why lint column order?
 
 Postgres stores a row's columns in definition order and inserts invisible padding bytes so each
 value starts on its type's alignment boundary (1/2/4/8). A `boolean` before a `bigint` costs 7
@@ -36,11 +36,9 @@ per 8 kB page, so the win compounds through cache and I/O.
 
 The catch: Postgres cannot reorder columns in place. After a migration is applied, the fix is a
 table rewrite. That makes column order a **pre-apply, CI-time** concern — exactly where a static
-linter fits and where existing tools don't reach (Atlas's `PG110` needs a dev database, the
-`pg_column_tetris` extension needs a live install and skips `ALTER`, pgtableoptimizer.com is a
-closed webpage with no CI story).
+linter fits.
 
-## What makes rowdiet different
+## Highlights
 
 - **Static & zero-DB** — parses migration files; nothing to install in Postgres.
 - **Migration-series aware** — folds `CREATE TABLE` + later `ALTER TABLE ADD COLUMN` (and drops,
@@ -175,9 +173,23 @@ Planned: distribution (crates.io release, prebuilt binaries, pre-commit hook, Gi
 hosted webpage), a larger extension map (PostGIS, …), and offering the rule upstream to squawk
 once rowdiet has proven out publicly.
 
+## Prior art
+
+- [`pg_column_byte_packer`][packer] — Braintree's Ruby gem from the article above; reorders
+  columns at generation time inside ActiveRecord migrations. Ruby-only, generation-side.
+- Atlas's `PG110` check — flags inefficient order, but needs a dev database to diff against.
+- The `pg_column_tetris` extension — reports from inside a live Postgres install; no CI story,
+  and `ALTER`-built layouts are out of scope.
+- pgtableoptimizer.com — a closed webpage; paste-only, nothing to automate.
+- [squawk] — the adjacent Postgres migration linter (locking and downtime rules); it has no
+  layout rules today, which is the gap rowdiet covers.
+
+[packer]: https://github.com/braintree/pg_column_byte_packer
+[squawk]: https://github.com/sbdchd/squawk
+
 ## License
 
 MIT OR Apache-2.0.
 
 [rocks]: https://www.enterprisedb.com/blog/rocks-and-sand
-[braintree]: https://medium.com/paypal-tech/postgresql-at-scale-saving-space-basically-for-free-d94483d5d725
+[braintree]: https://medium.com/braintree-product-technology/postgresql-at-scale-saving-space-basically-for-free-d94483d9ed9a
