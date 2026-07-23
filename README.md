@@ -28,15 +28,17 @@ $ rowdiet migrations/ --rows 10000000 --suggest
 ## Why lint column order?
 
 Postgres stores a row's columns in definition order and inserts invisible padding bytes so each
-value starts on its type's alignment boundary (1/2/4/8). A `boolean` before a `bigint` costs 7
+value starts on its type's alignment boundary (1/2/4/8 — [`typalign`][pgtype]; row layout per
+the [storage docs][pgstorage]). A `boolean` before a `bigint` costs 7
 dead bytes on **every row**. Reordering columns to descending alignment recovers it: published
 fleet-wide runs report 10–21% of total disk ([2ndQuadrant, "On Rocks and Sand"][rocks]: 21%;
 [Braintree/PayPal, across 100+ TB][braintree]: ~10%). Fewer bytes per row also means more rows
 per 8 kB page, so the win compounds through cache and I/O.
 
-The catch: Postgres cannot reorder columns in place. After a migration is applied, the fix is a
-table rewrite. That makes column order a **pre-apply, CI-time** concern — exactly where a static
-linter fits.
+The catch: Postgres cannot reorder columns in place — [the wiki's remedies][colpos] are all
+rewrites, and decoupling logical from physical order was [prototyped on pgsql-hackers and
+abandoned][lco]. So once a migration is applied the fix costs a table rewrite, which makes
+column order a **pre-apply, CI-time** concern — exactly where a static linter fits.
 
 ## Highlights
 
@@ -130,7 +132,7 @@ Surprises it knows about so you don't have to: `uuid` is char-aligned (16 B, nev
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is
 varlena (`bpchar`); an enum value is 4 bytes.
 
-## Limitations (v1)
+## Limitations
 
 - 64-bit Postgres assumed (`MAXALIGN` 8) — the near-universal case.
 - Unknown/extension types default to (varlena, int-aligned), flagged, and teachable via
@@ -152,27 +154,6 @@ varlena (`bpchar`); an enum value is 4 bytes.
 - `--suggest` prints a reordered `CREATE TABLE` skeleton; it never rewrites files (editing an
   applied migration breaks Flyway checksums / refinery divergence checks).
 
-## Status & roadmap
-
-Implemented:
-
-- the off-by-default `pg-exact` parser backend, which doubles as a differential oracle for the
-  default parser in the test suite;
-- the Rust-linked `wasm32-wasip1` module embedding the real PG17 parser (`docs/design.md`
-  § Parser decision) and the static paste-your-DDL page built on it (its own repo,
-  `rowdiet-web`);
-- partition children inheriting the parent's modeled layout;
-- a source-verified extension type map (pgvector, citext, hstore);
-- an exact minimum-padding search when a table has several irregular-size columns;
-- the `cargo rowdiet` subcommand and a wasm-opt size pass;
-- baseline gating for brownfield adoption (`--baseline` / `--update-baseline` / `--accept`),
-  with layout-signature-pinned allowances and the append-tolerant prefix rule;
-- the full verification matrix in `scripts/ci.sh`.
-
-Planned: distribution (crates.io release, prebuilt binaries, pre-commit hook, GitHub Action,
-hosted webpage), a larger extension map (PostGIS, …), and offering the rule upstream to squawk
-once rowdiet has proven out publicly.
-
 ## Prior art
 
 - [`pg_column_byte_packer`][packer] — Braintree's Ruby gem from the article above; reorders
@@ -193,3 +174,7 @@ MIT OR Apache-2.0.
 
 [rocks]: https://www.enterprisedb.com/blog/rocks-and-sand
 [braintree]: https://medium.com/braintree-product-technology/postgresql-at-scale-saving-space-basically-for-free-d94483d9ed9a
+[pgstorage]: https://www.postgresql.org/docs/current/storage-page-layout.html
+[pgtype]: https://www.postgresql.org/docs/current/catalog-pg-type.html
+[colpos]: https://wiki.postgresql.org/wiki/Alter_column_position
+[lco]: https://www.postgresql.org/message-id/flat/20150227182303.GH2384%40alvh.no-ip.org
