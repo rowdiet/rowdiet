@@ -128,10 +128,6 @@ pub fn rows_per_page(footprint: u64) -> u64 {
     (PAGE_SIZE - PAGE_HEADER) / (LINE_POINTER + footprint)
 }
 
-pub fn no_null_thoff() -> u64 {
-    maxalign(TUPLE_HEADER)
-}
-
 /// t_hoff for rows with no null bitmap: MAXALIGN(23) = 24.
 pub fn bare_thoff() -> u64 {
     maxalign(TUPLE_HEADER)

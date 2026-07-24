@@ -227,7 +227,7 @@ fn tiers() {
 
 #[test]
 fn null_bitmap_thresholds() {
-    assert_eq!(no_null_thoff(), 24);
+    assert_eq!(bare_thoff(), 24);
     assert_eq!(null_thoff(8), 24);
     assert_eq!(null_thoff(9), 32);
     assert_eq!(null_thoff(72), 32);
