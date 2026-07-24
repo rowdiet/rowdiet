@@ -174,11 +174,16 @@ varlena (`bpchar`); an enum value is 4 bytes.
 - [`pg_column_byte_packer`][packer] — Braintree's Ruby gem from the article above; reorders
   columns at generation time inside ActiveRecord migrations. Ruby-only, generation-side.
 - Atlas's `PG110` check — flags inefficient order, but needs a dev database to diff against.
-- The `pg_column_tetris` extension — reports from inside a live Postgres install; no CI story,
-  and `ALTER`-built layouts are out of scope.
-- pgtableoptimizer.com — a closed webpage; paste-only, nothing to automate.
-- [squawk] — the adjacent Postgres migration linter (locking and downtime rules); it has no
-  layout rules today, which is the gap rowdiet covers.
+- The `pg_column_tetris` extension — reports from inside a live Postgres install; no CI story.
+- pgtableoptimizer.com — a paste-a-table webpage; single-statement, and its numbers blend
+  estimates into exact figures (details in the comparison).
+- [squawk] — the adjacent Postgres migration linter (locking and downtime rules). No layout
+  rules today — a column-order check is an [open request there][squawk-860], where the
+  maintainer favors exactly the static approach rowdiet implements.
+
+Feature-by-feature table and dated accuracy notes: [docs/comparison.md](docs/comparison.md).
+
+[squawk-860]: https://github.com/sbdchd/squawk/issues/860
 
 [packer]: https://github.com/braintree/pg_column_byte_packer
 [squawk]: https://github.com/sbdchd/squawk
