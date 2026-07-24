@@ -25,10 +25,10 @@ pub enum Align {
 impl Align {
     pub fn bytes(self) -> u64 {
         match self {
-            Align::Char => 1,
-            Align::Short => 2,
-            Align::Int => 4,
-            Align::Double => 8,
+            Self::Char => 1,
+            Self::Short => 2,
+            Self::Int => 4,
+            Self::Double => 8,
         }
     }
 }
@@ -42,13 +42,12 @@ pub enum ColumnKind {
 
 impl ColumnKind {
     pub fn is_fixed(&self) -> bool {
-        matches!(self, ColumnKind::Fixed { .. })
+        matches!(self, Self::Fixed { .. })
     }
 
     pub fn align(&self) -> Align {
         match self {
-            ColumnKind::Fixed { align, .. } => *align,
-            ColumnKind::Varlena { align, .. } => *align,
+            Self::Fixed { align, .. } | Self::Varlena { align, .. } => *align,
         }
     }
 
@@ -56,8 +55,8 @@ impl ColumnKind {
     /// placing it anywhere but the end of its alignment group forces padding after it.
     pub fn irregular(&self) -> bool {
         match self {
-            ColumnKind::Fixed { len, align } => len % align.bytes() != 0,
-            ColumnKind::Varlena { .. } => false,
+            Self::Fixed { len, align } => len % align.bytes() != 0,
+            Self::Varlena { .. } => false,
         }
     }
 }
@@ -164,20 +163,7 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     if walk(&sorted_fixed).padding == 0 {
         return;
     }
-    let mut classes: Vec<FixedClass> = Vec::new();
-    for &index in order[..fixed_len].iter() {
-        let ColumnKind::Fixed { len, align } = kinds[index] else {
-            unreachable!("fixed prefix")
-        };
-        let key = (align.bytes(), len % MAXALIGN);
-        match classes.iter_mut().find(|c| c.key == key) {
-            Some(class) => class.members.push(index),
-            None => classes.push(FixedClass {
-                key,
-                members: vec![index],
-            }),
-        }
-    }
+    let classes = fixed_classes(kinds, &order[..fixed_len]);
     if classes.len() > 12 {
         return;
     }
@@ -210,6 +196,26 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
         }
     }
     order[..fixed_len].copy_from_slice(&refined);
+}
+
+/// Group the fixed prefix of `order` into its padding-equivalence classes, heuristic order
+/// preserved (first appearance) so the search's tie-breaking keeps the familiar shape.
+fn fixed_classes(kinds: &[ColumnKind], fixed_order: &[usize]) -> Vec<FixedClass> {
+    let mut classes: Vec<FixedClass> = Vec::new();
+    for &index in fixed_order {
+        let ColumnKind::Fixed { len, align } = kinds[index] else {
+            unreachable!("fixed prefix")
+        };
+        let key = (align.bytes(), len % MAXALIGN);
+        match classes.iter_mut().find(|c| c.key == key) {
+            Some(class) => class.members.push(index),
+            None => classes.push(FixedClass {
+                key,
+                members: vec![index],
+            }),
+        }
+    }
+    classes
 }
 
 struct FixedClass {
@@ -249,18 +255,18 @@ impl Dp<'_> {
     }
 }
 
-fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u8, u8, usize) {
-    let align_desc = |a: Align| 8 - a.bytes() as u8;
+fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
+    let align_desc = |a: Align| MAXALIGN - a.bytes();
     match kind {
-        ColumnKind::Fixed { align, .. } => (0, align_desc(*align), kind.irregular() as u8, index),
+        ColumnKind::Fixed { align, .. } => (0, align_desc(*align), kind.irregular(), index),
         ColumnKind::Varlena {
             align,
             proven_short: false,
-        } => (1, align_desc(*align), 0, index),
+        } => (1, align_desc(*align), false, index),
         ColumnKind::Varlena {
             align,
             proven_short: true,
-        } => (2, align_desc(*align), 0, index),
+        } => (2, align_desc(*align), false, index),
     }
 }
 

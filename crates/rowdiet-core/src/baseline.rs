@@ -11,7 +11,7 @@
 //! rewriting migration was taken anyway, so the allowance expires and the table must meet
 //! `fail_over` or be re-accepted deliberately.
 
-use crate::report::Analysis;
+use crate::report::{Analysis, TableReport};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,10 +77,10 @@ impl TableVerdict {
     pub fn failing(self) -> bool {
         matches!(
             self,
-            TableVerdict::NewViolation { .. }
-                | TableVerdict::Regression { .. }
-                | TableVerdict::GrownSinceBaseline { .. }
-                | TableVerdict::ModifiedSinceBaseline { .. }
+            Self::NewViolation { .. }
+                | Self::Regression { .. }
+                | Self::GrownSinceBaseline { .. }
+                | Self::ModifiedSinceBaseline { .. }
         )
     }
 }
@@ -119,38 +119,15 @@ pub fn evaluate(
     fail_on_degraded: bool,
     baseline: Option<&Baseline>,
 ) -> GateOutcome {
-    let default_limit = fail_over.or(baseline.map(|b| b.fail_over));
+    let default_limit = fail_over.or_else(|| baseline.map(|b| b.fail_over));
     let mut verdicts = BTreeMap::new();
     let mut expired = Vec::new();
     for table in analysis.tables.iter().filter(|t| !t.ignored) {
-        let avoidable = table.avoidable_bytes_per_row;
         let entry = baseline.and_then(|b| b.tables.get(&table.name));
-        let verdict = match entry {
-            Some(entry) => {
-                let allowed = entry.bytes;
-                match relation(&entry.layout, &table.layout_signature) {
-                    SignatureRelation::Match if avoidable > allowed => TableVerdict::Regression { avoidable, allowed },
-                    SignatureRelation::Grown if avoidable > allowed => {
-                        TableVerdict::GrownSinceBaseline { avoidable, allowed }
-                    }
-                    SignatureRelation::Match | SignatureRelation::Grown if avoidable < allowed => {
-                        TableVerdict::RatchetOpportunity { avoidable, allowed }
-                    }
-                    SignatureRelation::Match | SignatureRelation::Grown => TableVerdict::Pass,
-                    SignatureRelation::Different => match default_limit {
-                        Some(limit) if avoidable > limit => TableVerdict::ModifiedSinceBaseline { avoidable },
-                        _ => {
-                            expired.push(table.name.clone());
-                            TableVerdict::Pass
-                        }
-                    },
-                }
-            }
-            None => match default_limit {
-                Some(limit) if avoidable > limit => TableVerdict::NewViolation { avoidable },
-                _ => TableVerdict::Pass,
-            },
-        };
+        let (verdict, entry_expired) = table_verdict(table, entry, default_limit);
+        if entry_expired {
+            expired.push(table.name.clone());
+        }
         verdicts.insert(table.name.clone(), verdict);
     }
     let orphaned = baseline
@@ -184,6 +161,38 @@ pub fn evaluate(
         orphaned,
         expired,
     }
+}
+
+/// One table against its (possible) baseline entry. The second value reports a stale entry:
+/// the layout changed non-append while the table now meets `default_limit`, so the entry no
+/// longer describes anything and the next baseline write drops it.
+fn table_verdict(
+    table: &TableReport,
+    entry: Option<&BaselineEntry>,
+    default_limit: Option<u64>,
+) -> (TableVerdict, bool) {
+    let avoidable = table.avoidable_bytes_per_row;
+    let over_limit = |limit: Option<u64>| limit.is_some_and(|l| avoidable > l);
+    let Some(entry) = entry else {
+        let verdict = if over_limit(default_limit) {
+            TableVerdict::NewViolation { avoidable }
+        } else {
+            TableVerdict::Pass
+        };
+        return (verdict, false);
+    };
+    let allowed = entry.bytes;
+    let verdict = match relation(&entry.layout, &table.layout_signature) {
+        SignatureRelation::Match if avoidable > allowed => TableVerdict::Regression { avoidable, allowed },
+        SignatureRelation::Grown if avoidable > allowed => TableVerdict::GrownSinceBaseline { avoidable, allowed },
+        SignatureRelation::Match | SignatureRelation::Grown if avoidable < allowed => {
+            TableVerdict::RatchetOpportunity { avoidable, allowed }
+        }
+        SignatureRelation::Match | SignatureRelation::Grown => TableVerdict::Pass,
+        SignatureRelation::Different if over_limit(default_limit) => TableVerdict::ModifiedSinceBaseline { avoidable },
+        SignatureRelation::Different => return (TableVerdict::Pass, true),
+    };
+    (verdict, false)
 }
 
 enum SignatureRelation {
