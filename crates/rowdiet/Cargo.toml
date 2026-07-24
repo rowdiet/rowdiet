@@ -20,3 +20,7 @@ serde_json.workspace = true
 # build with --no-default-features to skip the C compile.
 default = ["pg-exact"]
 pg-exact = ["rowdiet-core/pg-exact"]
+
+[package.metadata.docs.rs]
+# Same feature set as the shipped binary (pg-exact is default), stated explicitly for the docs.rs build.
+all-features = true
