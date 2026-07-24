@@ -4,8 +4,15 @@
 
 use std::cmp::Ordering;
 
+/// Same order as comparing [`sort_key`]s, without allocating the owned tie-breaker strings —
+/// this runs O(n log n) times per directory sort.
 pub fn compare(a: &str, b: &str) -> Ordering {
-    sort_key(a).cmp(&sort_key(b))
+    match (parse_version(a), parse_version(b)) {
+        (Some(va), Some(vb)) => va.cmp(&vb).then_with(|| a.cmp(b)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
 }
 
 pub fn sort_key(file_name: &str) -> (u8, Vec<u64>, String) {
@@ -32,7 +39,7 @@ fn parse_version(name: &str) -> Option<Vec<u64>> {
         }
         segments.push(name[start..i].parse().ok()?);
         match b.get(i) {
-            Some(b'_' | b'.') if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => i += 1,
+            Some(b'_' | b'.') if b.get(i + 1).is_some_and(u8::is_ascii_digit) => i += 1,
             _ => break,
         }
     }

@@ -5,6 +5,7 @@ use crate::catalog::TypeRef;
 use sqlparser::ast as sq;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use std::borrow::Cow;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,10 +179,10 @@ fn index_column_key(ic: &sq::IndexColumn) -> Option<String> {
 
 fn map_column(cd: &sq::ColumnDef) -> RawColumn {
     let not_null = cd.options.iter().any(|od| match &od.option {
-        sq::ColumnOption::NotNull => true,
-        sq::ColumnOption::PrimaryKey(_) => true,
+        sq::ColumnOption::NotNull
+        | sq::ColumnOption::PrimaryKey(_)
         // Identity columns (no generation expression) are implicitly NOT NULL.
-        sq::ColumnOption::Generated {
+        | sq::ColumnOption::Generated {
             generation_expr: None, ..
         } => true,
         _ => false,
@@ -239,8 +240,7 @@ fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
         }
         sq::AlterTableOperation::RenameTable { table_name: renamed } => {
             let new = match renamed {
-                sq::RenameTableNameKind::As(n) => table_name(&n),
-                sq::RenameTableNameKind::To(n) => table_name(&n),
+                sq::RenameTableNameKind::As(n) | sq::RenameTableNameKind::To(n) => table_name(&n),
             };
             vec![DdlOp::RenameTable {
                 table: table.clone(),
@@ -360,9 +360,9 @@ fn map_type(dt: &sq::DataType) -> TypeRef {
     let display = dt.to_string();
     if let sq::DataType::Array(elem) = dt {
         let inner = match elem {
-            sq::ArrayElemTypeDef::SquareBracket(inner, _) => Some(inner),
-            sq::ArrayElemTypeDef::AngleBracket(inner) => Some(inner),
-            sq::ArrayElemTypeDef::Parenthesis(inner) => Some(inner),
+            sq::ArrayElemTypeDef::SquareBracket(inner, _)
+            | sq::ArrayElemTypeDef::AngleBracket(inner)
+            | sq::ArrayElemTypeDef::Parenthesis(inner) => Some(inner),
             sq::ArrayElemTypeDef::None => None,
         };
         return match inner {
@@ -431,7 +431,7 @@ fn scalar_key(dt: &sq::DataType) -> (String, Option<u64>) {
         TsVector => key("tsvector"),
         TsQuery => key("tsquery"),
         Regclass => key("regclass"),
-        GeometricType(g) => key(geometric_key(g)),
+        GeometricType(g) => key(geometric_key(*g)),
         Custom(name, _) => (custom_key(name), None),
         other => (other.to_string().to_lowercase(), None),
     }
@@ -440,12 +440,11 @@ fn scalar_key(dt: &sq::DataType) -> (String, Option<u64>) {
 fn char_len(l: &Option<sq::CharacterLength>) -> Option<u64> {
     match l {
         Some(sq::CharacterLength::IntegerLength { length, .. }) => Some(*length),
-        Some(sq::CharacterLength::Max) => None,
-        None => None,
+        Some(sq::CharacterLength::Max) | None => None,
     }
 }
 
-fn geometric_key(g: &sq::GeometricTypeKind) -> &'static str {
+fn geometric_key(g: sq::GeometricTypeKind) -> &'static str {
     match g {
         sq::GeometricTypeKind::Point => "point",
         sq::GeometricTypeKind::Line => "line",
@@ -468,20 +467,26 @@ fn custom_key(name: &sq::ObjectName) -> String {
 
 /// sqlparser 0.62 cannot parse `CREATE UNLOGGED TABLE`; stripping the keyword is layout-neutral.
 pub fn preprocess(text: &str) -> String {
+    preprocessed(text).into_owned()
+}
+
+/// Borrowing form of [`preprocess`] — the analysis loop calls this per statement, and almost no
+/// statement needs the rewrite.
+pub(crate) fn preprocessed(text: &str) -> Cow<'_, str> {
     let words = word_spans(text, 3);
     let is = |r: &Range<usize>, w: &str| text[r.clone()].eq_ignore_ascii_case(w);
     if words.len() == 3 && is(&words[0], "create") && is(&words[1], "unlogged") && is(&words[2], "table") {
         let mut stripped = String::with_capacity(text.len());
         stripped.push_str(&text[..words[1].start]);
         stripped.push_str(&text[words[2].start..]);
-        return stripped;
+        return Cow::Owned(stripped);
     }
-    text.to_string()
+    Cow::Borrowed(text)
 }
 
 fn word_spans(text: &str, n: usize) -> Vec<Range<usize>> {
     let b = text.as_bytes();
-    let mut spans = Vec::new();
+    let mut spans = Vec::with_capacity(n);
     let mut i = 0usize;
     while i < b.len() && spans.len() < n {
         if b[i].is_ascii_whitespace() {

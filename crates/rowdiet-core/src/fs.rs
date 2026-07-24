@@ -26,7 +26,7 @@ pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_cached_key(std::fs::DirEntry::file_name);
     for entry in entries {
         if entry.file_name().as_encoded_bytes().first() == Some(&b'.') {
             continue;

@@ -127,7 +127,7 @@ pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], confi
 
 fn extract_with(backend: ParserBackend, text: &str) -> Result<Vec<extract::DdlOp>, String> {
     match backend {
-        ParserBackend::Sqlparser => extract::extract(&extract::preprocess(text)),
+        ParserBackend::Sqlparser => extract::extract(&extract::preprocessed(text)),
         #[cfg(feature = "pg-exact")]
         ParserBackend::PgExact => extract_pgq::extract(text),
     }
@@ -234,19 +234,7 @@ fn scan_fragment(backend: ParserBackend, fragment: &str) -> FragmentOutcome {
 /// SQL stays unanalyzable.
 fn execute_template(fragment: &str) -> Option<String> {
     let b = fragment.as_bytes();
-    let kw = b"execute";
-    let mut at = None;
-    let mut i = 0usize;
-    while i + kw.len() <= b.len() {
-        let before = i == 0 || !split::ident_byte(b[i - 1]);
-        let after = b.get(i + kw.len()).is_none_or(|&c| !split::ident_byte(c));
-        if before && after && b[i..i + kw.len()].eq_ignore_ascii_case(kw) {
-            at = Some(i + kw.len());
-            break;
-        }
-        i += 1;
-    }
-    let mut i = at?;
+    let mut i = find_word(fragment, b"execute")? + b"execute".len();
     while i < b.len() && b[i] != b'\'' {
         i += 1;
     }
@@ -357,23 +345,25 @@ fn dispatch_dynamic_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &O
 }
 
 fn find_ddl_keyword(text: &str) -> Option<usize> {
+    [b"create".as_slice(), b"alter".as_slice(), b"drop".as_slice()]
+        .into_iter()
+        .filter_map(|keyword| find_word(text, keyword))
+        .min()
+}
+
+/// The first word-boundary, case-insensitive occurrence of `word` in `text`.
+fn find_word(text: &str, word: &[u8]) -> Option<usize> {
     let b = text.as_bytes();
-    let mut best: Option<usize> = None;
-    for keyword in [b"create".as_slice(), b"alter".as_slice(), b"drop".as_slice()] {
-        let mut i = 0usize;
-        while i + keyword.len() <= b.len() {
-            let boundary_before = i == 0 || !split::ident_byte(b[i - 1]);
-            let boundary_after = b.get(i + keyword.len()).is_none_or(|&c| !split::ident_byte(c));
-            if boundary_before && boundary_after && b[i..i + keyword.len()].eq_ignore_ascii_case(keyword) {
-                if best.is_none_or(|m| i < m) {
-                    best = Some(i);
-                }
-                break;
-            }
-            i += 1;
+    let mut i = 0usize;
+    while i + word.len() <= b.len() {
+        let boundary_before = i == 0 || !split::ident_byte(b[i - 1]);
+        let boundary_after = b.get(i + word.len()).is_none_or(|&c| !split::ident_byte(c));
+        if boundary_before && boundary_after && b[i..i + word.len()].eq_ignore_ascii_case(word) {
+            return Some(i);
         }
+        i += 1;
     }
-    best
+    None
 }
 
 fn dispatch_do_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &Origin) {
@@ -390,7 +380,7 @@ fn dispatch_do_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &Origin
         DdlOp::AddColumn { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (add column)", origin),
         DdlOp::DropColumns { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (drop column)", origin),
         DdlOp::RenameColumn { table, .. } => {
-            folder.conditional_table_ddl(&table, "ALTER TABLE (rename column)", origin)
+            folder.conditional_table_ddl(&table, "ALTER TABLE (rename column)", origin);
         }
         DdlOp::RenameTable { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (rename)", origin),
         DdlOp::SetColumnType { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (set type)", origin),
