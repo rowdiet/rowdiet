@@ -318,7 +318,7 @@ fn map_type(tn: &pb::TypeName) -> TypeRef {
     let parts: Vec<&str> = tn.names.iter().filter_map(string_node_ref).collect();
     let qualified = parts.len() > 1;
     let last = parts.last().copied().unwrap_or("");
-    let dims = tn.array_bounds.len().min(u8::MAX as usize) as u8;
+    let dims = u8::try_from(tn.array_bounds.len()).unwrap_or(u8::MAX);
     let (key, default_char_len) = match last {
         // The catalog name of the quoted one-byte `"char"` type is literally `char`; the keyword
         // `char` never arrives here (the grammar maps it to pg_catalog.bpchar).
@@ -345,7 +345,7 @@ fn map_type(tn: &pb::TypeName) -> TypeRef {
 fn first_int_typmod(typmods: &[pb::Node]) -> Option<u64> {
     match typmods.first()?.node.as_ref()? {
         NodeEnum::AConst(ac) => match ac.val.as_ref()? {
-            pb::a_const::Val::Ival(i) if i.ival >= 0 => Some(i.ival as u64),
+            pb::a_const::Val::Ival(i) => u64::try_from(i.ival).ok(),
             _ => None,
         },
         _ => None,

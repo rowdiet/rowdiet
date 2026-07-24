@@ -104,7 +104,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         None => None,
     };
     let gate = baseline::evaluate(&analysis, cli.fail_over, cli.fail_on_degraded, loaded.as_ref());
-    let shown_fail_over = cli.fail_over.or(loaded.as_ref().map(|b| b.fail_over));
+    let shown_fail_over = cli.fail_over.or_else(|| loaded.as_ref().map(|b| b.fail_over));
     let output = match cli.format {
         Format::Text => render::text(&analysis, cli.rows, cli.suggest, &gate),
         Format::Json => render::json(&analysis, shown_fail_over, &gate)?,
@@ -153,7 +153,7 @@ fn maintain_baseline(cli: &Cli, path: &Path, analysis: &Analysis) -> Result<Exit
     let written = if cli.update_baseline {
         let fail_over = cli
             .fail_over
-            .or(existing.as_ref().map(|b| b.fail_over))
+            .or_else(|| existing.as_ref().map(|b| b.fail_over))
             .ok_or("--update-baseline needs --fail-over (there is no existing baseline to take it from)")?;
         let updated = baseline::build_from(analysis, fail_over, env!("CARGO_PKG_VERSION"));
         write_baseline(path, &updated)?;

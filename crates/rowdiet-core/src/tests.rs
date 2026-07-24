@@ -11,7 +11,7 @@ fn src(name: &str, sql: &str) -> SqlSource {
 fn end_to_end_migration_series() {
     let v1 = src(
         "V1__init.sql",
-        r#"
+        r"
         CREATE TYPE order_status AS ENUM ('new', 'paid');
         CREATE TABLE orders (
             flag boolean NOT NULL,
@@ -20,7 +20,7 @@ fn end_to_end_migration_series() {
             note text
         );
         DO $$ BEGIN RAISE NOTICE 'hi'; END $$;
-        "#,
+        ",
     );
     let v2 = src(
         "V2__add_cols.sql",
@@ -538,12 +538,12 @@ fn do_block_counts_directly_unanalyzable_fragments() {
     // Fragments with a DDL keyword that neither parse nor yield an EXECUTE template take the
     // direct Unanalyzable arm — distinct from the dynamic-dispatch fallthrough, and previously
     // reachable by no test (both `+=` mutants on its counter survived).
-    let sql = r#"
+    let sql = r"
         DO $$ BEGIN
             EXECUTE 'CREATE ' || kind || ' whatever';
             EXECUTE 'ALTER ' || kind || ' whatever';
         END $$;
-    "#;
+    ";
     let analysis = analyze_sources(&[src("V1__dyn.sql", sql)], &Config::default());
     let note = analysis
         .notes

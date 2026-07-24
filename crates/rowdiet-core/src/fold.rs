@@ -45,8 +45,8 @@ pub struct Note {
 impl Note {
     /// Path-level note for a scan that matched no SQL files. Line 0 means "no line to point
     /// at" — renderers show the bare path.
-    pub fn empty_scan(path: &str) -> Note {
-        Note {
+    pub fn empty_scan(path: &str) -> Self {
+        Self {
             origin: Origin {
                 source: path.to_string(),
                 line: 0,
@@ -94,7 +94,7 @@ pub struct Folder {
 
 impl Folder {
     pub fn new(assume: BTreeMap<String, AssumedKind>) -> Self {
-        Folder {
+        Self {
             catalog: Catalog::new(assume),
             order: Vec::new(),
             tables: BTreeMap::new(),
@@ -250,7 +250,7 @@ impl Folder {
         if let Some(parent) = &partition_of {
             match self.tables.get(&parent.key) {
                 Some(parent_table) => {
-                    inherited = parent_table.columns.clone();
+                    inherited.clone_from(&parent_table.columns);
                     // Children share the parent's attribute numbering, dropped slots included.
                     inherited_dropped = parent_table.dropped_count;
                     incomplete = incomplete || parent_table.incomplete;
@@ -339,7 +339,7 @@ impl Folder {
         let entry = self.tables.get_mut(&table.key).expect("checked above");
         match entry.columns.iter_mut().find(|c| c.key == old) {
             Some(column) => {
-                column.key = new.clone();
+                column.key.clone_from(&new);
                 column.display = new;
                 mark_altered(entry, origin);
             }
@@ -366,12 +366,12 @@ impl Folder {
             self.order.retain(|key| key != &new.key);
         }
         let mut entry = self.tables.remove(&table.key).expect("checked above");
-        entry.key = new.key.clone();
+        entry.key.clone_from(&new.key);
         entry.display = new.display;
         mark_altered(&mut entry, origin);
-        for slot in self.order.iter_mut() {
+        for slot in &mut self.order {
             if slot == &table.key {
-                *slot = new.key.clone();
+                slot.clone_from(&new.key);
             }
         }
         self.tables.insert(new.key, entry);

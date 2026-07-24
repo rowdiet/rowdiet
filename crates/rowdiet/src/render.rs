@@ -376,7 +376,7 @@ struct AnnotationBudget {
 
 impl AnnotationBudget {
     fn new() -> Self {
-        AnnotationBudget {
+        Self {
             errors: 0,
             warnings: 0,
             notices: 0,
@@ -404,7 +404,7 @@ impl AnnotationBudget {
         }
     }
 
-    fn finish(&mut self, out: &mut String) {
+    fn finish(&self, out: &mut String) {
         if self.dropped > 0 {
             let _ = writeln!(
                 out,
@@ -474,7 +474,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     if gate_line.is_empty() {
         let _ = writeln!(out, "Gate: ok.");
     } else {
-        let _ = writeln!(out, "```\n{}```", gate_line);
+        let _ = writeln!(out, "```\n{gate_line}```");
     }
     out
 }

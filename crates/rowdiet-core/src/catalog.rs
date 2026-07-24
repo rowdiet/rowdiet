@@ -44,7 +44,7 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new(assume: BTreeMap<String, AssumedKind>) -> Self {
-        Catalog {
+        Self {
             assume,
             session: BTreeMap::new(),
         }

@@ -77,7 +77,7 @@ fn lint(input: &str) -> Result<String, String> {
         input.fail_on_degraded,
         input.baseline.as_ref(),
     );
-    let shown_fail_over = input.fail_over.or(input.baseline.as_ref().map(|b| b.fail_over));
+    let shown_fail_over = input.fail_over.or_else(|| input.baseline.as_ref().map(|b| b.fail_over));
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "parser": parser_name(),
@@ -110,7 +110,7 @@ fn parser_name() -> &'static str {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rowdiet_alloc(len: usize) -> *mut u8 {
-    Box::into_raw(vec![0u8; len].into_boxed_slice()) as *mut u8
+    Box::into_raw(vec![0u8; len].into_boxed_slice()).cast::<u8>()
 }
 
 /// Callers must pass a pointer previously returned by this module together with the exact length
@@ -135,7 +135,7 @@ pub unsafe fn lint_raw(ptr: *const u8, len: usize) -> (*mut u8, usize) {
         .into_bytes()
         .into_boxed_slice();
     let out_len = output.len();
-    (Box::into_raw(output) as *mut u8, out_len)
+    (Box::into_raw(output).cast::<u8>(), out_len)
 }
 
 /// High 32 bits = pointer, low 32 = length. Meaningful on wasm32 only (pointers fit in 32 bits);
