@@ -233,16 +233,18 @@ pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[Stri
             .iter()
             .find(|t| !t.ignored && (t.name == *name || t.display == *name))
             .ok_or_else(|| format!("cannot accept `{name}`: no such table in the analyzed DDL (or it is ignored)"))?;
+        // Entries are stored under the canonical fold key regardless of which spelling the
+        // caller used to name the table — an entry keyed by display would never match a gate.
         if table.avoidable_bytes_per_row > baseline.fail_over {
             baseline.tables.insert(
-                name.clone(),
+                table.name.clone(),
                 BaselineEntry {
                     bytes: table.avoidable_bytes_per_row,
                     layout: table.layout_signature.clone(),
                 },
             );
         } else {
-            baseline.tables.remove(name);
+            baseline.tables.remove(&table.name);
         }
     }
     Ok(())

@@ -965,3 +965,97 @@ mod schema_qualification {
         assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
     }
 }
+
+mod postaudit_pins {
+    use super::src;
+    use crate::{Config, NoteKind, analyze_sources, baseline};
+
+    #[test]
+    fn clean_analysis_passes_even_with_fail_on_degraded() {
+        let analysis = analyze_sources(
+            &[src("V1__c.sql", "CREATE TABLE ok (a bigint NOT NULL);")],
+            &Config::default(),
+        );
+        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        assert_eq!(strict.skipped_statements, 0);
+        assert_eq!(strict.incomplete_tables, 0);
+        assert!(!strict.exceeded, "{strict:#?}");
+    }
+
+    #[test]
+    fn accept_matches_the_display_spelling_too() {
+        let sql = "CREATE TABLE MyTable (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
+        let mut base = baseline::Baseline {
+            rowdiet: "test".into(),
+            fail_over: 0,
+            tables: std::collections::BTreeMap::new(),
+        };
+        baseline::accept_tables(&mut base, &analysis, &["MyTable".into()]).unwrap();
+        assert!(base.tables.contains_key("mytable"), "{base:?}");
+    }
+
+    #[test]
+    fn self_rename_keeps_the_table() {
+        // ALTER TABLE a RENAME TO A folds onto the same key; the collision guard must not
+        // treat it as replacing an existing table (a mutated guard deleted the table).
+        let sql = "CREATE TABLE a (flag boolean NOT NULL, id bigint NOT NULL);\nALTER TABLE a RENAME TO A;";
+        let analysis = analyze_sources(&[src("V1__a.sql", sql)], &Config::default());
+        assert_eq!(analysis.tables.len(), 1);
+        assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    }
+
+    #[test]
+    fn drop_bitmap_boundary_at_nine_original_columns() {
+        // live 8 + dropped 1 = 9 original attributes: bitmap pushes t_hoff 24 -> 32. A wrong
+        // combination (multiplying instead of adding the counts) lands back under the
+        // 8-attribute boundary and reports 56.
+        let cols: String = (1..=9).map(|i| format!("c{i} int NOT NULL, ")).collect();
+        let sql = format!(
+            "CREATE TABLE w ({}); ALTER TABLE w DROP COLUMN c9;",
+            cols.trim_end_matches(", ")
+        );
+        let analysis = analyze_sources(&[src("V1__w.sql", &sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.natts, 8);
+        assert_eq!(t.dropped_columns, 1);
+        assert_eq!(t.current.footprint, Some(64));
+    }
+
+    #[test]
+    fn placeholder_named_dynamic_create_and_drop_stay_summarized() {
+        // A placeholder in the TARGET name cannot become a targeted note; it must fall to the
+        // loud summary (mutating the concreteness guards to true routed it to a note naming
+        // the placeholder token).
+        let sql = "DO $$ BEGIN EXECUTE format('CREATE TABLE %I (id int)', nm); END $$;\n\
+                   DO $$ BEGIN EXECUTE format('DROP TABLE %I', nm); END $$;";
+        let analysis = analyze_sources(&[src("V1__p.sql", sql)], &Config::default());
+        assert_eq!(analysis.notes.len(), 2, "{:#?}", analysis.notes);
+        for note in &analysis.notes {
+            assert!(note.detail.contains("not statically analyzable"), "{}", note.detail);
+            assert!(!note.detail.contains("rowdiet_dyn"), "{}", note.detail);
+        }
+    }
+
+    #[test]
+    fn do_scan_cap_returns_unanalyzable_not_a_late_parse() {
+        // Keyword #34 would parse; the cap (32 attempts) must fire first. An uncapped scan
+        // reaches it and emits a conditional CREATE note instead of the summary.
+        let noise: String = (0..33).map(|i| format!("k{i} create ")).collect();
+        let sql = format!("DO $$ BEGIN {noise} create table capx (id int); END $$;");
+        let analysis = analyze_sources(&[src("V1__cap.sql", &sql)], &Config::default());
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::DoBlockDdl && n.detail.contains("not statically analyzable")),
+            "{:#?}",
+            analysis.notes
+        );
+        assert!(
+            !analysis.notes.iter().any(|n| n.detail.contains("capx")),
+            "{:#?}",
+            analysis.notes
+        );
+    }
+}

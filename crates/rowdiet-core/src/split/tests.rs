@@ -310,3 +310,80 @@ fn estring_escaped_newline_still_counts_the_line() {
     assert_eq!(stmts.len(), 2);
     assert_eq!(stmts[1].line, 4, "{stmts:#?}");
 }
+
+/// Property for `comment_marker_lines`: markers injected into generated comments must be
+/// found at exactly their lines; markers inside string literals, dollar bodies, and quoted
+/// identifiers must never count. The scanner duplicates split()'s quoting rules, so it gets
+/// the same generator treatment (its first mutation campaign left it almost unpinned).
+mod marker_property {
+    use super::super::comment_marker_lines;
+    use proptest::prelude::*;
+
+    const MARK: &str = "rowdiet:ignore";
+
+    #[derive(Clone, Debug)]
+    enum Piece {
+        LineCommentMarked,
+        BlockCommentMarked,
+        LineComment,
+        PlainStringMarked,
+        DollarBodyMarked,
+        QuotedIdentMarked,
+        Code,
+        Newline,
+    }
+
+    fn piece() -> impl Strategy<Value = Piece> {
+        prop_oneof![
+            Just(Piece::LineCommentMarked),
+            Just(Piece::BlockCommentMarked),
+            Just(Piece::LineComment),
+            Just(Piece::PlainStringMarked),
+            Just(Piece::DollarBodyMarked),
+            Just(Piece::QuotedIdentMarked),
+            Just(Piece::Code),
+            Just(Piece::Newline),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+        #[test]
+        fn finds_exactly_the_comment_markers(pieces in proptest::collection::vec(piece(), 1..14)) {
+            let mut text = String::new();
+            let mut line = 1u32;
+            let mut expected: Vec<u32> = Vec::new();
+            for p in &pieces {
+                match p {
+                    Piece::LineCommentMarked => {
+                        text.push_str(&format!("-- x {MARK} y\n"));
+                        expected.push(line);
+                        line += 1;
+                    }
+                    Piece::BlockCommentMarked => {
+                        text.push_str(&format!("/* a\n{MARK} */ "));
+                        expected.push(line + 1);
+                        line += 1;
+                    }
+                    Piece::LineComment => {
+                        text.push_str("-- nothing here\n");
+                        line += 1;
+                    }
+                    Piece::PlainStringMarked => text.push_str(&format!("'{MARK}' ")),
+                    Piece::DollarBodyMarked => text.push_str(&format!("$x$ -- {MARK}\n oops $x$ ")),
+                    Piece::QuotedIdentMarked => text.push_str(&format!("\"{MARK}\" ")),
+                    Piece::Code => text.push_str("select 1 "),
+                    Piece::Newline => {
+                        text.push('\n');
+                        line += 1;
+                    }
+                }
+                if matches!(p, Piece::DollarBodyMarked) {
+                    line += 1;
+                }
+            }
+            let got = comment_marker_lines(&text, MARK);
+            prop_assert_eq!(got, expected, "text: {:?}", text);
+        }
+    }
+}
