@@ -76,7 +76,7 @@ Gotchas:
 
 ## Runtime shape
 
-Reactor-style library module, not a bin: `#[no_mangle] extern "C" fn rowdiet_lint(ptr, len) ->
-ptr` with JSON in/out plus exported alloc/free (go-pgquery precedent). The browser loads it via
+Reactor-style library module, not a bin: `#[unsafe(no_mangle)] extern "C" fn rowdiet_lint(ptr, len) ->
+u64` (packed pointer+length, described above) with JSON in/out plus exported alloc/free (go-pgquery precedent). The browser loads it via
 `browser_wasi_shim`; a ~100-line hand-rolled JS loader replaces wasm-bindgen, which supports
 only `wasm32-unknown-unknown` — the target libpg_query cannot build for.

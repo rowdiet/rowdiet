@@ -29,6 +29,8 @@ pub enum NoteKind {
     DuplicateColumn,
     UnknownColumn,
     DoBlockDdl,
+    UnusedIgnoreMarker,
+    TempTableSkipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +60,10 @@ pub struct FoldedTable {
     pub ignored: bool,
     pub incomplete: bool,
     pub columns: Vec<FoldedColumn>,
+    /// Columns dropped over the series. Postgres keeps dropped attributes (attisdropped), so
+    /// every row written after the drop stores a NULL for each — the null bitmap is present
+    /// and sized by the ORIGINAL attribute count. Layout math must include that header cost.
+    pub dropped_count: usize,
 }
 
 #[derive(Debug)]
@@ -127,19 +133,24 @@ impl Folder {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                temporary,
                 partition_of,
             } => {
-                self.create_table(
-                    name,
-                    columns,
-                    pk_columns,
-                    if_not_exists,
-                    is_ctas,
-                    incomplete_columns,
-                    partition_of,
-                    origin,
-                    ignore_marker,
-                );
+                if temporary {
+                    self.temp_table_skipped(&name.display, origin);
+                } else {
+                    self.create_table(
+                        name,
+                        columns,
+                        pk_columns,
+                        if_not_exists,
+                        is_ctas,
+                        incomplete_columns,
+                        partition_of,
+                        origin,
+                        ignore_marker,
+                    );
+                }
             }
             DdlOp::AddColumn {
                 table,
@@ -219,10 +230,13 @@ impl Folder {
         // columns) — inherit the parent's modeled columns when the parent is in the set.
         let mut incomplete = incomplete_columns;
         let mut inherited: Vec<FoldedColumn> = Vec::new();
+        let mut inherited_dropped = 0usize;
         if let Some(parent) = &partition_of {
             match self.tables.get(&parent.key) {
                 Some(parent_table) => {
                     inherited = parent_table.columns.clone();
+                    // Children share the parent's attribute numbering, dropped slots included.
+                    inherited_dropped = parent_table.dropped_count;
                     incomplete = incomplete || parent_table.incomplete;
                 }
                 None => {
@@ -243,6 +257,7 @@ impl Folder {
             ignored: ignore_marker,
             incomplete,
             columns: inherited,
+            dropped_count: inherited_dropped,
         };
         for raw in columns {
             let mut column = self.resolve_column(raw, origin);
@@ -286,9 +301,12 @@ impl Folder {
             let existed = entry.columns.iter().any(|c| c.key == column);
             if existed {
                 entry.columns.retain(|c| c.key != column);
+                entry.dropped_count += 1;
                 mark_altered(entry, origin);
                 let detail = format!(
-                    "table {}: column {column} dropped — modeled as removed; rows already written keep paying its natts/null-bitmap effects",
+                    "table {}: column {column} dropped — Postgres keeps the attribute slot, so \
+                     every row written from now on carries a null bitmap sized by the original \
+                     column count (included in the footprint below)",
                     table.display
                 );
                 self.note(origin, NoteKind::DroppedColumn, detail);
@@ -316,6 +334,20 @@ impl Folder {
     fn rename_table(&mut self, table: RawName, new: RawName, origin: &Origin) {
         if !self.require_table(&table, origin) {
             return;
+        }
+        // Postgres would reject a rename onto an existing name; replaying it here replaces the
+        // target, which must not happen in silence.
+        if new.key != table.key && self.tables.contains_key(&new.key) {
+            self.note(
+                origin,
+                NoteKind::Redefined,
+                format!(
+                    "rename of {} to {} replaces an existing table of that name (Postgres would \
+                     reject this rename)",
+                    table.display, new.display
+                ),
+            );
+            self.order.retain(|key| key != &new.key);
         }
         let mut entry = self.tables.remove(&table.key).expect("checked above");
         entry.key = new.key.clone();
@@ -409,6 +441,24 @@ impl Folder {
 
     pub fn do_block_note(&mut self, origin: &Origin, detail: String) {
         self.note(origin, NoteKind::DoBlockDdl, detail);
+    }
+
+    pub fn unused_ignore_marker(&mut self, origin: &Origin) {
+        self.note(
+            origin,
+            NoteKind::UnusedIgnoreMarker,
+            "rowdiet:ignore is not attached to any statement — place it inside the statement it \
+             should exempt (before its semicolon)"
+                .to_string(),
+        );
+    }
+
+    pub fn temp_table_skipped(&mut self, name: &str, origin: &Origin) {
+        self.note(
+            origin,
+            NoteKind::TempTableSkipped,
+            format!("temporary table {name} is not analyzed (session-lived, no storage debt)"),
+        );
     }
 
     fn unknown_column(&mut self, table: &RawName, column: &str, origin: &Origin) {

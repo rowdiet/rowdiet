@@ -19,7 +19,7 @@ fn sample() -> Analysis {
 }
 
 fn gate(analysis: &Analysis, fail_over: Option<u64>) -> GateOutcome {
-    baseline::evaluate(analysis, fail_over, None)
+    baseline::evaluate(analysis, fail_over, false, None)
 }
 
 fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome {
@@ -39,7 +39,7 @@ fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome 
             })
             .collect(),
     };
-    baseline::evaluate(analysis, None, Some(&base))
+    baseline::evaluate(analysis, None, false, Some(&base))
 }
 
 #[test]

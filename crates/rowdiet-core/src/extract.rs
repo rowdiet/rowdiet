@@ -31,6 +31,8 @@ pub enum DdlOp {
         is_ctas: bool,
         /// LIKE / INHERITS / typed table — declared columns are not the whole story.
         incomplete_columns: bool,
+        /// CREATE TEMPORARY TABLE — session-lived, excluded from analysis.
+        temporary: bool,
         /// `PARTITION OF parent`: the child's physical layout is the parent's, verbatim.
         partition_of: Option<RawName>,
     },
@@ -154,6 +156,7 @@ fn map_create_table(ct: sq::CreateTable) -> DdlOp {
         if_not_exists: ct.if_not_exists,
         is_ctas,
         incomplete_columns,
+        temporary: ct.temporary,
         partition_of,
     }
 }
@@ -496,6 +499,9 @@ pub fn sniff(text: &str) -> Option<Sniff> {
             it.next()?;
             tok = it.next()?;
         }
+        if !tok.1 && tok.0.ends_with('.') {
+            tok = it.next()?;
+        }
         return Some(Sniff::AlterTable(sniff_key(tok)));
     }
     if first.eq_ignore_ascii_case("create") {
@@ -513,6 +519,11 @@ pub fn sniff(text: &str) -> Option<Sniff> {
         if name.0.eq_ignore_ascii_case("if") {
             it.next()?;
             it.next()?;
+            name = it.next()?;
+        }
+        if !name.1 && name.0.ends_with('.') {
+            // `schema."Quoted Name"` tokenizes as an unquoted `schema.` followed by the quoted
+            // identifier; the quoted token is the table name.
             name = it.next()?;
         }
         return Some(Sniff::CreateTable(sniff_key(name)));

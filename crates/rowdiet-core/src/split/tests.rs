@@ -300,3 +300,13 @@ mod round_trip_property {
         }
     }
 }
+
+#[test]
+fn estring_escaped_newline_still_counts_the_line() {
+    // A backslash before a newline inside an E-string skipped the newline uncounted, shifting
+    // every later statement's reported line by one.
+    let sql = "INSERT INTO t VALUES (E'a\\\n b');\n\nCREATE TABLE t9 (x int);";
+    let stmts = split(sql);
+    assert_eq!(stmts.len(), 2);
+    assert_eq!(stmts[1].line, 4, "{stmts:#?}");
+}

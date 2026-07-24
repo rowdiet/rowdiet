@@ -92,7 +92,17 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
     let mut pk_columns: Vec<String> = Vec::new();
     for elt in cs.table_elts.iter().chain(cs.constraints.iter()) {
         match elt.node.as_ref() {
-            Some(NodeEnum::ColumnDef(cd)) => columns.push(map_column(cd)),
+            // A ColumnDef without a type is not a column: on a partition child the grammar
+            // delivers `(col WITH OPTIONS ...)` option specs this way — they constrain
+            // inherited columns and are layout-inert. Anywhere else a type-less def is
+            // something we do not model, so the table is marked incomplete instead of
+            // growing a phantom column of type "unknown".
+            Some(NodeEnum::ColumnDef(cd)) if cd.type_name.is_some() => columns.push(map_column(cd)),
+            Some(NodeEnum::ColumnDef(_)) => {
+                if partition_of.is_none() {
+                    incomplete_columns = true;
+                }
+            }
             Some(NodeEnum::Constraint(c)) => pk_columns.extend(pk_keys(c)),
             Some(NodeEnum::TableLikeClause(_)) => incomplete_columns = true,
             _ => {}
@@ -105,6 +115,7 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
         if_not_exists: cs.if_not_exists,
         is_ctas: false,
         incomplete_columns,
+        temporary: cs.relation.as_ref().is_some_and(|rv| rv.relpersistence == "t"),
         partition_of,
     }
 }
@@ -296,6 +307,7 @@ fn map_ctas(ctas: &pb::CreateTableAsStmt) -> Vec<DdlOp> {
             if_not_exists: ctas.if_not_exists,
             is_ctas: true,
             incomplete_columns: false,
+            temporary: rv.relpersistence == "t",
             partition_of: None,
         }],
         None => vec![DdlOp::Irrelevant],

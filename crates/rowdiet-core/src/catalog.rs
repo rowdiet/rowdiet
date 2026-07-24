@@ -185,12 +185,20 @@ pub fn parse_assume_spec(spec: &str) -> Result<(String, AssumedKind), String> {
         ["varlena", align] => AssumedKind::Varlena {
             align: parse_align(align)?,
         },
-        ["fixed", len, align] => AssumedKind::Fixed {
-            len: len
+        ["fixed", len, align] => {
+            let len: u64 = len
                 .parse()
-                .map_err(|_| format!("assume-type `{spec}`: bad length `{len}`"))?,
-            align: parse_align(align)?,
-        },
+                .map_err(|_| format!("assume-type `{spec}`: bad length `{len}`"))?;
+            // pg_type.typlen is an int2; anything outside 1..=32767 is not a Postgres type and
+            // would corrupt the offset walk (a huge value overflows it).
+            if !(1..=32767).contains(&len) {
+                return Err(format!("assume-type `{spec}`: length must be 1..=32767, got {len}"));
+            }
+            AssumedKind::Fixed {
+                len,
+                align: parse_align(align)?,
+            }
+        }
         _ => return Err(usage()),
     };
     Ok((name.trim().to_lowercase(), kind))

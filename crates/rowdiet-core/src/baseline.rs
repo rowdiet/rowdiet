@@ -89,6 +89,12 @@ impl TableVerdict {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GateOutcome {
     pub exceeded: bool,
+    /// Statements the parser skipped (loudly noted, but a gate that only counts avoidable
+    /// bytes would stay green over them — these counts make the degradation visible to
+    /// automation, and `fail_on_degraded` turns them into a failure).
+    pub skipped_statements: usize,
+    /// Non-ignored tables marked incomplete (skipped or unexpanded DDL touched them).
+    pub incomplete_tables: usize,
     /// One verdict per non-ignored analyzed table.
     pub verdicts: BTreeMap<String, TableVerdict>,
     /// Baseline entries with no matching analyzed table (renamed or dropped since acceptance).
@@ -100,7 +106,15 @@ pub struct GateOutcome {
 
 /// Gate an analysis. An explicit `fail_over` wins over the baseline file's recorded one; with
 /// neither present nothing can fail. Ignored tables are outside both gate and baseline.
-pub fn evaluate(analysis: &Analysis, fail_over: Option<u64>, baseline: Option<&Baseline>) -> GateOutcome {
+/// `fail_on_degraded` additionally fails the gate when statements were skipped or tables are
+/// incomplete — without it those are surfaced in the outcome but stay green (a sqlparser user
+/// cannot always fix a parser gap; under pg-exact skips should be zero, so strict is cheap).
+pub fn evaluate(
+    analysis: &Analysis,
+    fail_over: Option<u64>,
+    fail_on_degraded: bool,
+    baseline: Option<&Baseline>,
+) -> GateOutcome {
     let default_limit = fail_over.or(baseline.map(|b| b.fail_over));
     let mut verdicts = BTreeMap::new();
     let mut expired = Vec::new();
@@ -144,9 +158,18 @@ pub fn evaluate(analysis: &Analysis, fail_over: Option<u64>, baseline: Option<&B
                 .collect()
         })
         .unwrap_or_default();
-    let exceeded = verdicts.values().any(|v| v.failing());
+    let skipped_statements = analysis
+        .notes
+        .iter()
+        .filter(|n| n.kind == crate::fold::NoteKind::SkippedStatement)
+        .count();
+    let incomplete_tables = analysis.tables.iter().filter(|t| !t.ignored && t.incomplete).count();
+    let degraded = skipped_statements > 0 || incomplete_tables > 0;
+    let exceeded = verdicts.values().any(|v| v.failing()) || (fail_on_degraded && degraded);
     GateOutcome {
         exceeded,
+        skipped_statements,
+        incomplete_tables,
         verdicts,
         orphaned,
         expired,
@@ -208,7 +231,7 @@ pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[Stri
         let table = analysis
             .tables
             .iter()
-            .find(|t| !t.ignored && t.name == *name)
+            .find(|t| !t.ignored && (t.name == *name || t.display == *name))
             .ok_or_else(|| format!("cannot accept `{name}`: no such table in the analyzed DDL (or it is ignored)"))?;
         if table.avoidable_bytes_per_row > baseline.fail_over {
             baseline.tables.insert(

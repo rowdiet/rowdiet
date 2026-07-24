@@ -62,6 +62,7 @@ cargo install rowdiet            # or from a checkout: cargo install --path crat
 cargo rowdiet migrations/        # installs a cargo subcommand too (cargo-rowdiet)
 rowdiet migrations/                          # report
 rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row
+rowdiet migrations/ --fail-over 0 --fail-on-degraded   # also fail when statements were skipped
 rowdiet migrations/ --format github          # GitHub Actions annotations
 rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
@@ -73,7 +74,11 @@ rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # accept
 ```
 
 Exit codes: `0` clean, `1` gate exceeded, `2` operational error. Exempt a deliberate layout with
-a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement.
+a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement — the marker counts only in
+comments (never in string literals), and a marker that ends up attached to no statement gets a
+note instead of vanishing. Skipped statements and incomplete tables are reported in the gate
+summary either way; `--fail-on-degraded` turns them into a failure (recommended under
+`--parser pg-exact`, where skips should be zero).
 
 `--format github` emits runner-safe annotations: property values and messages are
 workflow-command-escaped, and output respects the runner's 10-annotations-per-severity cap with
@@ -102,10 +107,14 @@ fail-over or gets re-accepted deliberately.
 #[test]
 fn migrations_are_byte_packed() {
     let analysis = rowdiet_core::fs::analyze_dir("migrations", &Default::default()).unwrap();
+    assert!(analysis.notes.is_empty(), "statements were skipped: {:#?}", analysis.notes);
     let worst = analysis.tables.iter().filter(|t| !t.ignored).map(|t| t.avoidable_bytes_per_row).max();
     assert_eq!(worst.unwrap_or(0), 0, "column order wastes bytes: {analysis:#?}");
 }
 ```
+
+The notes assertion matters: a gate that only counts avoidable bytes stays green over statements
+the parser could not read.
 
 Flyway users: run the CLI on the migrations directory in CI (Flyway has no non-JVM callback
 surface; a Java callback can shell out to `rowdiet` if you want runtime coupling).
@@ -113,7 +122,10 @@ surface; a Java callback can shell out to `rowdiet` if you want runtime coupling
 ## How it reports
 
 Fixed-width columns (int/bigint/timestamp/uuid/bool/…) are **byte-exact from DDL alone** — they
-are never TOASTed or compressed. Varlena columns (text/varchar/numeric/jsonb/bytea/inet/arrays/…)
+are never TOASTed or compressed. That includes the null-bitmap residue after `DROP COLUMN`:
+Postgres keeps dropped attribute slots and stores a NULL for each in every subsequent row, so a
+post-drop table's footprint carries a bitmap sized by the original column count (verified
+against pageinspect). Varlena columns (text/varchar/numeric/jsonb/bytea/inet/arrays/…)
 are stored three data-dependent ways (short form ≤126 B unaligned / long form 4-byte header,
 aligned / 18-byte TOAST pointer, unaligned), so their padding cannot be known statically.
 rowdiet therefore reports per table:
@@ -140,8 +152,10 @@ varlena (`bpchar`); an enum value is 4 bytes.
   `--assume-type` / `Config::assume`. Types defined *in the migration set* (`CREATE TYPE … AS
   ENUM/RANGE/…`, `CREATE DOMAIN`) resolve exactly by replay.
 - `ALTER TABLE` against tables created outside the analyzed files is noted, not modeled.
-- Dropped columns are removed from the model; already-applied rows keep paying their
-  natts/null-bitmap residue.
+- Migration files are version-ordered per directory. Flyway orders all configured locations
+  globally by version; if two directories share one version sequence, merge them (or lint them
+  together) so the fold order matches.
+- Temporary tables are skipped with a note (session-lived, no storage debt).
 - Known sqlparser gaps (`integer ARRAY` keyword form, `LIKE … INCLUDING`) are skipped
   per-statement with a note; `CREATE UNLOGGED TABLE` is handled by keyword strip. The `pg-exact`
   backend (`--parser pg-exact`) parses all of these natively.

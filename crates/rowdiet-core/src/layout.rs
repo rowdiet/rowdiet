@@ -115,7 +115,13 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
 /// Per-row on-disk footprint for a table of only fixed-width columns, no-NULL scenario:
 /// MAXALIGN(t_hoff) + data, MAXALIGN-rounded as the page placement does (bufpage.c).
 pub fn footprint(scenario_end_all_fixed: u64) -> u64 {
-    maxalign(maxalign(TUPLE_HEADER) + scenario_end_all_fixed)
+    footprint_at(maxalign(TUPLE_HEADER), scenario_end_all_fixed)
+}
+
+/// Footprint with an explicit data-start offset — used when dropped columns force a null
+/// bitmap into every new row (`t_hoff = null_thoff(original natts)`).
+pub fn footprint_at(t_hoff: u64, scenario_end_all_fixed: u64) -> u64 {
+    maxalign(t_hoff + scenario_end_all_fixed)
 }
 
 pub fn rows_per_page(footprint: u64) -> u64 {
@@ -128,6 +134,10 @@ pub fn no_null_thoff() -> u64 {
 
 /// t_hoff for rows that DO contain a NULL: header + one bitmap bit per table column.
 /// Order-invariant — display information only, never reorder advice.
+pub fn bare_thoff() -> u64 {
+    maxalign(TUPLE_HEADER)
+}
+
 pub fn null_thoff(natts: usize) -> u64 {
     maxalign(TUPLE_HEADER + (natts as u64).div_ceil(8))
 }

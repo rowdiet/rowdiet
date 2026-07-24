@@ -60,10 +60,11 @@ the fixed columns alone" — is deliberately absent: it only describes the *clus
 while in an interleaved table a fixed column's real offset rides on the preceding varlena's
 actual length, so presenting that number as guaranteed for the as-written order would overclaim.
 
-Null bitmap: present per-row only when the row has a NULL, sized by table natts
-(`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it is display information only
-(`layout::null_thoff`), never part of reorder advice. The scenario (all non-NULL) uses
-`t_hoff = 24`.
+Null bitmap: present per-row when the row has a NULL, sized by table natts
+(`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it never changes reorder
+advice. The scenario (all non-NULL) uses `t_hoff = 24` — except after `DROP COLUMN`, where the
+bitmap is unconditionally present in new rows (dropped attributes are stored as NULL forever),
+so the scenario uses `t_hoff = null_thoff(original natts)`; see Folding semantics.
 
 ## Suggested order
 
@@ -109,9 +110,14 @@ exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definit
   (search_path resolution is out of scope; collisions across schemas are accepted and
   deterministic).
 - `ADD COLUMN` appends — physically true in Postgres. `SET DATA TYPE` edits in place (a type
-  change rewrites the table but keeps attnum order). `DROP COLUMN` removes from the model with a
-  note that applied rows keep the natts/bitmap residue. Renames tracked; `DROP TABLE` removes;
-  redefinition replaces with a note; `IF NOT EXISTS` duplicates are silent no-ops.
+  change rewrites the table but keeps attnum order). `DROP COLUMN` removes the column from the
+  walk but keeps a dropped-slot count: Postgres retains dropped attributes (attisdropped) and
+  stores a NULL for each in every subsequent row, so the exact-tier footprint uses
+  `t_hoff = null_thoff(original natts)` once anything was dropped (pageinspect-verified:
+  10 int4 columns minus one = 72 B/row, 107 rows/page, not 64/120). Partition children inherit
+  the parent's dropped slots. Renames tracked (renaming onto an existing table is noted, never
+  silent); `DROP TABLE` removes; redefinition replaces with a note; `IF NOT EXISTS` duplicates
+  are silent no-ops.
 - `ADD PRIMARY KEY` (table-level or ALTER) forces NOT NULL on its columns; identity columns are
   implicitly NOT NULL; serial types likewise.
 - CTAS (`CREATE TABLE … AS SELECT`) and `LIKE` clauses cannot be resolved statically → note +
@@ -151,15 +157,23 @@ about everything new. Design points, in the order they were decided:
   demand a full-table rewrite of an applied table, the very cost this tool exists to avoid; so
   the allowance stays in force and only the appended waste can fail the gate, as
   `grown since baseline` — actionable while the appending migration is still unapplied. All
-  non-prefix changes imply a rewriting migration was taken anyway; they expire the entry
-  (`modified since baseline`) and force a deliberate re-accept.
+  non-prefix changes expire the entry (`modified since baseline`) and force a deliberate
+  re-accept. (Not every such change paid for a rewrite — `DROP COLUMN` and binary-coercible
+  type changes are metadata-only in Postgres — but each is a conscious layout edit, and
+  re-accepting is a one-line reviewed diff, so the expiry stays.)
 - **Improvements never auto-tighten.** A table now beating its allowance is reported as a
   ratchet opportunity; recording the better number is an explicit maintenance act —
   `--update-baseline` rewrites the whole file from the current analysis, `--accept <table>`
   refreshes exactly one entry (the reviewable one-line diff for accepting one table's growth,
   and the same mechanism prunes an entry once its table comes clean).
 
-Verdicts per non-ignored table: `pass`, `new_violation` (no entry, over fail-over),
+The gate also carries degradation: counts of skipped statements and incomplete tables ride in
+the outcome (a bytes-only gate would stay green over an unparseable migration set), and
+`fail_on_degraded` turns them into a failure — off by default so sqlparser users are not
+punished for known parser gaps, cheap to enable under pg-exact where skips should be zero.
+Reports and baselines key on the fold key (lowercased unless quoted), which is identical across
+parser backends; the as-written spelling is carried separately as `display`. Verdicts per
+non-ignored table: `pass`, `new_violation` (no entry, over fail-over),
 `regression` (over its allowance), `grown_since_baseline`, `modified_since_baseline`,
 `ratchet_opportunity`; entries with no matching table are listed as `orphaned`, expired-but-
 passing ones as `expired`. Ignored tables stay outside both gate and baseline.

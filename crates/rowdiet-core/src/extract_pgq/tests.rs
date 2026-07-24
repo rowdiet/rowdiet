@@ -236,6 +236,7 @@ fn ctas_and_partition_children() {
     match one("CREATE TABLE events_2026 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')") {
         DdlOp::CreateTable {
             incomplete_columns,
+            temporary: false,
             partition_of,
             ..
         } => {
@@ -247,6 +248,7 @@ fn ctas_and_partition_children() {
     match one("CREATE TABLE kid () INHERITS (folks)") {
         DdlOp::CreateTable {
             incomplete_columns,
+            temporary: false,
             partition_of,
             ..
         } => {

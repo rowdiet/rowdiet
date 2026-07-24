@@ -238,3 +238,56 @@ fn github_step_summary_file_is_appended() {
     assert!(content.contains("| account |"), "{content}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn baseline_is_portable_across_parser_backends() {
+    // Reports key on the fold key, not the backend-dependent display spelling, so a baseline
+    // written under one parser gates cleanly under the other (a confirmed pre-fix failure).
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-portable-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sql = dir.join("V1__m.sql");
+    std::fs::write(
+        &sql,
+        "CREATE TABLE MyTable (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);",
+    )
+    .unwrap();
+    let file = dir.join("b.json");
+    let wrote = bin()
+        .arg(&dir)
+        .args(["--fail-over", "0", "--update-baseline", "--baseline"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(wrote.status.code(), Some(0));
+    assert!(std::fs::read_to_string(&file).unwrap().contains("\"mytable\""));
+    let gated = bin()
+        .arg(&dir)
+        .args(["--parser", "pg-exact", "--baseline"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(
+        gated.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&gated.stdout)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fail_on_degraded_gates_skips() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-degraded-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("V1__b.sql"), "CREATE TABLE broken (a @@@ int);").unwrap();
+    let lenient = bin().arg(&dir).args(["--fail-over", "0"]).output().unwrap();
+    assert_eq!(lenient.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&lenient.stdout).contains("degraded:"));
+    let strict = bin()
+        .arg(&dir)
+        .args(["--fail-over", "0", "--fail-on-degraded"])
+        .output()
+        .unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -66,7 +66,12 @@ pub fn split(sql: &str) -> Vec<RawStatement> {
                             line += 1;
                             i += 1;
                         }
-                        b'\\' if estring => i += 2,
+                        b'\\' if estring => {
+                            if b.get(i + 1) == Some(&b'\n') {
+                                line += 1;
+                            }
+                            i += 2;
+                        }
                         b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
                         b'\'' => {
                             i += 1;
@@ -221,3 +226,122 @@ fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests;
+
+/// 1-based lines of every occurrence of `marker` that sits inside a comment of `text` —
+/// line (`--`) or block (`/* */`, nested). String literals, dollar-quoted bodies, and quoted
+/// identifiers are skipped, so a marker in data can never count. The ignore-marker semantics
+/// are built on this: a marker is honored only where a human wrote it as commentary.
+pub(crate) fn comment_marker_lines(text: &str, marker: &str) -> Vec<u32> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut line = 1u32;
+    let count_span = |span: &str, at_line: u32, out: &mut Vec<u32>| {
+        let mut rel_line = 0u32;
+        let mut rest = span;
+        while let Some(pos) = rest.find(marker) {
+            rel_line += rest[..pos].matches('\n').count() as u32;
+            out.push(at_line + rel_line);
+            rest = &rest[pos + marker.len()..];
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                count_span(&text[start..i], line, &mut out);
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let start = i;
+                let start_line = line;
+                let mut depth = 1u32;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'/' if b.get(i + 1) == Some(&b'*') => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        b'*' if b.get(i + 1) == Some(&b'/') => {
+                            depth -= 1;
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                count_span(&text[start..i.min(text.len())], start_line, &mut out);
+            }
+            b'\'' => {
+                let estring = i > 0 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !is_ident_byte(b[i - 2]));
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'\\' if estring => {
+                            if b.get(i + 1) == Some(&b'\n') {
+                                line += 1;
+                            }
+                            i += 2;
+                        }
+                        b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\n' => {
+                            line += 1;
+                            i += 1;
+                        }
+                        b'"' if b.get(i + 1) == Some(&b'"') => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'$' => match dollar_tag_end(b, i) {
+                Some(tag_end) => {
+                    let tag = &b[i..tag_end];
+                    i = tag_end;
+                    while i < b.len() {
+                        if b[i..].starts_with(tag) {
+                            i += tag.len();
+                            break;
+                        }
+                        if b[i] == b'\n' {
+                            line += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    out
+}

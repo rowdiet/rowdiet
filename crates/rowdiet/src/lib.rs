@@ -48,6 +48,9 @@ struct Cli {
     /// Accept one table's current state into the baseline, leaving other entries untouched; repeatable
     #[arg(long, value_name = "TABLE", requires = "baseline")]
     accept: Vec<String>,
+    /// Also exit 1 when statements were skipped or tables are incomplete (degraded analysis)
+    #[arg(long)]
+    fail_on_degraded: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -96,7 +99,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         Some(path) => Some(load_baseline(path)?),
         None => None,
     };
-    let gate = baseline::evaluate(&analysis, cli.fail_over, loaded.as_ref());
+    let gate = baseline::evaluate(&analysis, cli.fail_over, cli.fail_on_degraded, loaded.as_ref());
     let shown_fail_over = cli.fail_over.or(loaded.as_ref().map(|b| b.fail_over));
     let output = match cli.format {
         Format::Text => render::text(&analysis, cli.rows, cli.suggest, &gate),

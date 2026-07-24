@@ -44,24 +44,24 @@ fn layout_signatures_emitted() {
 
 #[test]
 fn no_gate_without_fail_over_or_baseline() {
-    let outcome = evaluate(&analysis(WASTEFUL), None, None);
+    let outcome = evaluate(&analysis(WASTEFUL), None, false, None);
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
 }
 
 #[test]
 fn fail_over_alone_flags_new_violation() {
-    let outcome = evaluate(&analysis(WASTEFUL), Some(0), None);
+    let outcome = evaluate(&analysis(WASTEFUL), Some(0), false, None);
     assert!(outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::NewViolation { avoidable: 8 });
-    let lenient = evaluate(&analysis(WASTEFUL), Some(8), None);
+    let lenient = evaluate(&analysis(WASTEFUL), Some(8), false, None);
     assert!(!lenient.exceeded);
 }
 
 #[test]
 fn baselined_table_passes_at_its_allowance() {
     let base = baseline(0, &[("t", 8, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, Some(&base));
+    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
     assert!(outcome.orphaned.is_empty());
@@ -71,7 +71,7 @@ fn baselined_table_passes_at_its_allowance() {
 #[test]
 fn tightened_allowance_flags_regression() {
     let base = baseline(0, &[("t", 4, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, Some(&base));
+    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
@@ -85,7 +85,7 @@ fn tightened_allowance_flags_regression() {
 #[test]
 fn improvement_is_a_ratchet_opportunity_not_auto_tightened() {
     let base = baseline(0, &[("t", 12, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, Some(&base));
+    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
@@ -105,7 +105,7 @@ fn appended_column_keeps_the_allowance_alive() {
     let a = analysis(grown);
     assert_eq!(a.tables[0].layout_signature, "f4i,f8d,f4i,f8d,f8d");
     let base = baseline(0, &[("t", 8, WASTEFUL_SIG)]);
-    let outcome = evaluate(&a, None, Some(&base));
+    let outcome = evaluate(&a, None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
     assert!(outcome.expired.is_empty());
@@ -119,7 +119,7 @@ fn wasteful_append_flags_grown_not_modified() {
         ALTER TABLE t ADD COLUMN g boolean NOT NULL;
         ALTER TABLE t ADD COLUMN h bigint NOT NULL;";
     let base = baseline(0, &[("t", 8, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(grown), None, Some(&base));
+    let outcome = evaluate(&analysis(grown), None, false, Some(&base));
     assert!(outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
@@ -133,7 +133,7 @@ fn wasteful_append_flags_grown_not_modified() {
 #[test]
 fn non_append_change_expires_the_allowance() {
     let base = baseline(0, &[("t", 8, "f16c")]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, Some(&base));
+    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
@@ -146,7 +146,7 @@ fn non_append_change_expires_the_allowance() {
 fn reordered_to_clean_reports_expired_entry() {
     let reordered = "CREATE TABLE t (b bigint NOT NULL, d bigint NOT NULL, a int NOT NULL, c int NOT NULL);";
     let base = baseline(0, &[("t", 8, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(reordered), None, Some(&base));
+    let outcome = evaluate(&analysis(reordered), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
     assert_eq!(outcome.expired, vec!["t".to_string()]);
@@ -155,8 +155,8 @@ fn reordered_to_clean_reports_expired_entry() {
 #[test]
 fn explicit_fail_over_overrides_the_files() {
     let base = baseline(8, &[]);
-    assert!(!evaluate(&analysis(WASTEFUL), None, Some(&base)).exceeded);
-    let strict = evaluate(&analysis(WASTEFUL), Some(0), Some(&base));
+    assert!(!evaluate(&analysis(WASTEFUL), None, false, Some(&base)).exceeded);
+    let strict = evaluate(&analysis(WASTEFUL), Some(0), false, Some(&base));
     assert!(strict.exceeded);
     assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 8 });
 }
@@ -165,7 +165,7 @@ fn explicit_fail_over_overrides_the_files() {
 fn orphaned_entries_reported_not_failed() {
     let base = baseline(0, &[("ghost", 4, "f4i")]);
     let sql = "CREATE TABLE t (b bigint NOT NULL, a int NOT NULL, c int NOT NULL);";
-    let outcome = evaluate(&analysis(sql), None, Some(&base));
+    let outcome = evaluate(&analysis(sql), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.orphaned, vec!["ghost".to_string()]);
 }
@@ -175,7 +175,7 @@ fn ignored_tables_stay_outside_gate_and_baseline() {
     let sql = "CREATE TABLE ig ( -- rowdiet:ignore
         a int NOT NULL, b bigint NOT NULL);";
     let base = baseline(0, &[("ig", 0, "f4i,f8d")]);
-    let outcome = evaluate(&analysis(sql), None, Some(&base));
+    let outcome = evaluate(&analysis(sql), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert!(!outcome.verdicts.contains_key("ig"));
     assert_eq!(outcome.orphaned, vec!["ig".to_string()]);

@@ -17,9 +17,10 @@
 //! (the parser may grow memory); wrap export calls in try/catch for the shim's `WASIProcExit`.
 //!
 //! Input JSON: `{"sources": [{"name": "...", "sql": "..."}], "assume": ["vector=varlena:d"],
-//! "fail_over": 0, "baseline": {"fail_over": 0, "tables": {"t": {"bytes": 8, "layout":
-//! "f4i,f8d"}}}}` (`assume`/`fail_over`/`baseline` optional; an explicit `fail_over` overrides
-//! the baseline's recorded one). Output JSON mirrors the CLI's `--format json` envelope — the
+//! "fail_over": 0, "fail_on_degraded": false, "baseline": {"fail_over": 0, "tables": {"t":
+//! {"bytes": 8, "layout": "f4i,f8d"}}}}` (`assume`/`fail_over`/`fail_on_degraded`/`baseline`
+//! optional; an explicit `fail_over` overrides the baseline's recorded one; `fail_on_degraded`
+//! also fails the gate when statements were skipped or tables are incomplete). Output JSON mirrors the CLI's `--format json` envelope — the
 //! gate outcome under `"gate"` (per-table verdicts, orphaned/expired entries) plus the
 //! `"gate_exceeded"` shorthand — with an extra `"parser"` field; errors come back as
 //! `{"error": "..."}`.
@@ -36,6 +37,8 @@ struct Input {
     fail_over: Option<u64>,
     #[serde(default)]
     baseline: Option<Baseline>,
+    #[serde(default)]
+    fail_on_degraded: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -67,7 +70,12 @@ fn lint(input: &str) -> Result<String, String> {
         })
         .collect();
     let analysis = analyze_sources_with(backend(), &sources, &config);
-    let gate = baseline::evaluate(&analysis, input.fail_over, input.baseline.as_ref());
+    let gate = baseline::evaluate(
+        &analysis,
+        input.fail_over,
+        input.fail_on_degraded,
+        input.baseline.as_ref(),
+    );
     let shown_fail_over = input.fail_over.or(input.baseline.as_ref().map(|b| b.fail_over));
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),

@@ -51,6 +51,13 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
             TableVerdict::Pass => {}
         }
     }
+    if gate.skipped_statements > 0 || gate.incomplete_tables > 0 {
+        let _ = writeln!(
+            out,
+            "degraded: {} statement(s) skipped, {} table(s) incomplete — pass --fail-on-degraded to gate on this",
+            gate.skipped_statements, gate.incomplete_tables
+        );
+    }
     if gate.exceeded {
         let mut parts = Vec::new();
         if new_violations > 0 {
@@ -64,6 +71,9 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         }
         if modified > 0 {
             parts.push(format!("{modified} modified since baseline"));
+        }
+        if parts.is_empty() {
+            parts.push("degraded analysis (--fail-on-degraded)".to_string());
         }
         let _ = writeln!(out, "FAIL: {}", parts.join(", "));
     }
@@ -92,13 +102,13 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
 fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, verdict: Option<TableVerdict>) {
     let loc = format!("{}:{}", t.origin.source, t.origin.line);
     if t.ignored {
-        let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.name);
+        let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.display);
         return;
     }
     // An empty modeled column set (partition child / LIKE / typed table) passes the gate
     // vacuously — report it as not analyzable rather than as "optimal [exact]".
     if t.natts == 0 {
-        let _ = writeln!(out, "◌ {} ({loc}) — no modeled columns — not analyzable", t.name);
+        let _ = writeln!(out, "◌ {} ({loc}) — no modeled columns — not analyzable", t.display);
         render_flags(out, t);
         return;
     }
@@ -108,7 +118,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
             (Tier::Exact, p) => format!("{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain"),
             (Tier::Estimate, p) => format!("{p} B scenario padding, none avoidable by reordering"),
         };
-        let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.name, tier_label(t.tier));
+        let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.display, tier_label(t.tier));
         render_flags(out, t);
         render_verdict(out, t, verdict);
         return;
@@ -116,7 +126,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     let _ = writeln!(
         out,
         "■ {} ({loc}) — {} columns — {}",
-        t.name,
+        t.display,
         t.natts,
         tier_label(t.tier)
     );
@@ -201,7 +211,7 @@ fn render_suggestion(out: &mut String, t: &TableReport) {
         out,
         "  -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):"
     );
-    let _ = writeln!(out, "  CREATE TABLE {} (", t.name);
+    let _ = writeln!(out, "  CREATE TABLE {} (", t.display);
     let by_name: BTreeMap<&str, &ColumnReport> = t.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let last = t.suggested_order.len().saturating_sub(1);
     for (i, name) in t.suggested_order.iter().enumerate() {
@@ -247,6 +257,8 @@ fn kind_label(kind: NoteKind) -> &'static str {
         NoteKind::DuplicateColumn => "duplicate-column",
         NoteKind::UnknownColumn => "unknown-column",
         NoteKind::DoBlockDdl => "do-block",
+        NoteKind::UnusedIgnoreMarker => "unused-ignore",
+        NoteKind::TempTableSkipped => "temp-table",
     }
 }
 
@@ -426,7 +438,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         let _ = writeln!(
             out,
             "| {} | {} | {tier} | {verdict} | {}:{} |",
-            markdown_cell(&t.name),
+            markdown_cell(&t.display),
             t.avoidable_bytes_per_row,
             markdown_cell(&t.origin.source),
             t.origin.line

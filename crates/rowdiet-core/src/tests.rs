@@ -307,6 +307,7 @@ mod differential {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                temporary,
                 partition_of,
             } => DdlOp::CreateTable {
                 name: norm_name(name),
@@ -315,6 +316,7 @@ mod differential {
                 if_not_exists,
                 is_ctas,
                 incomplete_columns,
+                temporary,
                 partition_of: partition_of.map(norm_name),
             },
             DdlOp::AddColumn {
@@ -661,5 +663,273 @@ mod format_identity_property {
         fn substitute_format_is_identity_without_percent(template in "[^%]{0,24}") {
             prop_assert_eq!(substitute_format(&template, "tok"), template);
         }
+    }
+}
+
+#[cfg(feature = "pg-exact")]
+mod pgq_partition_options {
+    use crate::{ParserBackend, SqlSource, analyze_sources_with};
+
+    #[test]
+    fn with_options_children_gain_no_phantom_columns() {
+        // `(col WITH OPTIONS ...)` arrives from the raw tree as a type-less ColumnDef; it
+        // must not become a column of type "unknown" (a confirmed pre-fix gate failure on
+        // valid PG DDL).
+        let sql = "CREATE TABLE p (flag boolean NOT NULL, id bigint NOT NULL) PARTITION BY RANGE (id);\n\
+                   CREATE TABLE c PARTITION OF p (id WITH OPTIONS NOT NULL) FOR VALUES FROM (1) TO (2);";
+        let analysis = analyze_sources_with(
+            ParserBackend::PgExact,
+            &[SqlSource {
+                name: "V1__p.sql".into(),
+                sql: sql.into(),
+            }],
+            &crate::Config::default(),
+        );
+        assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+        let child = analysis.tables.iter().find(|t| t.name == "c").unwrap();
+        let parent = analysis.tables.iter().find(|t| t.name == "p").unwrap();
+        assert_eq!(child.natts, parent.natts, "{child:#?}");
+        assert_eq!(child.tier, parent.tier);
+        assert!(child.assumed_types.is_empty());
+        assert_eq!(child.avoidable_bytes_per_row, parent.avoidable_bytes_per_row);
+    }
+}
+
+/// Regression pins for the hostile-audit batch (each reproduced pre-fix by the refute pass).
+mod audit_fixes {
+    use super::src;
+    use crate::{Config, NoteKind, analyze_sources};
+
+    #[test]
+    fn marker_in_string_literal_does_not_exempt() {
+        let sql = "CREATE TABLE t (a boolean NOT NULL, b bigint NOT NULL, note text DEFAULT 'rowdiet:ignore');";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        assert!(!analysis.tables[0].ignored);
+    }
+
+    #[test]
+    fn marker_above_statement_gets_a_note() {
+        let sql = "-- rowdiet:ignore\nCREATE TABLE t (a boolean NOT NULL, b bigint NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        assert!(!analysis.tables[0].ignored);
+        let note = analysis
+            .notes
+            .iter()
+            .find(|n| n.kind == NoteKind::UnusedIgnoreMarker)
+            .expect("stranded marker note");
+        assert_eq!(note.origin.line, 1);
+    }
+
+    #[test]
+    fn attached_marker_still_works_and_produces_no_stranded_note() {
+        let sql = "CREATE TABLE t ( -- rowdiet:ignore\n a boolean, b bigint);";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        assert!(analysis.tables[0].ignored);
+        assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    }
+
+    #[test]
+    fn rename_onto_existing_table_is_loud() {
+        let sql = "CREATE TABLE a (x boolean NOT NULL, y bigint NOT NULL);
+            CREATE TABLE b (z int NOT NULL);
+            ALTER TABLE a RENAME TO b;";
+        let analysis = analyze_sources(&[src("V1__r.sql", sql)], &Config::default());
+        assert_eq!(analysis.tables.len(), 1);
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Redefined && n.detail.contains("rename")),
+            "{:?}",
+            analysis.notes
+        );
+    }
+
+    #[test]
+    fn temporary_tables_are_skipped_with_a_note() {
+        let sql = "CREATE TEMPORARY TABLE scratch (a boolean NOT NULL, b bigint NOT NULL);
+            CREATE TABLE keep (a bigint NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        assert_eq!(analysis.tables.len(), 1);
+        assert_eq!(analysis.tables[0].name, "keep");
+        assert!(
+            analysis.notes.iter().any(|n| n.kind == NoteKind::TempTableSkipped),
+            "{:?}",
+            analysis.notes
+        );
+    }
+
+    #[test]
+    fn suggested_stats_match_the_suggested_order() {
+        // Rung-not-crossed fixture: nothing avoidable, so both the order AND the stats must
+        // describe the current layout (previously suggested.padding said 0 beside the original
+        // order whose padding is 7).
+        let sql = "CREATE TABLE t (flag boolean NOT NULL, a bigint NOT NULL, b timestamptz NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0);
+        assert_eq!(t.suggested, t.current);
+    }
+
+    #[test]
+    fn assume_type_length_bounds_are_enforced() {
+        use crate::catalog::parse_assume_spec;
+        assert!(parse_assume_spec("huge=fixed:18446744073709551615:d").is_err());
+        assert!(parse_assume_spec("zero=fixed:0:c").is_err());
+        assert!(parse_assume_spec("name=fixed:64:c").is_ok());
+        assert!(parse_assume_spec("big=fixed:32767:d").is_ok());
+    }
+
+    #[test]
+    fn skipped_qualified_quoted_target_still_flags_the_table() {
+        // sqlparser cannot parse LIKE ... INCLUDING; the sniffer must still resolve the
+        // schema-qualified quoted name instead of collapsing it to an empty string.
+        let sql = r#"CREATE TABLE "My Table" (a bigint NOT NULL);
+            ALTER TABLE myschema."My Table" ADD COLUMN broken_seq int, ADD woops;"#;
+        let analysis = analyze_sources(&[src("V1__q.sql", sql)], &Config::default());
+        let note = &analysis.notes[0];
+        assert_eq!(note.kind, NoteKind::SkippedStatement);
+        assert!(note.detail.contains("My Table"), "{}", note.detail);
+        assert!(analysis.tables[0].incomplete, "{:#?}", analysis.tables);
+    }
+
+    #[test]
+    fn dynamic_concrete_create_and_drop_get_targeted_notes() {
+        let sql = "CREATE TABLE t (a bigint NOT NULL);
+            DO $$ BEGIN EXECUTE format('CREATE TABLE audit_log (id %s)', ty); END $$;
+            DO $$ BEGIN EXECUTE 'DROP TABLE t'; END $$;";
+        let analysis = analyze_sources(&[src("V1__d.sql", sql)], &Config::default());
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::DoBlockDdl && n.detail.contains("audit_log")),
+            "{:?}",
+            analysis.notes
+        );
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::DoBlockDdl && n.detail.contains("DROP TABLE")),
+            "{:?}",
+            analysis.notes
+        );
+        assert!(
+            !analysis
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("not statically analyzable")),
+            "{:?}",
+            analysis.notes
+        );
+    }
+
+    #[test]
+    fn hostile_do_body_is_capped_not_quadratic() {
+        let body: String = (0..500).map(|i| format!("x{i} create ")).collect();
+        let sql = format!("CREATE TABLE t (a bigint NOT NULL);\nDO $$ BEGIN {body}; END $$;");
+        let started = std::time::Instant::now();
+        let analysis = analyze_sources(&[src("V1__h.sql", &sql)], &Config::default());
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert!(
+            analysis
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("not statically analyzable")),
+            "{:?}",
+            analysis.notes
+        );
+    }
+}
+
+mod audit_fixes_model {
+    use super::src;
+    use crate::{Config, analyze_sources};
+
+    #[test]
+    fn dropped_columns_keep_the_original_width_bitmap() {
+        // Verified against live PostgreSQL 17 pageinspect: 10 int4 columns, one dropped —
+        // new rows carry t_hoff 32 (23 + 2-byte bitmap for natts=10, MAXALIGNed), so the
+        // footprint is 72 and 107 rows fit a page, not the naive 64/120.
+        let sql = "CREATE TABLE w (c1 int NOT NULL, c2 int NOT NULL, c3 int NOT NULL, c4 int NOT NULL, c5 int NOT NULL, c6 int NOT NULL, c7 int NOT NULL, c8 int NOT NULL, c9 int NOT NULL, c10 int NOT NULL);
+            ALTER TABLE w DROP COLUMN c5;";
+        let analysis = analyze_sources(&[src("V1__w.sql", sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.natts, 9);
+        assert_eq!(t.dropped_columns, 1);
+        assert_eq!(t.current.footprint, Some(72));
+        assert_eq!(t.current.rows_per_page, Some(107));
+        assert_eq!(t.avoidable_bytes_per_row, 0);
+    }
+
+    #[test]
+    fn undropped_table_keeps_the_bare_header() {
+        let sql = "CREATE TABLE w (c1 int NOT NULL, c2 int NOT NULL, c3 int NOT NULL, c4 int NOT NULL, c5 int NOT NULL, c6 int NOT NULL, c7 int NOT NULL, c8 int NOT NULL, c9 int NOT NULL, c10 int NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__w.sql", sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.dropped_columns, 0);
+        assert_eq!(t.current.footprint, Some(64));
+        assert_eq!(t.current.rows_per_page, Some(120));
+    }
+
+    #[test]
+    fn drop_shift_does_not_change_avoidable() {
+        // The bitmap shift applies to current and suggested equally; the reorder delta must
+        // survive a drop untouched.
+        let sql = "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL, e int NOT NULL, f int NOT NULL, g int NOT NULL, h int NOT NULL, i int NOT NULL);
+            ALTER TABLE m DROP COLUMN e;";
+        let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.dropped_columns, 1);
+        assert_eq!(t.avoidable_bytes_per_row, 8);
+    }
+
+    #[test]
+    fn partition_children_inherit_the_dropped_slots() {
+        let sql = "CREATE TABLE p (a int NOT NULL, b bigint NOT NULL, junk int NOT NULL) PARTITION BY RANGE (b);
+            ALTER TABLE p DROP COLUMN junk;
+            CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
+        let analysis = analyze_sources(&[src("V1__p.sql", sql)], &Config::default());
+        let child = analysis.tables.iter().find(|t| t.name == "c").unwrap();
+        assert_eq!(child.dropped_columns, 1);
+        assert_eq!(child.current.footprint, analysis.tables[0].current.footprint);
+    }
+}
+
+mod audit_fixes_gate {
+    use super::src;
+    use crate::{Config, analyze_sources, baseline};
+
+    #[test]
+    fn degradation_is_surfaced_and_optionally_gating() {
+        let sql = "CREATE TABLE ok (a bigint NOT NULL);\nALTER TABLE ok ADD COLUMN x @@@ bad;";
+        let analysis = analyze_sources(&[src("V1__b.sql", sql)], &Config::default());
+        let lenient = baseline::evaluate(&analysis, Some(0), false, None);
+        assert!(lenient.skipped_statements > 0);
+        assert!(lenient.incomplete_tables > 0);
+        assert!(!lenient.exceeded, "{lenient:#?}");
+        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        assert!(strict.exceeded);
+    }
+}
+
+#[cfg(feature = "pg-exact")]
+mod keying_portability {
+    use crate::{Config, ParserBackend, SqlSource, analyze_sources_with};
+
+    #[test]
+    fn mixed_case_names_key_identically_across_backends() {
+        let sql = "CREATE TABLE MyTable (flag boolean NOT NULL, id bigint NOT NULL);";
+        let src = SqlSource {
+            name: "V1__m.sql".into(),
+            sql: sql.into(),
+        };
+        let a = analyze_sources_with(ParserBackend::Sqlparser, std::slice::from_ref(&src), &Config::default());
+        let b = analyze_sources_with(ParserBackend::PgExact, &[src], &Config::default());
+        assert_eq!(a.tables[0].name, "mytable");
+        assert_eq!(b.tables[0].name, "mytable");
+        assert_eq!(a.tables[0].display, "MyTable");
+        assert_eq!(a.tables[0].layout_signature, b.tables[0].layout_signature);
     }
 }

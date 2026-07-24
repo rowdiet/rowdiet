@@ -77,16 +77,31 @@ pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
 pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], config: &Config) -> Analysis {
     let mut folder = fold::Folder::new(config.assume.clone());
     for source in sources {
+        // The marker only counts inside comments — a string literal like
+        // DEFAULT 'rowdiet:ignore' must never exempt a table. Markers written in the file but
+        // attached to no statement (e.g. on their own line above a CREATE, which the splitter
+        // consumes as a leading comment) would otherwise vanish silently; they get a note.
+        let mut stranded: Vec<u32> = split::comment_marker_lines(&source.sql, IGNORE_MARKER);
         for raw in split::split(&source.sql) {
             let origin = Origin {
                 source: source.name.clone(),
                 line: raw.line,
             };
-            let ignore_marker = raw.text.contains(IGNORE_MARKER);
+            let attached = split::comment_marker_lines(&raw.text, IGNORE_MARKER);
+            for rel in &attached {
+                let abs = raw.line + rel - 1;
+                if let Some(pos) = stranded.iter().position(|&l| l == abs) {
+                    stranded.remove(pos);
+                }
+            }
+            let ignore_marker = !attached.is_empty();
             if is_do_statement(&raw.text) {
                 // The marker waives the body scan entirely — for DO blocks whose dynamic DDL a
-                // human has judged irrelevant to layout (e.g. partition-creation loops).
-                if !ignore_marker {
+                // human has judged irrelevant to layout (e.g. partition-creation loops). Inside
+                // the dollar-quoted body the marker is a plpgsql comment, scanned separately.
+                let body_marker = split::dollar_quoted_body(&raw.text)
+                    .is_some_and(|body| !split::comment_marker_lines(body, IGNORE_MARKER).is_empty());
+                if !ignore_marker && !body_marker {
                     scan_do_block(backend, &mut folder, &raw.text, &origin);
                 }
                 continue;
@@ -95,6 +110,12 @@ pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], confi
                 Ok(ops) => folder.apply(ops, &origin, ignore_marker),
                 Err(error) => folder.skipped(&origin, error, extract::sniff(&raw.text)),
             }
+        }
+        for line in stranded {
+            folder.unused_ignore_marker(&Origin {
+                source: source.name.clone(),
+                line,
+            });
         }
     }
     let (tables, notes) = folder.finish();
@@ -175,10 +196,19 @@ const DYNAMIC_TOKEN: &str = "rowdiet_dyn";
 /// parse that (`%I`/`%s` need an identifier in name positions but a number in value positions —
 /// e.g. hash-partition `REMAINDER %s` — so both substitutions are tried).
 fn scan_fragment(backend: ParserBackend, fragment: &str) -> FragmentOutcome {
+    // Each anchor costs a full parse of the fragment tail, so unbounded retries are quadratic
+    // in keyword count — a hostile 8k-keyword body took 45 s. Real plpgsql fragments carry a
+    // handful of DDL keywords; past the cap the fragment is reported not analyzable (loud).
+    const MAX_PARSE_ATTEMPTS: u32 = 32;
+    let mut attempts = 0u32;
     let mut from = 0usize;
     let mut saw_ddl_keyword = false;
     while let Some(relative) = find_ddl_keyword(&fragment[from..]) {
         saw_ddl_keyword = true;
+        if attempts >= MAX_PARSE_ATTEMPTS {
+            return FragmentOutcome::Unanalyzable;
+        }
+        attempts += 1;
         let start = from + relative;
         if let Ok(ops) = extract_with(backend, &fragment[start..]) {
             return FragmentOutcome::Ops(ops);
@@ -298,6 +328,18 @@ fn dispatch_dynamic_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &O
             partition_of: Some(parent),
             ..
         } if concrete(parent) => folder.has_table(&parent.key),
+        DdlOp::CreateTable {
+            name,
+            partition_of: None,
+            ..
+        } if concrete(name) => {
+            dispatch_do_op(folder, op, origin);
+            true
+        }
+        DdlOp::DropTables { names, .. } if names.iter().all(concrete) => {
+            dispatch_do_op(folder, op, origin);
+            true
+        }
         DdlOp::AddColumn { table, .. }
         | DdlOp::DropColumns { table, .. }
         | DdlOp::RenameColumn { table, .. }
