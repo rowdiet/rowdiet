@@ -238,6 +238,8 @@ mod differential {
     use crate::{Config, ParserBackend, SqlSource, analyze_sources_with, extract, extract_pgq};
 
     const CORPUS: &[&str] = &[
+        "CREATE TABLE s1.t1 (flag boolean NOT NULL, id bigint NOT NULL);",
+        "DROP TABLE s1.t1, s2.t2;",
         "CREATE TABLE account (active boolean NOT NULL, id bigint PRIMARY KEY, kind smallint NOT NULL, balance bigint NOT NULL)",
         "CREATE TABLE ints (a int, b integer, c int4, d int8, e bigint, f smallint, g real, h double precision, i float4, j float8)",
         "CREATE TABLE chars (a varchar(255), b character varying(31), c char(10), d char, e varchar, f text)",
@@ -784,7 +786,7 @@ mod audit_fixes {
     fn skipped_qualified_quoted_target_still_flags_the_table() {
         // sqlparser cannot parse LIKE ... INCLUDING; the sniffer must still resolve the
         // schema-qualified quoted name instead of collapsing it to an empty string.
-        let sql = r#"CREATE TABLE "My Table" (a bigint NOT NULL);
+        let sql = r#"CREATE TABLE myschema."My Table" (a bigint NOT NULL);
             ALTER TABLE myschema."My Table" ADD COLUMN broken_seq int, ADD woops;"#;
         let analysis = analyze_sources(&[src("V1__q.sql", sql)], &Config::default());
         let note = &analysis.notes[0];
@@ -931,5 +933,35 @@ mod keying_portability {
         assert_eq!(b.tables[0].name, "mytable");
         assert_eq!(a.tables[0].display, "MyTable");
         assert_eq!(a.tables[0].layout_signature, b.tables[0].layout_signature);
+    }
+}
+
+mod schema_qualification {
+    use super::src;
+    use crate::{Config, analyze_sources};
+
+    #[test]
+    fn same_named_tables_in_different_schemas_are_distinct() {
+        // The jvm-session reproducer: pre-fix these collided on the unqualified fold key and
+        // the first relation vanished with only a redefined note.
+        let sql = "CREATE SCHEMA a;\nCREATE SCHEMA b;\n\
+                   CREATE TABLE a.things (flag boolean NOT NULL, id bigint NOT NULL);\n\
+                   CREATE TABLE b.things (id bigint NOT NULL, flag boolean NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__s.sql", sql)], &Config::default());
+        assert_eq!(analysis.tables.len(), 2, "{:#?}", analysis.tables);
+        assert_eq!(analysis.tables[0].name, "a.things");
+        assert_eq!(analysis.tables[1].name, "b.things");
+        assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+        assert_ne!(analysis.tables[0].current.padding, analysis.tables[1].current.padding);
+    }
+
+    #[test]
+    fn qualified_alters_fold_onto_qualified_creates() {
+        let sql = "CREATE TABLE app.users (flag boolean NOT NULL, id bigint NOT NULL);\n\
+                   ALTER TABLE app.users ADD COLUMN n int NOT NULL;";
+        let analysis = analyze_sources(&[src("V1__q.sql", sql)], &Config::default());
+        assert_eq!(analysis.tables[0].name, "app.users");
+        assert_eq!(analysis.tables[0].natts, 3);
+        assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
     }
 }

@@ -130,7 +130,7 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
         } => match object_type {
             sq::ObjectType::Table => {
                 vec![DdlOp::DropTables {
-                    names: names.iter().map(raw_name).collect(),
+                    names: names.iter().map(table_name).collect(),
                     if_exists,
                 }]
             }
@@ -146,11 +146,11 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
 fn map_create_table(ct: sq::CreateTable) -> DdlOp {
     let is_ctas = ct.query.is_some() && ct.columns.is_empty();
     let incomplete_columns = ct.like.is_some() || ct.inherits.is_some();
-    let partition_of = ct.partition_of.as_ref().map(raw_name);
+    let partition_of = ct.partition_of.as_ref().map(table_name);
     let pk_columns = ct.constraints.iter().flat_map(pk_constraint_columns).collect();
     let columns = ct.columns.iter().map(map_column).collect();
     DdlOp::CreateTable {
-        name: raw_name(&ct.name),
+        name: table_name(&ct.name),
         columns,
         pk_columns,
         if_not_exists: ct.if_not_exists,
@@ -195,7 +195,7 @@ fn map_column(cd: &sq::ColumnDef) -> RawColumn {
 }
 
 fn map_alter_table(at: sq::AlterTable) -> Vec<DdlOp> {
-    let table = raw_name(&at.name);
+    let table = table_name(&at.name);
     at.operations
         .into_iter()
         .flat_map(|op| map_alter_op(&table, op))
@@ -237,10 +237,10 @@ fn map_alter_op(table: &RawName, op: sq::AlterTableOperation) -> Vec<DdlOp> {
                 new: ident_key(&new_column_name),
             }]
         }
-        sq::AlterTableOperation::RenameTable { table_name } => {
-            let new = match table_name {
-                sq::RenameTableNameKind::As(n) => raw_name(&n),
-                sq::RenameTableNameKind::To(n) => raw_name(&n),
+        sq::AlterTableOperation::RenameTable { table_name: renamed } => {
+            let new = match renamed {
+                sq::RenameTableNameKind::As(n) => table_name(&n),
+                sq::RenameTableNameKind::To(n) => table_name(&n),
             };
             vec![DdlOp::RenameTable {
                 table: table.clone(),
@@ -318,6 +318,8 @@ fn ident_key(id: &sq::Ident) -> String {
 
 /// Tables and types are keyed by their last name component (search_path resolution is out of
 /// scope); the full original spelling is kept for display.
+/// Type names: keyed by the last component (`pg_catalog.int4` resolves as `int4`; the type
+/// catalog is unqualified).
 fn raw_name(name: &sq::ObjectName) -> RawName {
     let key = name
         .0
@@ -325,6 +327,30 @@ fn raw_name(name: &sq::ObjectName) -> RawName {
         .and_then(|part| part.as_ident())
         .map(ident_key)
         .unwrap_or_else(|| name.to_string().to_lowercase());
+    RawName {
+        display: name.to_string(),
+        key,
+    }
+}
+
+/// Table names: qualification is part of the identity. Each part folds by its own quoting
+/// (`A.Things` → `a.things`, `a."Things"` → `a.Things`), so `a.things` and `b.things` are two
+/// relations, not a collision. Mixed qualified/unqualified references to the same relation are
+/// not resolved (search_path is out of scope) — qualify consistently.
+fn table_name(name: &sq::ObjectName) -> RawName {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|part| match part.as_ident() {
+            Some(ident) => ident_key(ident),
+            None => part.to_string().to_lowercase(),
+        })
+        .collect();
+    let key = if parts.is_empty() {
+        name.to_string().to_lowercase()
+    } else {
+        parts.join(".")
+    };
     RawName {
         display: name.to_string(),
         key,
@@ -499,10 +525,12 @@ pub fn sniff(text: &str) -> Option<Sniff> {
             it.next()?;
             tok = it.next()?;
         }
+        let mut key = sniff_key(tok);
         if !tok.1 && tok.0.ends_with('.') {
-            tok = it.next()?;
+            let quoted = it.next()?;
+            key.push_str(&quoted.0);
         }
-        return Some(Sniff::AlterTable(sniff_key(tok)));
+        return Some(Sniff::AlterTable(key));
     }
     if first.eq_ignore_ascii_case("create") {
         let mut tok = it.next()?;
@@ -521,12 +549,14 @@ pub fn sniff(text: &str) -> Option<Sniff> {
             it.next()?;
             name = it.next()?;
         }
+        let mut key = sniff_key(name);
         if !name.1 && name.0.ends_with('.') {
             // `schema."Quoted Name"` tokenizes as an unquoted `schema.` followed by the quoted
-            // identifier; the quoted token is the table name.
-            name = it.next()?;
+            // identifier; append the quoted part verbatim to the folded prefix.
+            let quoted = it.next()?;
+            key.push_str(&quoted.0);
         }
-        return Some(Sniff::CreateTable(sniff_key(name)));
+        return Some(Sniff::CreateTable(key));
     }
     None
 }
@@ -535,7 +565,8 @@ fn sniff_key((token, quoted): &(String, bool)) -> String {
     if *quoted {
         token.clone()
     } else {
-        token.rsplit('.').next().unwrap_or(token).to_lowercase()
+        // Qualification is part of the identity; fold the whole dotted path.
+        token.to_lowercase()
     }
 }
 

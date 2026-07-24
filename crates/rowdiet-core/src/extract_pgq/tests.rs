@@ -109,7 +109,7 @@ fn table_level_primary_key() {
 fn identifier_folding() {
     match one("CREATE TABLE \"my schema\".\"My Table\" (\"select\" int, UnQuoted int)") {
         DdlOp::CreateTable { name, columns, .. } => {
-            assert_eq!(name.key, "My Table");
+            assert_eq!(name.key, "my schema.My Table");
             assert_eq!(columns[0].key, "select");
             assert_eq!(columns[1].key, "unquoted");
         }
@@ -194,7 +194,10 @@ fn drops() {
     match one("DROP TABLE IF EXISTS a, s.b CASCADE") {
         DdlOp::DropTables { names, if_exists } => {
             assert!(if_exists);
-            assert_eq!(names.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+            assert_eq!(
+                names.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(),
+                vec!["a", "s.b"]
+            );
         }
         other => panic!("{other:?}"),
     }

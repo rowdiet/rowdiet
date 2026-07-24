@@ -48,7 +48,7 @@ fn map_statement(node: NodeEnum) -> Vec<DdlOp> {
         }
         NodeEnum::CompositeTypeStmt(ct) => match &ct.typevar {
             Some(rv) => vec![DdlOp::CreateComposite {
-                name: rangevar_name(rv),
+                name: type_rangevar_name(rv),
             }],
             None => vec![DdlOp::Irrelevant],
         },
@@ -375,7 +375,19 @@ fn render_display(parts: &[&str], typmods: &[pb::Node], dims: u8) -> String {
     format!("{}{}", with_mods, "[]".repeat(dims as usize))
 }
 
+/// Table identity keeps its qualification (the scanner already folded unquoted parts).
 fn rangevar_name(rv: &pb::RangeVar) -> RawName {
+    let (display, key) = if rv.schemaname.is_empty() {
+        (rv.relname.clone(), rv.relname.clone())
+    } else {
+        let joined = format!("{}.{}", rv.schemaname, rv.relname);
+        (joined.clone(), joined)
+    };
+    RawName { display, key }
+}
+
+/// Type names resolve unqualified in the catalog — last component only.
+fn type_rangevar_name(rv: &pb::RangeVar) -> RawName {
     let display = if rv.schemaname.is_empty() {
         rv.relname.clone()
     } else {
@@ -400,10 +412,13 @@ fn dropped_name(n: &pb::Node) -> Option<RawName> {
     match n.node.as_ref()? {
         NodeEnum::List(list) => {
             let parts: Vec<&str> = list.items.iter().filter_map(string_node_ref).collect();
-            let last = parts.last()?;
+            if parts.is_empty() {
+                return None;
+            }
+            let joined = parts.join(".");
             Some(RawName {
-                display: parts.join("."),
-                key: (*last).to_string(),
+                display: joined.clone(),
+                key: joined,
             })
         }
         NodeEnum::String(s) => Some(RawName {

@@ -107,13 +107,13 @@ fn table_level_primary_key() {
 fn quoted_and_qualified_table_names() {
     match one("CREATE TABLE \"my schema\".\"My Table\" (\"select\" int)") {
         DdlOp::CreateTable { name, columns, .. } => {
-            assert_eq!(name.key, "My Table");
+            assert_eq!(name.key, "my schema.My Table");
             assert_eq!(columns[0].key, "select");
         }
         other => panic!("{other:?}"),
     }
     match one("CREATE TABLE Foo.BAR (a int)") {
-        DdlOp::CreateTable { name, .. } => assert_eq!(name.key, "bar"),
+        DdlOp::CreateTable { name, .. } => assert_eq!(name.key, "foo.bar"),
         other => panic!("{other:?}"),
     }
 }
@@ -241,7 +241,7 @@ fn sniff_targets() {
     );
     assert_eq!(
         sniff("alter table ONLY my_schema.Big_Tab whatever"),
-        Some(Sniff::AlterTable("big_tab".into()))
+        Some(Sniff::AlterTable("my_schema.big_tab".into()))
     );
     assert_eq!(
         sniff("ALTER TABLE IF EXISTS x DROP y"),
@@ -253,7 +253,7 @@ fn sniff_targets() {
     );
     assert_eq!(
         sniff("CREATE TABLE IF NOT EXISTS s.t (x int)"),
-        Some(Sniff::CreateTable("t".into()))
+        Some(Sniff::CreateTable("s.t".into()))
     );
     assert_eq!(sniff("DO $$ x $$"), None);
     assert_eq!(sniff("CREATE INDEX i ON t (a)"), None);
