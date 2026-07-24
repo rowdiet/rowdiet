@@ -31,6 +31,7 @@ pub enum NoteKind {
     DoBlockDdl,
     UnusedIgnoreMarker,
     TempTableSkipped,
+    EmptyScan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,21 @@ pub struct Note {
     pub origin: Origin,
     pub kind: NoteKind,
     pub detail: String,
+}
+
+impl Note {
+    /// Path-level note for a scan that matched no SQL files. Line 0 means "no line to point
+    /// at" — renderers show the bare path.
+    pub fn empty_scan(path: &str) -> Note {
+        Note {
+            origin: Origin {
+                source: path.to_string(),
+                line: 0,
+            },
+            kind: NoteKind::EmptyScan,
+            detail: "no SQL files found under this path — nothing was analyzed".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

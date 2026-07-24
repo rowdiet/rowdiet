@@ -231,3 +231,14 @@ fn prefix_relation_respects_comma_boundaries() {
     assert!(matches!(relation("", "vi"), SignatureRelation::Different));
     assert!(matches!(relation("f8d,f4i", "f8d"), SignatureRelation::Different));
 }
+
+#[test]
+fn empty_scan_counts_as_degradation() {
+    let mut with_note = analysis("CREATE TABLE t (a bigint NOT NULL);");
+    with_note.notes.push(crate::fold::Note::empty_scan("migrations"));
+    let lenient = evaluate(&with_note, Some(0), false, None);
+    assert_eq!(lenient.empty_scans, 1);
+    assert!(!lenient.exceeded);
+    let strict = evaluate(&with_note, Some(0), true, None);
+    assert!(strict.exceeded);
+}

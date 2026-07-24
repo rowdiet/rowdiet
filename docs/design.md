@@ -186,7 +186,21 @@ passing ones as `expired`. Ignored tables stay outside both gate and baseline.
 `version.rs`: optional `V/U/B` prefix, digit segments separated by `_` or `.` (sub-versions like
 `V1718984460_1__` sort between their base and the next version), unversioned names (Flyway
 `R__` repeatables) after all versioned, lexicographic tiebreak. Directories are walked
-recursively; ordering applies per directory.
+recursively; ordering applies per directory. That per-directory scope is a deliberate
+divergence from Flyway, which orders by version *globally* across its locations: on a tree
+whose version numbers interleave across sibling subdirectories, rowdiet folds in a different
+order than Flyway applies. Timestamp-versioned and year-partitioned layouts are monotonic per
+directory, so they are unaffected.
+
+## Discovery policy
+
+The walk (shared verbatim by the CLI and the JVM adapters — the only policy both can honor
+identically, since Gradle's input fingerprinting cannot follow links) skips dot-prefixed
+entries and does not enter symlinked directories, so a link cycle cannot collect a file once
+per traversal depth; a symlinked `.sql` file is still collected and read through its link. An
+explicitly passed root is exempt from the dot filter. A scanned path that matches no SQL files
+produces an `empty_scan` note and counts as degradation under `fail_on_degraded` — a typo'd
+migrations path must not gate green forever having analyzed nothing.
 
 ## Parser decision
 

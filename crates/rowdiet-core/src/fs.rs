@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 mod tests;
 
 /// All `*.sql` files under `dir` (recursive), version-ordered within each directory.
+///
+/// Walk policy, kept identical across the CLI and the JVM adapters: dot-prefixed entries are
+/// skipped (the explicitly passed root is exempt — only entries found during the walk are
+/// filtered); symlinked directories are not entered, so a link cycle cannot duplicate files
+/// (a symlinked `*.sql` file is still collected and read through the link).
 pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
@@ -23,8 +28,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
+        if entry.file_name().as_encoded_bytes().first() == Some(&b'.') {
+            continue;
+        }
+        // file_type() does not follow symlinks, so is_dir() is false for a symlinked directory
+        // and the else-branch keeps symlinked files.
+        let file_type = entry.file_type()?;
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             walk(&path, out)?;
         } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) {
             out.push(path);
@@ -63,5 +74,11 @@ pub fn analyze_dir_with(backend: crate::ParserBackend, dir: impl AsRef<Path>, co
             sql: String::from_utf8_lossy(&bytes).into_owned(),
         });
     }
-    Ok(crate::analyze_sources_with(backend, &sources, config))
+    let mut analysis = crate::analyze_sources_with(backend, &sources, config);
+    if sources.is_empty() {
+        analysis
+            .notes
+            .push(crate::fold::Note::empty_scan(&dir.display().to_string()));
+    }
+    Ok(analysis)
 }

@@ -291,3 +291,43 @@ fn fail_on_degraded_gates_skips() {
     assert_eq!(strict.status.code(), Some(1));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn empty_directory_is_noted_and_gates_under_fail_on_degraded() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-test-{}-empty", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("readme.txt"), "not sql").unwrap();
+    let out = bin().arg(&dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[empty-scan] no SQL files found"), "{stdout}");
+    assert!(stdout.contains("1 path(s) matched no SQL files"), "{stdout}");
+    let strict = bin().arg(&dir).arg("--fail-on-degraded").output().unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_file_arguments_keep_the_given_order() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-test-{}-order", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let create = dir.join("V1__create.sql");
+    let alter = dir.join("V2__alter.sql");
+    std::fs::write(&create, "CREATE TABLE o (a int NOT NULL);").unwrap();
+    std::fs::write(&alter, "ALTER TABLE o ADD COLUMN b bigint NOT NULL;").unwrap();
+    // Explicit files are analyzed in argument order, never version-sorted: alter-before-create
+    // must leave the ALTER pointing at an unknown table.
+    let reversed = bin().arg(&alter).arg(&create).output().unwrap();
+    let reversed_stdout = String::from_utf8_lossy(&reversed.stdout);
+    assert!(reversed_stdout.contains("unknown-table"), "{reversed_stdout}");
+    let ordered = bin()
+        .args(["--format", "json"])
+        .arg(&create)
+        .arg(&alter)
+        .output()
+        .unwrap();
+    let ordered_stdout = String::from_utf8_lossy(&ordered.stdout);
+    assert!(!ordered_stdout.contains("unknown_table"), "{ordered_stdout}");
+    assert!(ordered_stdout.contains("\"natts\": 2"), "{ordered_stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

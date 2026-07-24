@@ -6,7 +6,7 @@ mod render;
 use clap::{Parser, ValueEnum};
 use rowdiet_core::catalog::parse_assume_spec;
 use rowdiet_core::{
-    Analysis, Baseline, Config, ParserBackend, SqlSource, analyze_sources_with, baseline, fs as core_fs,
+    Analysis, Baseline, Config, Note, ParserBackend, SqlSource, analyze_sources_with, baseline, fs as core_fs,
 };
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -89,8 +89,12 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
 
 fn run(cli: &Cli) -> Result<ExitCode, String> {
     let config = build_config(&cli.assume_type)?;
-    let sources = gather_sources(&cli.paths)?;
-    let analysis = analyze_sources_with(backend(cli.parser)?, &sources, &config);
+    let gathered = gather_sources(&cli.paths)?;
+    let mut analysis = analyze_sources_with(backend(cli.parser)?, &gathered.sources, &config);
+    for dir in &gathered.empty_dirs {
+        analysis.notes.push(Note::empty_scan(dir));
+    }
+    let analysis = analysis;
     if cli.update_baseline || !cli.accept.is_empty() {
         let path = cli.baseline.as_deref().ok_or("--baseline FILE is required")?;
         return maintain_baseline(cli, path, &analysis);
@@ -194,8 +198,16 @@ fn build_config(specs: &[String]) -> Result<Config, String> {
     Ok(config)
 }
 
-fn gather_sources(paths: &[String]) -> Result<Vec<SqlSource>, String> {
+struct Gathered {
+    sources: Vec<SqlSource>,
+    /// Directory arguments that matched no SQL files — surfaced as empty-scan notes so a
+    /// typo'd path cannot gate green forever.
+    empty_dirs: Vec<String>,
+}
+
+fn gather_sources(paths: &[String]) -> Result<Gathered, String> {
     let mut sources = Vec::new();
+    let mut empty_dirs = Vec::new();
     for raw in paths {
         if raw == "-" {
             let mut sql = String::new();
@@ -210,12 +222,16 @@ fn gather_sources(paths: &[String]) -> Result<Vec<SqlSource>, String> {
         }
         let path = Path::new(raw);
         if path.is_dir() {
-            for file in core_fs::collect_sql_files(path).map_err(|e| format!("{raw}: {e}"))? {
+            let files = core_fs::collect_sql_files(path).map_err(|e| format!("{raw}: {e}"))?;
+            if files.is_empty() {
+                empty_dirs.push(raw.clone());
+            }
+            for file in files {
                 sources.push(core_fs::read_source(&file).map_err(|e| format!("{}: {e}", file.display()))?);
             }
         } else {
             sources.push(core_fs::read_source(path).map_err(|e| format!("{raw}: {e}"))?);
         }
     }
-    Ok(sources)
+    Ok(Gathered { sources, empty_dirs })
 }

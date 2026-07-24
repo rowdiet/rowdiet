@@ -95,6 +95,9 @@ pub struct GateOutcome {
     pub skipped_statements: usize,
     /// Non-ignored tables marked incomplete (skipped or unexpanded DDL touched them).
     pub incomplete_tables: usize,
+    /// Scanned paths that matched no SQL files at all — a typo'd migrations directory would
+    /// otherwise gate green forever having analyzed nothing.
+    pub empty_scans: usize,
     /// One verdict per non-ignored analyzed table.
     pub verdicts: BTreeMap<String, TableVerdict>,
     /// Baseline entries with no matching analyzed table (renamed or dropped since acceptance).
@@ -106,9 +109,10 @@ pub struct GateOutcome {
 
 /// Gate an analysis. An explicit `fail_over` wins over the baseline file's recorded one; with
 /// neither present nothing can fail. Ignored tables are outside both gate and baseline.
-/// `fail_on_degraded` additionally fails the gate when statements were skipped or tables are
-/// incomplete — without it those are surfaced in the outcome but stay green (a sqlparser user
-/// cannot always fix a parser gap; under pg-exact skips should be zero, so strict is cheap).
+/// `fail_on_degraded` additionally fails the gate when statements were skipped, tables are
+/// incomplete, or a scanned path matched no SQL files — without it those are surfaced in the
+/// outcome but stay green (a sqlparser user cannot always fix a parser gap; under pg-exact
+/// skips should be zero, so strict is cheap).
 pub fn evaluate(
     analysis: &Analysis,
     fail_over: Option<u64>,
@@ -164,12 +168,18 @@ pub fn evaluate(
         .filter(|n| n.kind == crate::fold::NoteKind::SkippedStatement)
         .count();
     let incomplete_tables = analysis.tables.iter().filter(|t| !t.ignored && t.incomplete).count();
-    let degraded = skipped_statements > 0 || incomplete_tables > 0;
+    let empty_scans = analysis
+        .notes
+        .iter()
+        .filter(|n| n.kind == crate::fold::NoteKind::EmptyScan)
+        .count();
+    let degraded = skipped_statements > 0 || incomplete_tables > 0 || empty_scans > 0;
     let exceeded = verdicts.values().any(|v| v.failing()) || (fail_on_degraded && degraded);
     GateOutcome {
         exceeded,
         skipped_statements,
         incomplete_tables,
+        empty_scans,
         verdicts,
         orphaned,
         expired,

@@ -12,7 +12,12 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOu
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "notes:");
         for note in &analysis.notes {
-            let origin = format!("{}:{}", note.origin.source, note.origin.line);
+            // Line 0 marks a path-level note (e.g. an empty scan) — there is no line to point at.
+            let origin = if note.origin.line == 0 {
+                note.origin.source.clone()
+            } else {
+                format!("{}:{}", note.origin.source, note.origin.line)
+            };
             let _ = writeln!(out, "  {origin} [{}] {}", kind_label(note.kind), note.detail);
         }
     }
@@ -51,11 +56,11 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
             TableVerdict::Pass => {}
         }
     }
-    if gate.skipped_statements > 0 || gate.incomplete_tables > 0 {
+    if gate.skipped_statements > 0 || gate.incomplete_tables > 0 || gate.empty_scans > 0 {
         let _ = writeln!(
             out,
-            "degraded: {} statement(s) skipped, {} table(s) incomplete — pass --fail-on-degraded to gate on this",
-            gate.skipped_statements, gate.incomplete_tables
+            "degraded: {} statement(s) skipped, {} table(s) incomplete, {} path(s) matched no SQL files — pass --fail-on-degraded to gate on this",
+            gate.skipped_statements, gate.incomplete_tables, gate.empty_scans
         );
     }
     if gate.exceeded {
@@ -259,6 +264,7 @@ fn kind_label(kind: NoteKind) -> &'static str {
         NoteKind::DoBlockDdl => "do-block",
         NoteKind::UnusedIgnoreMarker => "unused-ignore",
         NoteKind::TempTableSkipped => "temp-table",
+        NoteKind::EmptyScan => "empty-scan",
     }
 }
 

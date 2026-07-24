@@ -75,12 +75,21 @@ rowdiet migrations/ --baseline rowdiet-baseline.json --fail-over 0 --update-base
 rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # accept one table's growth
 ```
 
+Paths can mix directories, individual files, and `-` (stdin). A directory is scanned
+recursively for `*.sql` (any case) and expanded in version order; dot-prefixed entries are
+skipped (an explicitly passed dot-directory still works), and symlinked directories are not
+entered — a symlinked `.sql` file is still read through its link. Explicit file arguments are
+analyzed in the order given, never re-sorted — so prefer `rowdiet migrations/` over
+`rowdiet migrations/*.sql`: a shell glob expands lexicographically, which puts `V10` before
+`V2`. A directory argument that matches no SQL files gets a loud `empty-scan` note rather than
+a silent pass.
+
 Exit codes: `0` clean, `1` gate exceeded, `2` operational error. Exempt a deliberate layout with
 a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement — the marker counts only in
 comments (never in string literals), and a marker that ends up attached to no statement gets a
-note instead of vanishing. Skipped statements and incomplete tables are reported in the gate
-summary either way; `--fail-on-degraded` turns them into a failure (recommended under
-`--parser pg-exact`, where skips should be zero).
+note instead of vanishing. Skipped statements, incomplete tables, and empty scans are reported
+in the gate summary either way; `--fail-on-degraded` turns them into a failure (recommended
+under `--parser pg-exact`, where skips should be zero).
 
 `--format github` emits runner-safe annotations: property values and messages are
 workflow-command-escaped, and output respects the runner's 10-annotations-per-severity cap with

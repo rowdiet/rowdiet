@@ -20,7 +20,8 @@
 //! "fail_over": 0, "fail_on_degraded": false, "baseline": {"fail_over": 0, "tables": {"t":
 //! {"bytes": 8, "layout": "f4i,f8d"}}}}` (`assume`/`fail_over`/`fail_on_degraded`/`baseline`
 //! optional; an explicit `fail_over` overrides the baseline's recorded one; `fail_on_degraded`
-//! also fails the gate when statements were skipped or tables are incomplete). Output JSON
+//! also fails the gate when statements were skipped, tables are incomplete, or an empty scan
+//! was noted). Output JSON
 //! mirrors the CLI's `--format json` envelope — the gate outcome under `"gate"` (per-table
 //! verdicts, orphaned/expired entries) plus the `"gate_exceeded"` shorthand — with an extra
 //! `"parser"` field; errors come back as `{"error": "..."}`.
