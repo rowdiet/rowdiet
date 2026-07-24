@@ -29,3 +29,6 @@ pg-exact = ["dep:pg_query"]
 [package.metadata.docs.rs]
 # All features: pg_query vendors its C sources (no network) and its dependents build green on docs.rs inside limits.
 all-features = true
+
+[lints]
+workspace = true

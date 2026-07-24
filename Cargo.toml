@@ -24,3 +24,20 @@ sqlparser = "0.62"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+
+# Lint classes held at zero. ci.sh runs clippy with -D warnings, so anything new here fails the
+# build. Deliberately short: pedantic/nursery stay off as whole groups — their remaining
+# emissions were judged noise (reasons in the commit that introduced the table).
+[workspace.lints.clippy]
+# Nursery; currently zero everywhere.
+cognitive_complexity = "warn"
+assigning_clones = "warn"
+explicit_iter_loop = "warn"
+needless_pass_by_ref_mut = "warn"
+needless_raw_string_hashes = "warn"
+or_fun_call = "warn"
+ptr_as_ptr = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+use_self = "warn"

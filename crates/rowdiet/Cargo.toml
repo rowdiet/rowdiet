@@ -24,3 +24,6 @@ pg-exact = ["rowdiet-core/pg-exact"]
 [package.metadata.docs.rs]
 # Same feature set as the shipped binary (pg-exact is default), stated explicitly for the docs.rs build.
 all-features = true
+
+[lints]
+workspace = true

@@ -19,3 +19,6 @@ serde_json.workspace = true
 # The web build wants the real PG17 grammar; disable to get a sqlparser-only module.
 default = ["pg-exact"]
 pg-exact = ["rowdiet-core/pg-exact"]
+
+[lints]
+workspace = true
