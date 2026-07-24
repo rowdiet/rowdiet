@@ -132,12 +132,13 @@ pub fn no_null_thoff() -> u64 {
     maxalign(TUPLE_HEADER)
 }
 
-/// t_hoff for rows that DO contain a NULL: header + one bitmap bit per table column.
-/// Order-invariant — display information only, never reorder advice.
+/// t_hoff for rows with no null bitmap: MAXALIGN(23) = 24.
 pub fn bare_thoff() -> u64 {
     maxalign(TUPLE_HEADER)
 }
 
+/// t_hoff for rows that carry a null bitmap: header + one bitmap bit per table column.
+/// Order-invariant, so it never changes reorder advice.
 pub fn null_thoff(natts: usize) -> u64 {
     maxalign(TUPLE_HEADER + (natts as u64).div_ceil(8))
 }

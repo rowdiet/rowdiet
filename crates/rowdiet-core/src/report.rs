@@ -19,7 +19,7 @@ pub struct Analysis {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableReport {
     /// The fold key — lowercased unless the DDL quoted the name. Stable across parser
-    /// backends, which makes it the identity baselines and gate verdicts key on (display
+    /// backends, which makes it the identity that baselines and gate verdicts key on (display
     /// spelling is backend-dependent and cosmetic).
     pub name: String,
     /// The name as written in the DDL (first backend-dependent spelling seen).

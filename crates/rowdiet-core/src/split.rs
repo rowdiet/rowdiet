@@ -229,8 +229,8 @@ mod tests;
 
 /// 1-based lines of every occurrence of `marker` that sits inside a comment of `text` —
 /// line (`--`) or block (`/* */`, nested). String literals, dollar-quoted bodies, and quoted
-/// identifiers are skipped, so a marker in data can never count. The ignore-marker semantics
-/// are built on this: a marker is honored only where a human wrote it as commentary.
+/// identifiers are skipped, so a marker in data can never count; the ignore-marker semantics
+/// are built on this.
 pub(crate) fn comment_marker_lines(text: &str, marker: &str) -> Vec<u32> {
     let b = text.as_bytes();
     let mut out = Vec::new();

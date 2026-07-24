@@ -316,10 +316,9 @@ fn ident_key(id: &sq::Ident) -> String {
     }
 }
 
-/// Tables and types are keyed by their last name component (search_path resolution is out of
-/// scope); the full original spelling is kept for display.
-/// Type names: keyed by the last component (`pg_catalog.int4` resolves as `int4`; the type
-/// catalog is unqualified).
+/// Type names (and other non-table objects) are keyed by their last component
+/// (`pg_catalog.int4` resolves as `int4`; the type catalog is unqualified); the full original
+/// spelling is kept for display. Tables go through `table_name` instead.
 fn raw_name(name: &sq::ObjectName) -> RawName {
     let key = name
         .0

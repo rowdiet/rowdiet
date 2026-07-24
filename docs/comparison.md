@@ -17,8 +17,8 @@ corrections welcome.
 ## Notes per tool
 
 - **`pg_column_byte_packer`** (Braintree) — reorders columns while *generating* ActiveRecord
-  migrations. Complementary rather than competing: it prevents the problem at authoring time
-  in one ORM; rowdiet lints any SQL migration set after the fact.
+  migrations. Complementary: it prevents the problem at authoring time in one ORM; rowdiet
+  lints any SQL migration set after the fact.
 - **Atlas `PG110`** — flags inefficient order, but needs a dev database to diff against; not a
   static check.
 - **`pg_column_tetris`** — reports from inside a live installation. Useful for auditing an
@@ -29,11 +29,11 @@ corrections welcome.
   `bpchar`, a varlena); `timetz` as 8 bytes (it is 12); columns of unrecognized types —
   including `serial` — are silently excluded from the analysis; totals omit the tuple header,
   null bitmap, and final MAXALIGN rounding, so headline savings can overstate the real
-  data-area delta. Only the first pasted statement is analyzed. rowdiet's two-tier reporting
-  exists precisely because varlena padding cannot be known statically — numbers that can't be
-  guaranteed are labeled, never blended with exact ones.
+  data-area delta. Only the first pasted statement is analyzed. rowdiet reports two tiers
+  because varlena padding can't be known statically: estimates are labeled, not blended with
+  exact numbers.
 - **squawk** — the adjacent Postgres migration linter, focused on locking and downtime safety;
-  it has no layout rules today. Notably, a column-order check is an open feature request there
+  it has no layout rules today. A column-order check is an open feature request there
   ([sbdchd/squawk#860](https://github.com/sbdchd/squawk/issues/860)), where the maintainer's
   stated preference — compute type sizes statically instead of asking Postgres — is the
   approach rowdiet implements. We intend to offer the rule upstream once rowdiet has proven

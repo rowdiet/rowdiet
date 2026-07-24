@@ -110,7 +110,7 @@ exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definit
   each part folded by its own quoting (`A.Things` → `a.things`, `a."Things"` → `a.Things`), so
   same-named tables in different schemas are distinct relations. Mixed qualified/unqualified
   references to one relation are not resolved (search_path is out of scope) — qualify
-  consistently, as the referenced migrations should anyway. **Types** are keyed by their last
+  consistently, as migrations should anyway. **Types** are keyed by their last
   name component (`pg_catalog.int4` resolves as `int4`; the type catalog is unqualified).
 - `ADD COLUMN` appends — physically true in Postgres. `SET DATA TYPE` edits in place (a type
   change rewrites the table but keeps attnum order). `DROP COLUMN` removes the column from the
