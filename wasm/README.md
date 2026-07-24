@@ -1,8 +1,8 @@
 # wasip1 build recipe: libpg_query in a Rust-linked wasm module
 
 Proven end-to-end: the module built with this recipe runs under wasmtime 47 and Node's WASI,
-including PostgreSQL's sigsetjmp error path. Every flag below earned its place against a real
-build failure.
+including PostgreSQL's sigsetjmp error path. Each flag below was added to fix a concrete build
+failure.
 
 ## Pins
 
@@ -46,7 +46,7 @@ RUSTFLAGS="-C link-arg=-L$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasip1 -C link-
   cargo build --release --target wasm32-wasip1 -p rowdiet-wasm --features pg-exact
 ```
 
-Gotchas, learned the hard way:
+Gotchas:
 
 - `pg_query`'s build.rs does **not** rerun on env-var changes — after editing flags, delete
   `target/wasm32-wasip1/release/{build,.fingerprint}/pg_query-*`.

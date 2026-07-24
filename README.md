@@ -128,7 +128,7 @@ The suggested order is: fixed columns before varlena, alignment descending, irre
 (`timetz`, `macaddr`) at the end of their group, varlenas alignment-descending with proven-short
 ones last. For all-regular schemas this provably yields zero padding under any NULL mask.
 
-Surprises it knows about so you don't have to: `uuid` is char-aligned (16 B, never pads);
+Non-obvious type facts it models: `uuid` is char-aligned (16 B, never pads);
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is
 varlena (`bpchar`); an enum value is 4 bytes.
 

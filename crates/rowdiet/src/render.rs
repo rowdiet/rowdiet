@@ -96,7 +96,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         return;
     }
     // An empty modeled column set (partition child / LIKE / typed table) passes the gate
-    // vacuously — say so instead of wearing an "optimal [exact]" chip it did not earn.
+    // vacuously — report it as not analyzable rather than as "optimal [exact]".
     if t.natts == 0 {
         let _ = writeln!(out, "◌ {} ({loc}) — no modeled columns — not analyzable", t.name);
         render_flags(out, t);

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build rowdiet-wasm (reactor cdylib + smoke bin) for wasm32-wasip1 with the pinned wasi-sdk
-# recipe — see wasm/README.md for the why of every flag. WASI_SDK overrides the default path.
+# recipe — wasm/README.md documents each flag. WASI_SDK overrides the default path.
 set -eu
 WASI_SDK="${WASI_SDK:-/opt/wasi-sdk-33.0}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
