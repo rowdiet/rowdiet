@@ -235,7 +235,7 @@ fn analysis_serializes() {
 mod differential {
     use crate::catalog::TypeRef;
     use crate::extract::{DdlOp, RawColumn, RawName};
-    use crate::{analyze_sources_with, extract, extract_pgq, Config, ParserBackend, SqlSource};
+    use crate::{Config, ParserBackend, SqlSource, analyze_sources_with, extract, extract_pgq};
 
     const CORPUS: &[&str] = &[
         "CREATE TABLE account (active boolean NOT NULL, id bigint PRIMARY KEY, kind smallint NOT NULL, balance bigint NOT NULL)",
@@ -572,10 +572,12 @@ mod pgq_guards {
         )
         .unwrap();
         match &ops[..] {
-            [DdlOp::CreateRange {
-                name,
-                subtype: Some(sub),
-            }] => {
+            [
+                DdlOp::CreateRange {
+                    name,
+                    subtype: Some(sub),
+                },
+            ] => {
                 assert_eq!(name.key, "r8");
                 assert_eq!(sub.key, "int8");
             }

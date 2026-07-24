@@ -25,7 +25,7 @@
 //! `{"error": "..."}`.
 
 use rowdiet_core::catalog::parse_assume_spec;
-use rowdiet_core::{analyze_sources_with, baseline, Baseline, Config, ParserBackend, SqlSource};
+use rowdiet_core::{Baseline, Config, ParserBackend, SqlSource, analyze_sources_with, baseline};
 
 #[derive(serde::Deserialize)]
 struct Input {
@@ -99,14 +99,14 @@ fn parser_name() -> &'static str {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rowdiet_alloc(len: usize) -> *mut u8 {
     Box::into_raw(vec![0u8; len].into_boxed_slice()) as *mut u8
 }
 
 /// Callers must pass a pointer previously returned by this module together with the exact length
 /// it was created with (alloc len for inputs, `out_len` for lint outputs).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rowdiet_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
@@ -138,7 +138,7 @@ fn pack(ptr: u32, len: u32) -> u64 {
 /// # Safety
 /// Same contract as [`lint_raw`]: the host passes a live buffer previously obtained from
 /// `rowdiet_alloc` and filled with the input JSON.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rowdiet_lint(ptr: *const u8, len: usize) -> u64 {
     let (out_ptr, out_len) = unsafe { lint_raw(ptr, len) };
     pack(out_ptr as usize as u32, out_len as u32)

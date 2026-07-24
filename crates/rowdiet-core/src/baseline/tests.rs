@@ -1,5 +1,5 @@
 use super::*;
-use crate::{analyze_sources, Config, SqlSource};
+use crate::{Config, SqlSource, analyze_sources};
 
 /// 8 B/row avoidable (56 → 48 footprint), signature `f4i,f8d,f4i,f8d`.
 const WASTEFUL: &str = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);";

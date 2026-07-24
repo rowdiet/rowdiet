@@ -1,5 +1,5 @@
 use super::*;
-use rowdiet_core::{analyze_sources, baseline, Baseline, BaselineEntry, Config, SqlSource};
+use rowdiet_core::{Baseline, BaselineEntry, Config, SqlSource, analyze_sources, baseline};
 
 fn analyze(sql: &str) -> Analysis {
     analyze_sources(
@@ -13,7 +13,9 @@ fn analyze(sql: &str) -> Analysis {
 
 /// 8 B/row avoidable, signature `f1c,f8d,f2s,f8d`.
 fn sample() -> Analysis {
-    analyze("CREATE TABLE account (active boolean NOT NULL, id bigint PRIMARY KEY, kind smallint NOT NULL, balance bigint NOT NULL);")
+    analyze(
+        "CREATE TABLE account (active boolean NOT NULL, id bigint PRIMARY KEY, kind smallint NOT NULL, balance bigint NOT NULL);",
+    )
 }
 
 fn gate(analysis: &Analysis, fail_over: Option<u64>) -> GateOutcome {

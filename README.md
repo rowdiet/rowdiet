@@ -58,6 +58,7 @@ column order a **pre-apply, CI-time** concern — exactly where a static linter 
 
 ```sh
 cargo install rowdiet            # or from a checkout: cargo install --path crates/rowdiet
+# builds on Rust 1.88+ (rust-version, verified by CI)
 cargo rowdiet migrations/        # installs a cargo subcommand too (cargo-rowdiet)
 rowdiet migrations/                          # report
 rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row

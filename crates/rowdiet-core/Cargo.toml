@@ -5,6 +5,7 @@ keywords = ["postgres", "padding", "alignment", "migration", "lint"]
 categories = ["development-tools", "database"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 # Private for now — flip when shipping to crates.io.
 publish = false

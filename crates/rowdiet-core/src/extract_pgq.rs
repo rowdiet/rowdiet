@@ -11,8 +11,8 @@
 
 use crate::catalog::TypeRef;
 use crate::extract::{DdlOp, RawColumn, RawName};
-use pg_query::protobuf as pb;
 use pg_query::NodeEnum;
+use pg_query::protobuf as pb;
 
 pub fn extract(text: &str) -> Result<Vec<DdlOp>, String> {
     let parsed = pg_query::parse(text).map_err(|e| e.to_string())?;

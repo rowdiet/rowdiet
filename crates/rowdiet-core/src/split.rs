@@ -216,11 +216,7 @@ fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {
     while j < b.len() && is_ident_byte(b[j]) {
         j += 1;
     }
-    if j < b.len() && b[j] == b'$' {
-        Some(j + 1)
-    } else {
-        None
-    }
+    if j < b.len() && b[j] == b'$' { Some(j + 1) } else { None }
 }
 
 #[cfg(test)]

@@ -46,3 +46,13 @@ jobs:
           wasm-opt --version
       - name: full verification matrix
         run: ./scripts/ci.sh
+
+  # Proves the declared rust-version: the workspace must check on the floor toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.88 check --workspace --all-features --locked

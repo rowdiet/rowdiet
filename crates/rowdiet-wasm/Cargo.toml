@@ -3,6 +3,7 @@ name = "rowdiet-wasm"
 description = "wasip1 reactor module: rowdiet analysis behind a minimal C ABI, for the static webpage"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

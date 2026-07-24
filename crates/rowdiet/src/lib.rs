@@ -6,7 +6,7 @@ mod render;
 use clap::{Parser, ValueEnum};
 use rowdiet_core::catalog::parse_assume_spec;
 use rowdiet_core::{
-    analyze_sources_with, baseline, fs as core_fs, Analysis, Baseline, Config, ParserBackend, SqlSource,
+    Analysis, Baseline, Config, ParserBackend, SqlSource, analyze_sources_with, baseline, fs as core_fs,
 };
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
