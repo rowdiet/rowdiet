@@ -18,6 +18,27 @@ pub struct Analysis {
     pub notes: Vec<Note>,
 }
 
+impl Analysis {
+    /// The tables the gate considers: every analyzed table not exempted by `rowdiet:ignore`,
+    /// in creation order. The same filter [`baseline::evaluate`](crate::baseline::evaluate)
+    /// applies — hand-written gates should start here so they cannot drift from it.
+    pub fn gated_tables(&self) -> impl Iterator<Item = &TableReport> {
+        self.tables.iter().filter(|table| !table.ignored)
+    }
+
+    /// The largest [`avoidable_bytes_per_row`](TableReport::avoidable_bytes_per_row) among
+    /// gated tables — 0 when every layout is tight (or nothing was analyzed). The number a
+    /// zero-tolerance test asserts on. A clean maximum still says nothing about skipped
+    /// statements, so pair it with a look at [`notes`](Self::notes) or use
+    /// [`baseline::evaluate`](crate::baseline::evaluate) with `fail_on_degraded`.
+    pub fn worst_avoidable(&self) -> u64 {
+        self.gated_tables()
+            .map(|table| table.avoidable_bytes_per_row)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// One table's full analysis: identity, provenance, per-column layout, current-vs-suggested
 /// numbers, and the avoidable-bytes headline the gate acts on.
 #[derive(Debug, Clone, PartialEq)]

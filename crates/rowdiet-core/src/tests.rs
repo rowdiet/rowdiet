@@ -1,10 +1,7 @@
 use crate::*;
 
 fn src(name: &str, sql: &str) -> SqlSource {
-    SqlSource {
-        name: name.into(),
-        sql: sql.into(),
-    }
+    SqlSource::new(name, sql)
 }
 
 #[test]
@@ -1118,4 +1115,24 @@ fn duplicate_check_follows_identifier_folding() {
     assert_eq!(quoted.tables[0].natts, 2, "{:?}", quoted.notes);
     assert!(!quoted.tables[0].incomplete);
     assert!(quoted.notes.is_empty());
+}
+
+#[test]
+fn analysis_accessors_mirror_the_gate_filter() {
+    let wasteful = src(
+        "V1__w.sql",
+        "CREATE TABLE w (a boolean NOT NULL, b bigint NOT NULL, c boolean NOT NULL, d bigint NOT NULL);",
+    );
+    let ignored = src(
+        "V2__i.sql",
+        "CREATE TABLE i (-- rowdiet:ignore\n a boolean NOT NULL, b bigint NOT NULL);",
+    );
+    let analysis = analyze_sources(&[wasteful, ignored], &Config::default());
+    assert_eq!(analysis.tables.len(), 2);
+    let gated: Vec<&str> = analysis.gated_tables().map(|t| t.name.as_str()).collect();
+    assert_eq!(gated, ["w"], "the ignored table must be outside the gate filter");
+    assert_eq!(analysis.worst_avoidable(), analysis.tables[0].avoidable_bytes_per_row);
+    assert!(analysis.worst_avoidable() > 0);
+    let empty = analyze_sources(&[], &Config::default());
+    assert_eq!(empty.worst_avoidable(), 0);
 }

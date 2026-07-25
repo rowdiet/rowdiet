@@ -375,6 +375,19 @@ pub enum Tier {
     Estimate,
 }
 
+/// The tier's stable tag — the same word the serde representation carries (`exact`,
+/// `estimate`), so logs and JSON name tiers identically. Renderers add their own explanatory
+/// wording on top.
+impl std::fmt::Display for Tier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = match self {
+            Self::Exact => "exact",
+            Self::Estimate => "estimate",
+        };
+        f.write_str(tag)
+    }
+}
+
 /// The tier `kinds` report at: [`Tier::Exact`] iff every column is fixed-width.
 pub fn tier(kinds: &[ColumnKind]) -> Tier {
     if kinds.iter().all(ColumnKind::is_fixed) {

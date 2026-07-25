@@ -242,3 +242,45 @@ fn empty_scan_counts_as_degradation() {
     let strict = evaluate(&with_note, Some(0), true, None);
     assert!(strict.exceeded);
 }
+
+#[test]
+fn outcome_degraded_mirrors_the_fail_on_degraded_condition() {
+    let clean = evaluate(&analysis(WASTEFUL), Some(100), false, None);
+    assert!(!clean.degraded());
+    let mut with_note = analysis(WASTEFUL);
+    with_note.notes.push(crate::fold::Note::empty_scan("migrations"));
+    let lenient = evaluate(&with_note, Some(100), false, None);
+    assert!(lenient.degraded(), "an empty scan is degradation");
+    assert!(!lenient.exceeded);
+    let strict = evaluate(&with_note, Some(100), true, None);
+    assert!(strict.exceeded, "fail_on_degraded escalates exactly degraded()");
+}
+
+// Display promises the serde `verdict` tag; a divergence would let logs and JSON name the
+// same verdict differently.
+#[cfg(feature = "serde")]
+#[test]
+fn verdict_display_matches_serde_tag() {
+    // Every variant — extend when the enum grows.
+    let all = [
+        TableVerdict::Pass,
+        TableVerdict::NewViolation { avoidable: 1 },
+        TableVerdict::Regression {
+            avoidable: 2,
+            allowed: 1,
+        },
+        TableVerdict::GrownSinceBaseline {
+            avoidable: 2,
+            allowed: 1,
+        },
+        TableVerdict::ModifiedSinceBaseline { avoidable: 2 },
+        TableVerdict::RatchetOpportunity {
+            avoidable: 1,
+            allowed: 2,
+        },
+    ];
+    for verdict in all {
+        let json = serde_json::to_value(verdict).unwrap();
+        assert_eq!(json["verdict"].as_str().unwrap(), verdict.to_string(), "{verdict:?}");
+    }
+}

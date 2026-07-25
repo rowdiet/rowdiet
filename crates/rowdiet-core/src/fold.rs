@@ -20,6 +20,19 @@ pub struct Origin {
     pub line: u32,
 }
 
+/// `source:line` — except for path-level origins (line 0), which print the bare source, since
+/// there is no line to point at. The one place that convention lives; renderers should print
+/// origins through it rather than re-deciding when the line is real.
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.line == 0 {
+            f.write_str(&self.source)
+        } else {
+            write!(f, "{}:{}", self.source, self.line)
+        }
+    }
+}
+
 /// Stable category tag of a [`Note`] — what renderers label and gates count on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
@@ -57,6 +70,31 @@ pub enum NoteKind {
     TempTableSkipped,
     /// A scanned path matched no SQL files; see [`Note::empty_scan`].
     EmptyScan,
+}
+
+/// The kind's stable tag — the same word the serde representation carries
+/// (`skipped_statement`, `empty_scan`, …), so logs and JSON name note kinds identically.
+/// Renderers may still label kinds with their own shorter vocabulary.
+impl std::fmt::Display for NoteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = match self {
+            Self::SkippedStatement => "skipped_statement",
+            Self::AlterUnknownTable => "alter_unknown_table",
+            Self::AlterSkippedTable => "alter_skipped_table",
+            Self::CtasSkipped => "ctas_skipped",
+            Self::IncompleteColumns => "incomplete_columns",
+            Self::DroppedColumn => "dropped_column",
+            Self::UnknownType => "unknown_type",
+            Self::Redefined => "redefined",
+            Self::DuplicateColumn => "duplicate_column",
+            Self::UnknownColumn => "unknown_column",
+            Self::DoBlockDdl => "do_block_ddl",
+            Self::UnusedIgnoreMarker => "unused_ignore_marker",
+            Self::TempTableSkipped => "temp_table_skipped",
+            Self::EmptyScan => "empty_scan",
+        };
+        f.write_str(tag)
+    }
 }
 
 /// One analysis finding — the loud-degradation channel the module doc promises.

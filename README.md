@@ -115,17 +115,20 @@ new migration before it ships. Any other layout change (reorder, drop, type chan
 allowance (`modified since baseline`): the table was rewritten anyway, so it either meets the
 fail-over or gets re-accepted deliberately.
 
-### As a library (refinery guard, five lines)
+### As a library (refinery guard, four lines)
 
 ```rust
 #[test]
 fn migrations_are_byte_packed() {
     let analysis = rowdiet_core::fs::analyze_dir("migrations", &Default::default()).unwrap();
     assert!(analysis.notes.is_empty(), "statements were skipped: {:#?}", analysis.notes);
-    let worst = analysis.tables.iter().filter(|t| !t.ignored).map(|t| t.avoidable_bytes_per_row).max();
-    assert_eq!(worst.unwrap_or(0), 0, "column order wastes bytes: {analysis:#?}");
+    assert_eq!(analysis.worst_avoidable(), 0, "column order wastes bytes: {analysis:#?}");
 }
 ```
+
+`worst_avoidable()` is the largest avoidable-bytes figure among non-ignored tables;
+`Analysis::gated_tables()` iterates exactly the tables the gate considers, for hand-rolled
+policies that must not drift from `baseline::evaluate`'s filter.
 
 The notes assertion matters: a gate that only counts avoidable bytes stays green over statements
 the parser could not read.

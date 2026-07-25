@@ -12,13 +12,8 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOu
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "notes:");
         for note in &analysis.notes {
-            // Line 0 marks a path-level note (e.g. an empty scan) — there is no line to point at.
-            let origin = if note.origin.line == 0 {
-                note.origin.source.clone()
-            } else {
-                format!("{}:{}", note.origin.source, note.origin.line)
-            };
-            let _ = writeln!(out, "  {origin} [{}] {}", kind_label(note.kind), note.detail);
+            // Origin's Display prints the bare source for path-level notes (line 0).
+            let _ = writeln!(out, "  {} [{}] {}", note.origin, kind_label(note.kind), note.detail);
         }
     }
     let wasteful = analysis
@@ -105,7 +100,7 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
 }
 
 fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, verdict: Option<TableVerdict>) {
-    let loc = format!("{}:{}", t.origin.source, t.origin.line);
+    let loc = &t.origin;
     if t.ignored {
         let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.display);
         return;

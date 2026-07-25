@@ -8,15 +8,16 @@
 //!
 //! ```
 //! use rowdiet_core::{analyze_sources, Config, SqlSource};
-//! let migration = SqlSource {
-//!     name: "V1__init.sql".into(),
-//!     sql: "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);".into(),
-//! };
+//! let migration = SqlSource::new(
+//!     "V1__init.sql",
+//!     "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);",
+//! );
 //! let analysis = analyze_sources(&[migration], &Config::default());
 //! let table = &analysis.tables[0];
 //! assert_eq!(table.current.footprint, Some(56));
 //! assert_eq!(table.suggested.footprint, Some(48));
 //! assert_eq!(table.avoidable_bytes_per_row, 8);
+//! assert_eq!(analysis.worst_avoidable(), 8);
 //! ```
 
 pub mod baseline;
@@ -55,6 +56,17 @@ pub struct SqlSource {
     pub name: String,
     /// The complete SQL text — any number of statements; rowdiet splits it itself.
     pub sql: String,
+}
+
+impl SqlSource {
+    /// A source from any pair of string-likes — spares callers the field-by-field `.into()`
+    /// dance when the values are `&str`s (tests, adapters, embedded DDL).
+    pub fn new(name: impl Into<String>, sql: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            sql: sql.into(),
+        }
+    }
 }
 
 /// A `CREATE TABLE` whose text contains this marker is exempt from the gate (still listed, as

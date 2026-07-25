@@ -101,6 +101,23 @@ impl TableVerdict {
     }
 }
 
+/// The verdict kind's stable tag — the same word the serde `verdict` field carries
+/// (`pass`, `new_violation`, …), so logs and JSON name verdicts identically. Payload numbers
+/// are not included; renderers present those with their own wording.
+impl std::fmt::Display for TableVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag = match self {
+            Self::Pass => "pass",
+            Self::NewViolation { .. } => "new_violation",
+            Self::Regression { .. } => "regression",
+            Self::GrownSinceBaseline { .. } => "grown_since_baseline",
+            Self::ModifiedSinceBaseline { .. } => "modified_since_baseline",
+            Self::RatchetOpportunity { .. } => "ratchet_opportunity",
+        };
+        f.write_str(tag)
+    }
+}
+
 /// What [`evaluate`] concluded: the overall pass/fail plus everything a renderer needs to say why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -126,6 +143,16 @@ pub struct GateOutcome {
     pub expired: Vec<String>,
 }
 
+impl GateOutcome {
+    /// True when the analysis degraded: statements were skipped, tables are incomplete, or a
+    /// scanned path matched no SQL files. This is exactly the condition `fail_on_degraded`
+    /// escalates to a failure; without that flag it stays visible here while the gate stays
+    /// green.
+    pub fn degraded(&self) -> bool {
+        self.skipped_statements > 0 || self.incomplete_tables > 0 || self.empty_scans > 0
+    }
+}
+
 /// Gate an analysis. An explicit `fail_over` wins over the baseline file's recorded one; with
 /// neither present nothing can fail. Ignored tables are outside both gate and baseline.
 /// `fail_on_degraded` additionally fails the gate when statements were skipped, tables are
@@ -141,7 +168,7 @@ pub fn evaluate(
     let default_limit = fail_over.or_else(|| baseline.map(|b| b.fail_over));
     let mut verdicts = BTreeMap::new();
     let mut expired = Vec::new();
-    for table in analysis.tables.iter().filter(|t| !t.ignored) {
+    for table in analysis.gated_tables() {
         let entry = baseline.and_then(|b| b.tables.get(&table.name));
         let (verdict, entry_expired) = table_verdict(table, entry, default_limit);
         if entry_expired {
@@ -163,23 +190,23 @@ pub fn evaluate(
         .iter()
         .filter(|n| n.kind == crate::fold::NoteKind::SkippedStatement)
         .count();
-    let incomplete_tables = analysis.tables.iter().filter(|t| !t.ignored && t.incomplete).count();
+    let incomplete_tables = analysis.gated_tables().filter(|t| t.incomplete).count();
     let empty_scans = analysis
         .notes
         .iter()
         .filter(|n| n.kind == crate::fold::NoteKind::EmptyScan)
         .count();
-    let degraded = skipped_statements > 0 || incomplete_tables > 0 || empty_scans > 0;
-    let exceeded = verdicts.values().any(|v| v.failing()) || (fail_on_degraded && degraded);
-    GateOutcome {
-        exceeded,
+    let mut outcome = GateOutcome {
+        exceeded: false,
         skipped_statements,
         incomplete_tables,
         empty_scans,
         verdicts,
         orphaned,
         expired,
-    }
+    };
+    outcome.exceeded = outcome.verdicts.values().any(|v| v.failing()) || (fail_on_degraded && outcome.degraded());
+    outcome
 }
 
 /// One table against its (possible) baseline entry. The second value reports a stale entry:
@@ -240,9 +267,8 @@ fn relation(baselined: &str, current: &str) -> SignatureRelation {
 /// at current bytes and signature. Orphans and expired entries vanish by construction.
 pub fn build_from(analysis: &Analysis, fail_over: u64, version: &str) -> Baseline {
     let tables = analysis
-        .tables
-        .iter()
-        .filter(|t| !t.ignored && t.avoidable_bytes_per_row > fail_over)
+        .gated_tables()
+        .filter(|t| t.avoidable_bytes_per_row > fail_over)
         .map(|t| {
             (
                 t.name.clone(),
@@ -272,9 +298,8 @@ pub fn build_from(analysis: &Analysis, fail_over: u64, version: &str) -> Baselin
 pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[String]) -> Result<(), String> {
     for name in names {
         let table = analysis
-            .tables
-            .iter()
-            .find(|t| !t.ignored && (t.name == *name || t.display == *name))
+            .gated_tables()
+            .find(|t| t.name == *name || t.display == *name)
             .ok_or_else(|| format!("cannot accept `{name}`: no such table in the analyzed DDL (or it is ignored)"))?;
         // Entries are stored under the canonical fold key regardless of which spelling the
         // caller used to name the table — an entry keyed by display would never match a gate.

@@ -212,3 +212,45 @@ fn serial_column_is_not_null() {
         }
     );
 }
+
+#[test]
+fn origin_display_keeps_the_line_zero_convention() {
+    let at_line = Origin {
+        source: "V1__init.sql".into(),
+        line: 3,
+    };
+    assert_eq!(at_line.to_string(), "V1__init.sql:3");
+    let path_level = Origin {
+        source: "migrations".into(),
+        line: 0,
+    };
+    assert_eq!(path_level.to_string(), "migrations");
+}
+
+// Display promises the serde tag vocabulary; a divergence would let logs and JSON name the
+// same kind differently.
+#[cfg(feature = "serde")]
+#[test]
+fn note_kind_display_matches_serde() {
+    // Every variant — extend when the enum grows.
+    let all = [
+        NoteKind::SkippedStatement,
+        NoteKind::AlterUnknownTable,
+        NoteKind::AlterSkippedTable,
+        NoteKind::CtasSkipped,
+        NoteKind::IncompleteColumns,
+        NoteKind::DroppedColumn,
+        NoteKind::UnknownType,
+        NoteKind::Redefined,
+        NoteKind::DuplicateColumn,
+        NoteKind::UnknownColumn,
+        NoteKind::DoBlockDdl,
+        NoteKind::UnusedIgnoreMarker,
+        NoteKind::TempTableSkipped,
+        NoteKind::EmptyScan,
+    ];
+    for kind in all {
+        let json = serde_json::to_value(kind).unwrap();
+        assert_eq!(json.as_str().unwrap(), kind.to_string(), "{kind:?}");
+    }
+}
