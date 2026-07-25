@@ -9,6 +9,9 @@ edition = "2024"
 # alone would allow 1.85).
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/rowdiet/rowdiet"
+homepage = "https://rowdiet.dev"
+readme = "README.md"
 
 # Size-tuned profile for wasm artifacts (wasm/build-wasip1.sh builds with --profile wasm).
 [profile.wasm]
