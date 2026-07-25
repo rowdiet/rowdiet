@@ -87,13 +87,24 @@ pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], confi
         // DEFAULT 'rowdiet:ignore' must never exempt a table. Markers written in the file but
         // attached to no statement (e.g. on their own line above a CREATE, which the splitter
         // consumes as a leading comment) would otherwise vanish silently; they get a note.
-        let mut stranded: Vec<u32> = split::comment_marker_lines(&source.sql, IGNORE_MARKER);
+        // Every statement is a substring of the file, so one containment miss up front settles
+        // the whole file's marker scans.
+        let file_has_marker = source.sql.contains(IGNORE_MARKER);
+        let mut stranded: Vec<u32> = if file_has_marker {
+            split::comment_marker_lines(&source.sql, IGNORE_MARKER)
+        } else {
+            Vec::new()
+        };
         for raw in split::split(&source.sql) {
             let origin = Origin {
                 source: source.name.clone(),
                 line: raw.line,
             };
-            let attached = split::comment_marker_lines(&raw.text, IGNORE_MARKER);
+            let attached = if file_has_marker {
+                split::comment_marker_lines(&raw.text, IGNORE_MARKER)
+            } else {
+                Vec::new()
+            };
             for rel in &attached {
                 let abs = raw.line + rel - 1;
                 if let Some(pos) = stranded.iter().position(|&l| l == abs) {
@@ -105,8 +116,9 @@ pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], confi
                 // The marker waives the body scan entirely — for DO blocks whose dynamic DDL a
                 // human has judged irrelevant to layout (e.g. partition-creation loops). Inside
                 // the dollar-quoted body the marker is a plpgsql comment, scanned separately.
-                let body_marker = split::dollar_quoted_body(&raw.text)
-                    .is_some_and(|body| !split::comment_marker_lines(body, IGNORE_MARKER).is_empty());
+                let body_marker = file_has_marker
+                    && split::dollar_quoted_body(&raw.text)
+                        .is_some_and(|body| !split::comment_marker_lines(body, IGNORE_MARKER).is_empty());
                 if !ignore_marker && !body_marker {
                     scan_do_block(backend, &mut folder, &raw.text, &origin);
                 }

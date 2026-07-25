@@ -247,6 +247,12 @@ fn dollar_tag_end(b: &[u8], start: usize) -> Option<usize> {
 /// identifiers are skipped, so a marker in data can never count; the ignore-marker semantics
 /// are built on this.
 pub(crate) fn comment_marker_lines(text: &str, marker: &str) -> Vec<u32> {
+    // Almost no input contains the marker at all, and a plain substring miss is an order of
+    // magnitude cheaper than the quote-aware walk below — which only exists to decide whether
+    // an occurrence sits in a comment, so zero occurrences need no walk.
+    if !text.contains(marker) {
+        return Vec::new();
+    }
     let mut c = Cursor::new(text);
     let mut out = Vec::new();
     while !c.done() {
