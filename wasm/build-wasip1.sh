@@ -15,7 +15,7 @@ export RUSTFLAGS="-C link-arg=-L$WASI_SDK/share/wasi-sysroot/lib/wasm32-wasip1 -
  -C link-arg=-lwasi-emulated-signal -C link-arg=-lwasi-emulated-process-clocks \
  -C link-arg=-lwasi-emulated-mman -C link-arg=-lwasi-emulated-getpid"
 cd "$ROOT"
-cargo build --profile wasm --target wasm32-wasip1 -p rowdiet-wasm
+cargo build --profile wasm --target wasm32-wasip1 -p rowdiet-wasm "$@"
 # Optional size pass (brew install binaryen). The feature flags matter: the module carries real
 # wasm-EH (exnref) from the sjlj lowering.
 if command -v wasm-opt >/dev/null 2>&1; then

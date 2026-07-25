@@ -7,6 +7,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build artifacts for (publish jobs skip already-published versions by failing; use for artifact backfill)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -41,3 +46,54 @@ jobs:
       - run: cargo publish -p rowdiet --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  # Reproducible wasm modules attached to the GitHub release: the pg-exact module the site
+  # serves, and the sqlparser-only variant, with checksums. Backfillable for an existing tag
+  # via workflow_dispatch.
+  artifacts:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      WASI_SDK: ${{ github.workspace }}/.toolchains/wasi-sdk-33.0-x86_64-linux
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: rust toolchain + wasm target
+        run: |
+          rustup show
+          rustup target add wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: cache wasm toolchains
+        id: toolchains
+        uses: actions/cache@v4
+        with:
+          path: .toolchains
+          key: wasi-sdk-33.0_binaryen-131_x86_64-linux
+      - name: install wasi-sdk + binaryen
+        if: steps.toolchains.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .toolchains
+          curl -sSfL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz | tar -xz -C .toolchains
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_131/binaryen-version_131-x86_64-linux.tar.gz | tar -xz -C .toolchains
+      - name: expose wasm-opt
+        run: echo "${{ github.workspace }}/.toolchains/binaryen-version_131/bin" >> "$GITHUB_PATH"
+      - name: build pg-exact module
+        run: |
+          ./wasm/build-wasip1.sh
+          cp target/wasm32-wasip1/wasm/rowdiet_wasm.wasm "rowdiet-wasm-pgexact-$TAG-wasip1.wasm"
+      - name: build sqlparser-only module
+        run: |
+          ./wasm/build-wasip1.sh --no-default-features
+          cp target/wasm32-wasip1/wasm/rowdiet_wasm.wasm "rowdiet-wasm-sqlparser-$TAG-wasip1.wasm"
+      - name: checksums + upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum rowdiet-wasm-*-wasip1.wasm > SHA256SUMS
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "rowdiet $TAG"
+          gh release upload "$TAG" rowdiet-wasm-*-wasip1.wasm SHA256SUMS --clobber
