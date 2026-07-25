@@ -550,9 +550,11 @@ pub fn preprocess(text: &str) -> String {
 /// Borrowing form of [`preprocess`] — the analysis loop calls this per statement, and almost no
 /// statement needs the rewrite.
 pub(crate) fn preprocessed(text: &str) -> Cow<'_, str> {
-    let words = word_spans(text, 3);
+    let Some(words) = word_spans::<3>(text) else {
+        return Cow::Borrowed(text);
+    };
     let is = |r: &Range<usize>, w: &str| text[r.clone()].eq_ignore_ascii_case(w);
-    if words.len() == 3 && is(&words[0], "create") && is(&words[1], "unlogged") && is(&words[2], "table") {
+    if is(&words[0], "create") && is(&words[1], "unlogged") && is(&words[2], "table") {
         let mut stripped = String::with_capacity(text.len());
         stripped.push_str(&text[..words[1].start]);
         stripped.push_str(&text[words[2].start..]);
@@ -561,11 +563,15 @@ pub(crate) fn preprocessed(text: &str) -> Cow<'_, str> {
     Cow::Borrowed(text)
 }
 
-fn word_spans(text: &str, n: usize) -> Vec<Range<usize>> {
+/// The first `N` whitespace-separated words of `text`, or None when fewer exist before
+/// non-word content. Fixed-size on purpose: this probe runs per statement and must not
+/// allocate for the near-universal miss.
+fn word_spans<const N: usize>(text: &str) -> Option<[Range<usize>; N]> {
     let b = text.as_bytes();
-    let mut spans = Vec::with_capacity(n);
+    let mut spans = [const { 0..0 }; N];
+    let mut found = 0usize;
     let mut i = 0usize;
-    while i < b.len() && spans.len() < n {
+    while i < b.len() && found < N {
         if b[i].is_ascii_whitespace() {
             i += 1;
         } else if b[i] == b'_' || b[i].is_ascii_alphanumeric() {
@@ -573,12 +579,13 @@ fn word_spans(text: &str, n: usize) -> Vec<Range<usize>> {
             while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
                 i += 1;
             }
-            spans.push(start..i);
+            spans[found] = start..i;
+            found += 1;
         } else {
             break;
         }
     }
-    spans
+    (found == N).then_some(spans)
 }
 
 /// What [`sniff`] recognized: the fold key of the table an unparseable statement targets.
