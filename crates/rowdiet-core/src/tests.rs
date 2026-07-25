@@ -1059,3 +1059,39 @@ mod postaudit_pins {
         );
     }
 }
+
+#[test]
+fn duplicate_column_in_create_is_loud_and_kept_once() {
+    let sql = "CREATE TABLE account (
+        active boolean NOT NULL,
+        id bigint PRIMARY KEY,
+        kind smallint NOT NULL,
+        kind smallint NOT NULL,
+        balance bigint NOT NULL
+    );";
+    let analysis = analyze_sources(&[src("V1__dup.sql", sql)], &Config::default());
+    let table = &analysis.tables[0];
+    assert_eq!(table.natts, 4, "first occurrence kept, duplicate dropped");
+    assert!(
+        table.incomplete,
+        "an unapplyable statement must not model a clean table"
+    );
+    assert_eq!(
+        analysis
+            .notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::DuplicateColumn)
+            .count(),
+        1,
+        "{:?}",
+        analysis.notes
+    );
+    let gate = crate::baseline::evaluate(&analysis, None, true, None);
+    assert!(gate.exceeded, "fail-on-degraded must catch the duplicate");
+    #[cfg(feature = "pg-exact")]
+    {
+        let exact = analyze_sources_with(ParserBackend::PgExact, &[src("V1__dup.sql", sql)], &Config::default());
+        assert_eq!(exact.tables[0].natts, 4);
+        assert!(exact.tables[0].incomplete);
+    }
+}

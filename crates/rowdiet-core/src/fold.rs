@@ -275,10 +275,24 @@ impl Folder {
             columns: inherited,
             dropped_count: inherited_dropped,
         };
+        let mut seen: std::collections::HashSet<String> = table.columns.iter().map(|c| c.key.clone()).collect();
         for raw in columns {
             let mut column = self.resolve_column(raw, origin);
             if pk_columns.contains(&column.key) {
                 column.not_null = true;
+            }
+            // Postgres rejects the whole statement over a repeated name, so a layout modeled
+            // from it describes no applyable table: keep the first occurrence, say so, and
+            // flag the table so `--fail-on-degraded` can gate on it.
+            if !seen.insert(column.key.clone()) {
+                let detail = format!(
+                    "table {}: column {} specified more than once — Postgres rejects this \
+                     statement; first occurrence kept",
+                    table.display, column.display
+                );
+                self.note(origin, NoteKind::DuplicateColumn, detail);
+                table.incomplete = true;
+                continue;
             }
             table.columns.push(column);
         }
