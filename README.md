@@ -1,6 +1,6 @@
 # rowdiet — a static column-tetris linter for Postgres migrations
 
-<!-- badges: added at publish (docs.rs, crates.io — they render as errors while the crates are unpublished) -->
+[![crates.io](https://img.shields.io/crates/v/rowdiet.svg)](https://crates.io/crates/rowdiet) [![docs.rs](https://img.shields.io/docsrs/rowdiet-core)](https://docs.rs/rowdiet-core) [![CI](https://github.com/rowdiet/rowdiet/actions/workflows/ci.yml/badge.svg)](https://github.com/rowdiet/rowdiet/actions/workflows/ci.yml)
 
 **rowdiet** lints Postgres migration SQL for wasted alignment padding (the *column tetris*
 problem) **statically, with no database**. It parses your `CREATE TABLE` / `ALTER TABLE`
