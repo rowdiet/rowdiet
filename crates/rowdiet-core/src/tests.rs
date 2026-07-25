@@ -1095,3 +1095,27 @@ fn duplicate_column_in_create_is_loud_and_kept_once() {
         assert!(exact.tables[0].incomplete);
     }
 }
+
+#[test]
+fn duplicate_check_follows_identifier_folding() {
+    // Unquoted identifiers fold, so KIND duplicates kind; a quoted "KIND" is a distinct column.
+    let folded = analyze_sources(
+        &[src(
+            "V1__f.sql",
+            "CREATE TABLE t (kind smallint NOT NULL, KIND smallint NOT NULL);",
+        )],
+        &Config::default(),
+    );
+    assert_eq!(folded.tables[0].natts, 1);
+    assert!(folded.tables[0].incomplete);
+    let quoted = analyze_sources(
+        &[src(
+            "V1__q.sql",
+            "CREATE TABLE t (kind smallint NOT NULL, \"KIND\" smallint NOT NULL);",
+        )],
+        &Config::default(),
+    );
+    assert_eq!(quoted.tables[0].natts, 2, "{:?}", quoted.notes);
+    assert!(!quoted.tables[0].incomplete);
+    assert!(quoted.notes.is_empty());
+}
