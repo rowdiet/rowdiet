@@ -28,6 +28,9 @@ jobs:
 
   publish:
     needs: test
+    # Tag pushes only: manual dispatches are for artifact backfills, and republishing an
+    # existing version can only fail.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     permissions:
