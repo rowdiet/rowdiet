@@ -230,12 +230,44 @@ fn gather_sources(paths: &[String]) -> Result<Gathered, String> {
             if files.is_empty() {
                 empty_dirs.push(raw.clone());
             }
-            for file in files {
-                sources.push(core_fs::read_source(&file).map_err(|e| format!("{}: {e}", file.display()))?);
-            }
+            sources.append(&mut read_files(files)?);
         } else {
             sources.push(core_fs::read_source(path).map_err(|e| format!("{raw}: {e}"))?);
         }
     }
     Ok(Gathered { sources, empty_dirs })
+}
+
+/// Read a directory's collected files, in order. Reading is the CLI's second-largest wall-time
+/// block after parsing and parallelizes cleanly — but only so far: past four workers the
+/// syscall path contends instead of scaling (measured on macOS/APFS), hence the fixed cap.
+/// Results and the first-error-wins failure message are in file order either way.
+fn read_files(files: Vec<PathBuf>) -> Result<Vec<SqlSource>, String> {
+    let format_err = |file: &Path, e: std::io::Error| format!("{}: {e}", file.display());
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(4)
+        .min(files.len());
+    if workers < 2 {
+        return files
+            .iter()
+            .map(|file| core_fs::read_source(file).map_err(|e| format_err(file, e)))
+            .collect();
+    }
+    let chunk = files.len().div_ceil(workers);
+    let results: Vec<std::io::Result<SqlSource>> = std::thread::scope(|scope| {
+        let readers: Vec<_> = files
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(|file| core_fs::read_source(file)).collect::<Vec<_>>()))
+            .collect();
+        readers
+            .into_iter()
+            .flat_map(|reader| reader.join().expect("reader thread panicked"))
+            .collect()
+    });
+    files
+        .iter()
+        .zip(results)
+        .map(|(file, result)| result.map_err(|e| format_err(file, e)))
+        .collect()
 }

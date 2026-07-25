@@ -62,8 +62,17 @@ pub fn read_source(path: &Path) -> io::Result<SqlSource> {
     let bytes = std::fs::read(path)?;
     Ok(SqlSource {
         name: path.display().to_string(),
-        sql: String::from_utf8_lossy(&bytes).into_owned(),
+        sql: decode_lossy(bytes),
     })
+}
+
+/// UTF-8 decode with U+FFFD replacement, reusing the buffer on the (universal) valid case —
+/// `from_utf8_lossy(&bytes).into_owned()` would copy every file byte a second time.
+fn decode_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(sql) => sql,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
 }
 
 /// The five-line CI guard: point it at a migrations directory (e.g. in a `#[test]` or right
@@ -91,7 +100,7 @@ pub fn analyze_dir_with(backend: crate::ParserBackend, dir: impl AsRef<Path>, co
         let name = path.strip_prefix(dir).unwrap_or(&path).display().to_string();
         sources.push(SqlSource {
             name,
-            sql: String::from_utf8_lossy(&bytes).into_owned(),
+            sql: decode_lossy(bytes),
         });
     }
     let mut analysis = crate::analyze_sources_with(backend, &sources, config);
