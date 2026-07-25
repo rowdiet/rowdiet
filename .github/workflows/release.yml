@@ -1,0 +1,40 @@
+name: release
+# Publishes rowdiet-core then rowdiet to crates.io on a version tag (or manual dispatch).
+#
+# v0.1.0 uses the CARGO_REGISTRY_TOKEN repository secret — crates.io requires the first
+# publish of a new crate to be token-based. Once both crates exist and their settings name
+# this repository + workflow (+ the release environment) as a trusted publisher, this switches
+# to the OIDC exchange (rust-lang/crates-io-auth-action) and the secret gets deleted.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup default stable
+      # cargo blocks until the published version is visible in the index, so the dependent
+      # CLI publish can follow immediately.
+      - run: cargo publish -p rowdiet-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish -p rowdiet --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
