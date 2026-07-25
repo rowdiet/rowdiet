@@ -11,7 +11,6 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 # Private for now — flip when shipping to crates.io.
-publish = false
 
 [dependencies]
 rowdiet-core = { workspace = true, features = ["serde", "fs"] }

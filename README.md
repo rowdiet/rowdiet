@@ -8,6 +8,9 @@ statements, computes the on-disk row layout Postgres will actually use (postgres
 alignment, and ordering), and reports the bytes per row you can recover by reordering columns —
 **before** the migration is applied, while reordering is still free.
 
+**Try it in your browser: [rowdiet.dev](https://rowdiet.dev)** — the same engine compiled to
+WebAssembly, with draggable byte rulers; nothing leaves the page.
+
 ```
 $ rowdiet migrations/ --rows 10000000 --suggest
 ■ account (V1__init.sql:1) — 6 columns — estimate — long-form varlena scenario
