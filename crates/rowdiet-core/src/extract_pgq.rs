@@ -14,6 +14,12 @@ use crate::extract::{DdlOp, RawColumn, RawName};
 use pg_query::NodeEnum;
 use pg_query::protobuf as pb;
 
+/// `text` → its [`DdlOp`]s via the PG17 grammar. No preprocessing needed (unlike the sqlparser
+/// backend, this grammar takes `CREATE UNLOGGED TABLE` as-is).
+///
+/// # Errors
+///
+/// libpg_query's parse error message; the analysis loop surfaces it as a skipped-statement note.
 pub fn extract(text: &str) -> Result<Vec<DdlOp>, String> {
     let parsed = pg_query::parse(text).map_err(|e| e.to_string())?;
     let mut ops = Vec::new();

@@ -1,3 +1,6 @@
+//! End-to-end tests of the compiled `rowdiet` binary against the fixture migration sets:
+//! exit codes, output formats, gating, and baseline maintenance.
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 

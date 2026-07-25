@@ -3,9 +3,13 @@
 //! line numbers. Whether a statement parses is the caller's per-statement concern — a linter must
 //! degrade loudly per statement, never abort a whole file.
 
+/// One top-level statement found by [`split`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawStatement {
+    /// The statement text, whitespace-trimmed, terminating semicolon excluded. Comments before
+    /// the first content byte are dropped; interior comments (where ignore markers live) stay.
     pub text: String,
+    /// 1-based line where the statement's content begins.
     pub line: u32,
 }
 
@@ -138,6 +142,8 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Split `sql` at top-level semicolons. Never fails: comment-only stretches yield nothing, and a
+/// trailing statement without a semicolon is still returned.
 pub fn split(sql: &str) -> Vec<RawStatement> {
     let mut c = Cursor::new(sql);
     let mut out = Vec::new();

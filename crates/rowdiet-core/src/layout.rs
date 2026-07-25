@@ -5,6 +5,8 @@
 //! varlena stored in long form, with varlena payload bytes excluded (payload size is unknowable
 //! from DDL and order-invariant; only headers, fixed data, and alignment padding are counted).
 
+/// The 64-bit PostgreSQL MAXALIGN: tuple headers, data starts, and footprints all round to
+/// 8-byte boundaries.
 pub const MAXALIGN: u64 = 8;
 const TUPLE_HEADER: u64 = 23;
 const PAGE_SIZE: u64 = 8192;
@@ -13,16 +15,22 @@ const LINE_POINTER: u64 = 4;
 const VARLENA_LONG_HEADER: u64 = 4;
 const VARLENA_SHORT_HEADER: u64 = 1;
 
+/// pg_type.typalign storage alignment class — the boundary a value's first byte must sit on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "lowercase"))]
 pub enum Align {
+    /// `c`: byte-aligned — never causes padding.
     Char,
+    /// `s`: 2-byte.
     Short,
+    /// `i`: 4-byte.
     Int,
+    /// `d`: 8-byte (= MAXALIGN on 64-bit).
     Double,
 }
 
 impl Align {
+    /// The alignment boundary in bytes: 1, 2, 4, or 8.
     pub fn bytes(self) -> u64 {
         match self {
             Self::Char => 1,
@@ -33,18 +41,34 @@ impl Align {
     }
 }
 
+/// A column's storage class — the only fact about a column the layout math consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum ColumnKind {
-    Fixed { len: u64, align: Align },
-    Varlena { align: Align, proven_short: bool },
+    /// Fixed-width type: always `len` bytes on disk.
+    Fixed {
+        /// pg_type.typlen, bytes.
+        len: u64,
+        /// Storage alignment.
+        align: Align,
+    },
+    /// Variable-length type, counted at header size only (payload bytes are unknowable from DDL).
+    Varlena {
+        /// Alignment of the long form; the short form never aligns.
+        align: Align,
+        /// The typmod proves every value fits the 1-byte-header short form (varchar(n)/char(n),
+        /// n ≤ 31): stored unaligned, one byte counted.
+        proven_short: bool,
+    },
 }
 
 impl ColumnKind {
+    /// True for [`ColumnKind::Fixed`] — a table of only fixed columns is what earns [`Tier::Exact`].
     pub fn is_fixed(&self) -> bool {
         matches!(self, Self::Fixed { .. })
     }
 
+    /// The declared alignment for either form (for a varlena it governs the long form only).
     pub fn align(&self) -> Align {
         match self {
             Self::Fixed { align, .. } | Self::Varlena { align, .. } => *align,
@@ -61,27 +85,39 @@ impl ColumnKind {
     }
 }
 
+/// Bytes to insert so `offset` lands on a multiple of `align`; 0 when it already does.
 pub fn pad(offset: u64, align: u64) -> u64 {
     (align - offset % align) % align
 }
 
+/// `n` rounded up to the next 8-byte boundary.
 pub fn maxalign(n: u64) -> u64 {
     n + pad(n, MAXALIGN)
 }
 
+/// One column's placement in a [`Walk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnWalk {
+    /// Padding inserted immediately before this column, bytes.
     pub pad_before: u64,
+    /// The column's data start, bytes from the beginning of the data area (t_hoff not included).
     pub offset: u64,
 }
 
+/// A column order laid out into offsets, under the module doc's canonical scenario.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
+    /// Placement per column, same order as the walked input.
     pub columns: Vec<ColumnWalk>,
+    /// Total inter-column padding: the sum of every `pad_before`. Trailing MAXALIGN rounding is
+    /// not part of it — that happens in [`footprint_at`].
     pub padding: u64,
+    /// Offset just past the last column's data: the data-area size before footprint rounding.
     pub scenario_end: u64,
 }
 
+/// Place `kinds` in the given order and total the padding (canonical scenario: every column
+/// non-NULL, varlenas at header size — 4 bytes aligned, or 1 byte unaligned when proven short).
 pub fn walk(kinds: &[ColumnKind]) -> Walk {
     let mut off = 0u64;
     let mut padding = 0u64;
@@ -123,6 +159,8 @@ pub fn footprint_at(t_hoff: u64, scenario_end_all_fixed: u64) -> u64 {
     maxalign(t_hoff + scenario_end_all_fixed)
 }
 
+/// Rows of this footprint per 8192-byte heap page, after the 24-byte page header and one 4-byte
+/// line pointer per row (fillfactor 100, no special space).
 pub fn rows_per_page(footprint: u64) -> u64 {
     (PAGE_SIZE - PAGE_HEADER) / (LINE_POINTER + footprint)
 }
@@ -277,10 +315,13 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
+    /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
+    /// At least one varlena: long-form-scenario numbers — bounds, not guarantees.
     Estimate,
 }
 
+/// The tier `kinds` report at: [`Tier::Exact`] iff every column is fixed-width.
 pub fn tier(kinds: &[ColumnKind]) -> Tier {
     if kinds.iter().all(ColumnKind::is_fixed) {
         Tier::Exact

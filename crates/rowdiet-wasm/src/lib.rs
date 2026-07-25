@@ -48,6 +48,9 @@ struct InputSource {
     sql: String,
 }
 
+/// Analyze input JSON (crate-doc schema) and return the output JSON. Total: every failure —
+/// malformed input, a bad assume spec — comes back as `{"error": "…"}`, never a panic, so the
+/// ABI needs no separate error channel.
 pub fn lint_json(input: &str) -> String {
     match lint(input) {
         Ok(output) => output,
@@ -108,6 +111,8 @@ fn parser_name() -> &'static str {
     }
 }
 
+/// Allocate a zero-filled `len`-byte input buffer for the host to write UTF-8 JSON into.
+/// [`rowdiet_lint`] does not consume it — release it with [`rowdiet_free`] and the same `len`.
 #[unsafe(no_mangle)]
 pub extern "C" fn rowdiet_alloc(len: usize) -> *mut u8 {
     Box::into_raw(vec![0u8; len].into_boxed_slice()).cast::<u8>()

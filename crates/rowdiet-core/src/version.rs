@@ -15,6 +15,8 @@ pub fn compare(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// The sortable key of a migration filename: rank (0 = versioned, 1 = not), numeric version
+/// segments, then the whole name as tie-breaker.
 pub fn sort_key(file_name: &str) -> (u8, Vec<u64>, String) {
     match parse_version(file_name) {
         Some(segments) => (0, segments, file_name.to_string()),

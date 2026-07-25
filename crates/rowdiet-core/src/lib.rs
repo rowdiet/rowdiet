@@ -40,15 +40,20 @@ pub use report::{Analysis, ColumnReport, OrderStats, TableReport};
 
 use std::collections::BTreeMap;
 
+/// Analysis configuration, shared by every entry point. `Config::default()` assumes nothing.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Storage assumptions for type names the analyzer cannot resolve from DDL (extension types).
     pub assume: BTreeMap<String, AssumedKind>,
 }
 
+/// One SQL input — typically a migration file. Callers pass sources already in apply order.
 #[derive(Debug, Clone)]
 pub struct SqlSource {
+    /// Where the SQL came from; appears verbatim in origins, reports, and notes (a path, for
+    /// file-based callers).
     pub name: String,
+    /// The complete SQL text — any number of statements; rowdiet splits it itself.
     pub sql: String,
 }
 
@@ -74,6 +79,7 @@ pub fn analyze_sources(sources: &[SqlSource], config: &Config) -> Analysis {
     analyze_sources_with(ParserBackend::Sqlparser, sources, config)
 }
 
+/// [`analyze_sources`] with an explicit parser backend.
 pub fn analyze_sources_with(backend: ParserBackend, sources: &[SqlSource], config: &Config) -> Analysis {
     let mut folder = fold::Folder::new(config.assume.clone());
     for source in sources {

@@ -8,37 +8,66 @@ use crate::extract::{DdlOp, RawColumn, RawName, Sniff};
 use crate::layout::ColumnKind;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Where a statement (or finding) came from — every table and note carries one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Origin {
+    /// The [`SqlSource::name`](crate::SqlSource::name) the statement was read from (a path, for
+    /// file-based callers).
     pub source: String,
+    /// 1-based line of the statement's first content byte; 0 for path-level notes (no line to
+    /// point at).
     pub line: u32,
 }
 
+/// Stable category tag of a [`Note`] — what renderers label and gates count on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum NoteKind {
+    /// A statement did not parse; a sniffed ALTER target is flagged incomplete, a sniffed
+    /// CREATE leaves its table unanalyzed.
     SkippedStatement,
+    /// ALTER/DROP of a table never created in the analyzed set (pre-existing schema?).
     AlterUnknownTable,
+    /// ALTER of a table whose CREATE was itself skipped — the alteration cannot be modeled either.
     AlterSkippedTable,
+    /// `CREATE TABLE AS SELECT`: column set unknown statically, table not analyzed.
     CtasSkipped,
+    /// The declared column list is not the whole table (LIKE / INHERITS / typed table / absent
+    /// partition parent).
     IncompleteColumns,
+    /// A column drop — every row written afterwards pays for a null bitmap sized by the original
+    /// column count.
     DroppedColumn,
+    /// A type resolved by the flagged (varlena, int-aligned) fallback; noted once per type name.
     UnknownType,
+    /// A CREATE (or a rename landing on an existing name) replaced a table's prior definition.
     Redefined,
+    /// A column name occurred twice: within one CREATE (Postgres rejects the statement) or via
+    /// ADD COLUMN of an existing column.
     DuplicateColumn,
+    /// An ALTER named a column the model does not have.
     UnknownColumn,
+    /// A DO-block finding: conditional table DDL, unanalyzable dynamic fragments, or a body that
+    /// could not be scanned.
     DoBlockDdl,
+    /// A `rowdiet:ignore` marker attached to no statement — it exempts nothing.
     UnusedIgnoreMarker,
+    /// A temporary table — session-lived, no storage debt, not analyzed.
     TempTableSkipped,
+    /// A scanned path matched no SQL files; see [`Note::empty_scan`].
     EmptyScan,
 }
 
+/// One analysis finding — the loud-degradation channel the module doc promises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Note {
+    /// The statement (or path) the finding points at.
     pub origin: Origin,
+    /// Category for renderers and gates.
     pub kind: NoteKind,
+    /// Ready-to-print explanation.
     pub detail: String,
 }
 
@@ -57,24 +86,40 @@ impl Note {
     }
 }
 
+/// A column after folding: resolved storage class plus the strings reports need.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoldedColumn {
+    /// Name as written in the DDL.
     pub display: String,
+    /// Case-folded name — the identity later ALTERs address.
     pub key: String,
+    /// The declared type's spelling, for reports (tracks `SET TYPE`).
     pub type_display: String,
+    /// Resolved storage class for the layout walk.
     pub kind: ColumnKind,
+    /// False when the type resolved by fallback ([`NoteKind::UnknownType`]).
     pub known_type: bool,
+    /// Declared or implied NOT NULL (explicit, PRIMARY KEY, identity, serial).
     pub not_null: bool,
 }
 
+/// One table's modeled state after the replay — what [`Folder::finish`] hands to reporting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoldedTable {
+    /// Name as written (tracks renames).
     pub display: String,
+    /// Fold key: case-folded, qualification kept — the identity ALTERs address and baselines
+    /// key on.
     pub key: String,
+    /// The statement that created the table (the latest CREATE when redefined).
     pub origin: Origin,
+    /// Statements that changed the table after creation (consecutive duplicates collapsed).
     pub altered_in: Vec<Origin>,
+    /// The creating statement carried `rowdiet:ignore` — listed, but exempt from gating.
     pub ignored: bool,
+    /// The model is known partial: skipped or unexpanded DDL touched this table.
     pub incomplete: bool,
+    /// Live columns in physical order.
     pub columns: Vec<FoldedColumn>,
     /// Columns dropped over the series. Postgres keeps dropped attributes (attisdropped), so
     /// every row written after the drop stores a NULL for each — the null bitmap is present
@@ -82,6 +127,8 @@ pub struct FoldedTable {
     pub dropped_count: usize,
 }
 
+/// The replay state machine: feed each statement through [`Self::apply`] (parsed) or
+/// [`Self::skipped`] (not), in version order, then [`Self::finish`].
 #[derive(Debug)]
 pub struct Folder {
     catalog: Catalog,
@@ -93,6 +140,7 @@ pub struct Folder {
 }
 
 impl Folder {
+    /// A folder with an empty model; `assume` seeds the type catalog's user layer.
     pub fn new(assume: BTreeMap<String, AssumedKind>) -> Self {
         Self {
             catalog: Catalog::new(assume),
@@ -104,6 +152,8 @@ impl Folder {
         }
     }
 
+    /// Fold one parsed statement's ops, in order. `ignore_marker` says the statement carried
+    /// `rowdiet:ignore` — a table it creates is marked ignored.
     pub fn apply(&mut self, ops: Vec<DdlOp>, origin: &Origin, ignore_marker: bool) {
         for op in ops {
             self.apply_one(op, origin, ignore_marker);
@@ -134,6 +184,8 @@ impl Folder {
         self.note(origin, NoteKind::SkippedStatement, detail);
     }
 
+    /// End the replay: surviving tables in creation order (a redefinition re-positions its
+    /// table), plus every note recorded.
     pub fn finish(self) -> (Vec<FoldedTable>, Vec<Note>) {
         let mut tables = self.tables;
         let list = self.order.iter().filter_map(|key| tables.remove(key)).collect();
@@ -455,6 +507,7 @@ impl Folder {
         false
     }
 
+    /// True if `key` (a fold key) currently names a modeled table.
     pub fn has_table(&self, key: &str) -> bool {
         self.tables.contains_key(key)
     }
@@ -469,10 +522,12 @@ impl Folder {
         self.note(origin, NoteKind::DoBlockDdl, detail);
     }
 
+    /// Record a [`NoteKind::DoBlockDdl`] note with caller-supplied detail.
     pub fn do_block_note(&mut self, origin: &Origin, detail: String) {
         self.note(origin, NoteKind::DoBlockDdl, detail);
     }
 
+    /// Note a `rowdiet:ignore` marker that ended up attached to no statement.
     pub fn unused_ignore_marker(&mut self, origin: &Origin) {
         self.note(
             origin,
@@ -483,6 +538,7 @@ impl Folder {
         );
     }
 
+    /// Note a temporary table that was not analyzed; `name` is its display spelling.
     pub fn temp_table_skipped(&mut self, name: &str, origin: &Origin) {
         self.note(
             origin,

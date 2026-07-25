@@ -8,13 +8,18 @@
 use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
 
+/// The complete result of one analysis run — what renderers, gates, and adapters consume.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Analysis {
+    /// One report per table, in creation order (ignored tables included and marked).
     pub tables: Vec<TableReport>,
+    /// Degradation and context notes, in encounter order.
     pub notes: Vec<Note>,
 }
 
+/// One table's full analysis: identity, provenance, per-column layout, current-vs-suggested
+/// numbers, and the avoidable-bytes headline the gate acts on.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TableReport {
@@ -24,18 +29,35 @@ pub struct TableReport {
     pub name: String,
     /// The name as written in the DDL (first backend-dependent spelling seen).
     pub display: String,
+    /// The statement that created the table.
     pub origin: Origin,
+    /// Statements that changed the table after creation (consecutive duplicates collapsed).
     pub altered_in: Vec<Origin>,
+    /// Exempted via `rowdiet:ignore` — listed, but outside gate and baseline.
     pub ignored: bool,
+    /// The model is known partial: skipped or unexpanded DDL touched this table.
     pub incomplete: bool,
+    /// How solid the numbers are; see [`Tier`].
     pub tier: Tier,
+    /// Live column count (dropped attribute slots are in `dropped_columns`).
     pub natts: usize,
+    /// Some column is nullable: real rows may then carry a null bitmap the canonical no-NULL
+    /// scenario does not count.
     pub any_nullable: bool,
+    /// Per-column detail, in current physical order, with offsets from the current walk.
     pub columns: Vec<ColumnReport>,
+    /// Numbers for the order as written.
     pub current: OrderStats,
+    /// Numbers for the suggested order; identical to `current` when nothing is avoidable.
     pub suggested: OrderStats,
+    /// Column names (display spelling) in suggested order; the original order when nothing is
+    /// avoidable.
     pub suggested_order: Vec<String>,
+    /// The headline number gates compare: footprint delta (exact tier) or scenario-padding
+    /// delta (estimate tier) between current and suggested order. 0 = reordering gains nothing.
     pub avoidable_bytes_per_row: u64,
+    /// Type spellings that resolved by assumption, sorted and deduplicated — the table's
+    /// numbers are only as good as those assumptions.
     pub assumed_types: Vec<String>,
     /// Columns dropped across the migration series. When nonzero, every NEW row still carries
     /// a null bitmap sized by the original attribute count (Postgres keeps dropped attribute
@@ -47,23 +69,37 @@ pub struct TableReport {
     pub layout_signature: String,
 }
 
+/// One column, as placed in the table's current physical order.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnReport {
+    /// Column name (display spelling).
     pub name: String,
+    /// Declared type as written.
     pub type_display: String,
+    /// Declared or implied NOT NULL.
     pub not_null: bool,
+    /// False when the type resolved by assumption (listed in [`TableReport::assumed_types`]).
     pub known_type: bool,
+    /// Resolved storage class.
     pub kind: ColumnKind,
+    /// Padding before this column in the current order, bytes.
     pub pad_before: u64,
+    /// Data start within the data area, bytes (tuple header not included).
     pub offset: u64,
 }
 
+/// Layout numbers for one column order — [`TableReport::current`] and
+/// [`TableReport::suggested`] each hold one.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct OrderStats {
+    /// Inter-column alignment padding, bytes per row (meaningful at both tiers).
     pub padding: u64,
+    /// Whole-row on-disk size, header included and MAXALIGN-rounded, bytes. None at the
+    /// estimate tier — varlena payloads make it unknowable.
     pub footprint: Option<u64>,
+    /// Rows of that footprint per 8 kB heap page. None at the estimate tier.
     pub rows_per_page: Option<u64>,
 }
 

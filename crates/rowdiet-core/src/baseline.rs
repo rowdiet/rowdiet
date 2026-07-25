@@ -14,6 +14,8 @@
 use crate::report::{Analysis, TableReport};
 use std::collections::BTreeMap;
 
+/// In-memory form of a baseline file (JSON on disk): the default gate plus per-table accepted
+/// debt. Built by [`build_from`], maintained by [`accept_tables`], consumed by [`evaluate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Baseline {
@@ -22,9 +24,12 @@ pub struct Baseline {
     pub rowdiet: String,
     /// Default gate for tables without an entry — i.e. for every table added after baselining.
     pub fail_over: u64,
+    /// Accepted-debt entries, keyed by the fold key ([`TableReport::name`]). The maintenance
+    /// ops record only tables over `fail_over` — within it, no allowance is needed.
     pub tables: BTreeMap<String, BaselineEntry>,
 }
 
+/// One table's accepted allowance, pinned to the layout it was accepted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BaselineEntry {
@@ -42,38 +47,49 @@ pub struct BaselineEntry {
     serde(tag = "verdict", rename_all = "snake_case")
 )]
 pub enum TableVerdict {
+    /// Within the applicable limit (allowance or `fail_over`), or no limit is in force.
     Pass,
     /// No baseline entry and avoidable exceeds `fail_over`.
     NewViolation {
+        /// Current avoidable bytes/row.
         avoidable: u64,
     },
     /// Entry applies (signature unchanged) but avoidable exceeds the allowance. With an
     /// unchanged layout the number can only move through hand-tightened entries or analyzer
     /// improvements — either way the recorded allowance is the contract.
     Regression {
+        /// Current avoidable bytes/row.
         avoidable: u64,
+        /// The baselined allowance in force.
         allowed: u64,
     },
     /// Columns were appended (old signature is a prefix of the current one) and the appended
     /// columns themselves pushed avoidable past the still-active allowance. Actionable while the
     /// appending migration is unapplied — reorder the new columns — or acceptable explicitly.
     GrownSinceBaseline {
+        /// Current avoidable bytes/row.
         avoidable: u64,
+        /// The baselined allowance in force.
         allowed: u64,
     },
     /// The layout changed in a non-append way, expiring the allowance, and the table does not
     /// meet `fail_over`. Re-accept deliberately or fix the layout in the rewriting migration.
     ModifiedSinceBaseline {
+        /// Current avoidable bytes/row.
         avoidable: u64,
     },
     /// Passing, and better than the allowance — the entry can be tightened (explicitly).
     RatchetOpportunity {
+        /// Current avoidable bytes/row.
         avoidable: u64,
+        /// The baselined allowance the table now beats.
         allowed: u64,
     },
 }
 
 impl TableVerdict {
+    /// True for the verdict kinds that fail the gate; [`Pass`](Self::Pass) and
+    /// [`RatchetOpportunity`](Self::RatchetOpportunity) do not.
     pub fn failing(self) -> bool {
         matches!(
             self,
@@ -85,9 +101,12 @@ impl TableVerdict {
     }
 }
 
+/// What [`evaluate`] concluded: the overall pass/fail plus everything a renderer needs to say why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GateOutcome {
+    /// The gate failed: some verdict is failing, or the analysis degraded under
+    /// `fail_on_degraded`. The CLI's exit-1 signal.
     pub exceeded: bool,
     /// Statements the parser skipped (loudly noted, but a gate that only counts avoidable
     /// bytes would stay green over them — these counts make the degradation visible to
@@ -245,6 +264,11 @@ pub fn build_from(analysis: &Analysis, fail_over: u64, version: &str) -> Baselin
 /// explicit, reviewable act of accepting one table's growth without touching the rest of the
 /// file. A named table now meeting the file's `fail_over` has its entry pruned instead
 /// (baselines list only debt).
+///
+/// # Errors
+///
+/// When a name (fold key or display spelling) matches no non-ignored analyzed table. Names
+/// processed before the failing one have already been applied — persist the baseline only on Ok.
 pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[String]) -> Result<(), String> {
     for name in names {
         let table = analysis

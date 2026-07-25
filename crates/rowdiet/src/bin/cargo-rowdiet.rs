@@ -1,3 +1,6 @@
+//! The `cargo-rowdiet` shim behind `cargo rowdiet ...`: drops the subcommand argument cargo
+//! inserts, then runs the same CLI as the `rowdiet` binary.
+
 use std::process::ExitCode;
 
 fn main() -> ExitCode {

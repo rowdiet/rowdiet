@@ -11,22 +11,46 @@ use std::collections::BTreeMap;
 /// typmod (varchar(n)/char(n)) and array dimensionality.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
+    /// Normalized lookup key: unquoted names lowercased, qualification stripped to the last
+    /// component (the catalog is unqualified).
     pub key: String,
+    /// The full spelling as written, for reports.
     pub display: String,
+    /// Declared character count of `varchar(n)`/`char(n)`; None when unlimited or not a
+    /// character type. n ≤ 31 proves short-form storage.
     pub char_len: Option<u64>,
+    /// `[]` depth as written (0 = scalar); any nonzero value resolves as one array varlena —
+    /// Postgres arrays share a single representation regardless of declared dimensionality.
     pub dims: u8,
 }
 
+/// User-supplied storage assumption for a type name the DDL cannot resolve — the value side of
+/// [`Config::assume`](crate::Config) and of the CLI's `--assume-type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssumedKind {
-    Fixed { len: u64, align: Align },
-    Varlena { align: Align },
+    /// Fixed-width: always `len` bytes at `align`.
+    Fixed {
+        /// Size in bytes; [`parse_assume_spec`] enforces 1..=32767 (pg_type.typlen's int2 range).
+        len: u64,
+        /// Storage alignment.
+        align: Align,
+    },
+    /// Variable-length, counted at long-form header size.
+    Varlena {
+        /// Alignment of the long form.
+        align: Align,
+    },
 }
 
+/// A catalog answer: what a [`TypeRef`] means for layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolved {
+    /// Storage class for the layout walk.
     pub kind: ColumnKind,
+    /// False when the class is a guess (unresolvable name, shell type, range over an unknown
+    /// subtype) — the fold notes it once and reports the column as assumed.
     pub known: bool,
+    /// True only for serial pseudo-types: the column is NOT NULL without any constraint.
     pub implicit_not_null: bool,
 }
 
@@ -36,6 +60,8 @@ struct SessionEntry {
     known: bool,
 }
 
+/// The resolver for one analysis run. Lookup layers, first hit wins: session-defined types
+/// (replayed `CREATE TYPE` DDL), then user assumptions, then the vendored built-in table.
 #[derive(Debug)]
 pub struct Catalog {
     assume: BTreeMap<String, AssumedKind>,
@@ -43,6 +69,7 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// A catalog with no session-defined types yet; `assume` seeds the user layer.
     pub fn new(assume: BTreeMap<String, AssumedKind>) -> Self {
         Self {
             assume,
@@ -108,6 +135,8 @@ impl Catalog {
         self.session.insert(key, SessionEntry { kind, known: false });
     }
 
+    /// `DROP TYPE`: forgets a session definition. Names not session-defined (assumed or
+    /// built-in) are unaffected.
     pub fn drop_type(&mut self, key: &str) {
         self.session.remove(key);
     }
@@ -120,6 +149,9 @@ impl Catalog {
         }
     }
 
+    /// Resolve a reference to its storage class; total — an unresolvable name yields the flagged
+    /// default (see the module doc), never an error. Arrays are varlena, d-aligned iff the
+    /// element type is, and `known` tracks the element.
     pub fn resolve(&self, t: &TypeRef) -> Resolved {
         if t.dims > 0 {
             let elem = self.resolve_scalar(&t.key, None);

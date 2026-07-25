@@ -13,6 +13,10 @@ mod tests;
 /// skipped (the explicitly passed root is exempt — only entries found during the walk are
 /// filtered); symlinked directories are not entered, so a link cycle cannot duplicate files
 /// (a symlinked `*.sql` file is still collected and read through the link).
+///
+/// # Errors
+///
+/// Any [`std::fs::read_dir`] / metadata failure during the walk, unchanged.
 pub fn collect_sql_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
@@ -48,6 +52,12 @@ fn file_name(path: &Path) -> &str {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("")
 }
 
+/// Read one file into a [`SqlSource`] named by the path as given. Bytes are decoded lossily
+/// (invalid UTF-8 becomes U+FFFD), so encoding damage cannot abort an analysis.
+///
+/// # Errors
+///
+/// The underlying [`std::fs::read`] failure, unchanged.
 pub fn read_source(path: &Path) -> io::Result<SqlSource> {
     let bytes = std::fs::read(path)?;
     Ok(SqlSource {
@@ -59,10 +69,20 @@ pub fn read_source(path: &Path) -> io::Result<SqlSource> {
 /// The five-line CI guard: point it at a migrations directory (e.g. in a `#[test]` or right
 /// before the migration runner) and gate on the result. Uses the default parser backend; use
 /// [`analyze_dir_with`] to pick one.
+///
+/// # Errors
+///
+/// Directory walk and file read failures only — statements that fail to parse are notes in the
+/// analysis, never errors.
 pub fn analyze_dir(dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
     analyze_dir_with(crate::ParserBackend::Sqlparser, dir, config)
 }
 
+/// [`analyze_dir`] with an explicit parser backend.
+///
+/// # Errors
+///
+/// Same as [`analyze_dir`]: walk and read failures only.
 pub fn analyze_dir_with(backend: crate::ParserBackend, dir: impl AsRef<Path>, config: &Config) -> io::Result<Analysis> {
     let dir = dir.as_ref();
     let mut sources = Vec::new();

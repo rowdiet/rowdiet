@@ -8,27 +8,46 @@ use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::ops::Range;
 
+/// An object name as parsed: display spelling plus normalized identity key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawName {
+    /// As written in the DDL (rendering is backend-dependent).
     pub display: String,
+    /// Identity: unquoted parts case-folded. Tables keep their qualification (`a.things`);
+    /// type names are keyed by their last component.
     pub key: String,
 }
 
+/// One column definition as parsed from `CREATE TABLE` / `ADD COLUMN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawColumn {
+    /// Column name as written.
     pub display: String,
+    /// Case-folded column identity within its table.
     pub key: String,
+    /// The declared type, ready for catalog resolution.
     pub type_ref: TypeRef,
+    /// The definition itself forces NOT NULL: explicit constraint, PRIMARY KEY, or identity.
     pub not_null: bool,
 }
 
+/// One layout-relevant DDL effect, dialect- and backend-neutral: both parser backends emit this
+/// vocabulary and everything downstream consumes only it. A multi-command `ALTER TABLE` becomes
+/// several ops.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlOp {
+    /// `CREATE TABLE`, all forms — plain, `AS SELECT`, `PARTITION OF`, temporary.
     CreateTable {
+        /// The table being created.
         name: RawName,
+        /// Column definitions in declared (= physical) order.
         columns: Vec<RawColumn>,
+        /// Column keys named by a table-level `PRIMARY KEY` constraint — folded as NOT NULL.
         pk_columns: Vec<String>,
+        /// `IF NOT EXISTS`: re-creating a known table folds as a no-op, not a redefinition.
         if_not_exists: bool,
+        /// `CREATE TABLE AS SELECT` — the column set is unknown statically; the fold skips the
+        /// table loudly.
         is_ctas: bool,
         /// LIKE / INHERITS / typed table — declared columns are not the whole story.
         incomplete_columns: bool,
@@ -37,66 +56,124 @@ pub enum DdlOp {
         /// `PARTITION OF parent`: the child's physical layout is the parent's, verbatim.
         partition_of: Option<RawName>,
     },
+    /// `ALTER TABLE .. ADD COLUMN` — appends to the physical order, as Postgres does.
     AddColumn {
+        /// Target table.
         table: RawName,
+        /// The appended column.
         column: RawColumn,
+        /// `IF NOT EXISTS`: adding an existing column folds as a no-op, not a duplicate-column
+        /// note.
         if_not_exists: bool,
     },
+    /// `ALTER TABLE .. DROP COLUMN` — the fold removes the columns but keeps counting the
+    /// dropped attribute slots (null-bitmap cost).
     DropColumns {
+        /// Target table.
         table: RawName,
+        /// Keys of the columns to drop.
         columns: Vec<String>,
+        /// `IF EXISTS`: dropping an absent column folds as a no-op, not an unknown-column note.
         if_exists: bool,
     },
+    /// `ALTER TABLE .. RENAME COLUMN` — layout-inert; tracked so reports name columns as the
+    /// DDL now does.
     RenameColumn {
+        /// Target table.
         table: RawName,
+        /// Current column key.
         old: String,
+        /// New name (becomes both key and display).
         new: String,
     },
+    /// `ALTER TABLE .. RENAME TO` — moves the model entry; a rename onto an existing table is
+    /// noted as a redefinition.
     RenameTable {
+        /// Target table.
         table: RawName,
+        /// The new table name.
         new: RawName,
     },
+    /// `ALTER TABLE .. ALTER COLUMN .. TYPE` — re-resolves the column's storage class in place
+    /// (position unchanged, as in Postgres).
     SetColumnType {
+        /// Target table.
         table: RawName,
+        /// Key of the altered column.
         column: String,
+        /// The new type.
         type_ref: TypeRef,
     },
+    /// `SET NOT NULL` / `DROP NOT NULL`; also the per-column effect of `ADD PRIMARY KEY`.
     SetNotNull {
+        /// Target table.
         table: RawName,
+        /// Key of the altered column.
         column: String,
+        /// The new nullability: true for SET, false for DROP.
         value: bool,
     },
+    /// `DROP TABLE` — removes tables from the model.
     DropTables {
+        /// Tables to drop.
         names: Vec<RawName>,
+        /// `IF EXISTS`: dropping an unknown table folds as a no-op, not a note.
         if_exists: bool,
     },
+    /// `CREATE TYPE .. AS ENUM` — a fixed 4-byte, int-aligned type.
     CreateEnum {
+        /// The type (keyed unqualified).
         name: RawName,
     },
+    /// `CREATE TYPE .. AS (..)` — columns of a composite type are varlena, double-aligned.
     CreateComposite {
+        /// The type (keyed unqualified).
         name: RawName,
     },
+    /// `CREATE TYPE .. AS RANGE` — varlena; alignment follows the subtype.
     CreateRange {
+        /// The type (keyed unqualified).
         name: RawName,
+        /// The `SUBTYPE =` option; None keeps the range int-aligned and flagged as assumed.
         subtype: Option<TypeRef>,
     },
+    /// Base or shell `CREATE TYPE` — storage options are not evaluated; resolves flagged, with
+    /// the sound default.
     CreateBase {
+        /// The type (keyed unqualified).
         name: RawName,
     },
+    /// `CREATE DOMAIN .. AS base` — storage inherited from the base type verbatim.
     CreateDomain {
+        /// The domain (keyed unqualified).
         name: RawName,
+        /// The domain's base type.
         base: TypeRef,
     },
+    /// `DROP TYPE` / `DROP DOMAIN` — forgets session type definitions.
     DropTypes {
+        /// Types to drop (keyed unqualified).
         names: Vec<RawName>,
     },
+    /// `ALTER TYPE .. RENAME TO` — moves a session type definition.
     RenameType {
+        /// Current type name.
         name: RawName,
+        /// New type name.
         new: RawName,
     },
+    /// Parsed fine, no layout consequence (indexes, grants, DML, …) — folds as a no-op.
     Irrelevant,
 }
 
+/// One statement's text → its [`DdlOp`]s, via sqlparser's Postgres dialect. Feed
+/// [`preprocess`]ed text, as the analysis loop does — sqlparser 0.62 rejects
+/// `CREATE UNLOGGED TABLE` otherwise.
+///
+/// # Errors
+///
+/// The parse error message when sqlparser cannot parse `text`; the analysis loop surfaces it as
+/// a [`NoteKind::SkippedStatement`](crate::fold::NoteKind::SkippedStatement) note.
 pub fn extract(text: &str) -> Result<Vec<DdlOp>, String> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, text).map_err(|e| e.to_string())?;
     Ok(statements.into_iter().flat_map(map_statement).collect())
@@ -504,9 +581,12 @@ fn word_spans(text: &str, n: usize) -> Vec<Range<usize>> {
     spans
 }
 
+/// What [`sniff`] recognized: the fold key of the table an unparseable statement targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sniff {
+    /// The statement creates this table — it stays unanalyzed (a ghost).
     CreateTable(String),
+    /// The statement alters this table — the table is flagged incomplete.
     AlterTable(String),
 }
 

@@ -1,5 +1,6 @@
 //! rowdiet CLI implementation, shared by the `rowdiet` binary and the `cargo-rowdiet`
-//! cargo-subcommand shim (`cargo rowdiet ...`).
+//! cargo-subcommand shim (`cargo rowdiet ...`). Not a library API — programmatic users
+//! (embedding the analysis, writing adapters) want [`rowdiet_core`] instead.
 
 mod render;
 
@@ -76,6 +77,9 @@ fn backend(choice: ParserChoice) -> Result<ParserBackend, String> {
     }
 }
 
+/// Run the CLI on `args` (argv\[0\] included, as from [`std::env::args`]). Exit code 0: clean
+/// pass (baseline maintenance exits 0 without gating); 1: the gate failed; 2: setup errors
+/// (bad paths, bad specs, bad baseline JSON). Invalid flags exit the process from inside clap.
 pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let cli = Cli::parse_from(args);
     match run(&cli) {
