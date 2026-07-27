@@ -131,7 +131,14 @@ fn migrations_are_byte_packed() {
 policies that must not drift from `baseline::evaluate`'s filter.
 
 The notes assertion matters: a gate that only counts avoidable bytes stays green over statements
-the parser could not read.
+the parser could not read. Pointing at a directory with no SQL is itself a note — `analyze_dir`
+records an `empty_scan` — so the `notes.is_empty()` check above also catches a mistyped path or a
+glob that matched nothing. If you narrow that check to specific note kinds, keep `EmptyScan` in the
+set, or an empty scan slips through silently.
+
+Discover the directories to scan rather than hardcoding them: a fixed list cannot flag a *new*
+`crates/<name>/migrations` that nobody added to it — rowdiet only sees the paths you pass it. Glob
+the directories, assert the discovered set is non-empty, then analyze each.
 
 Flyway users: run the CLI on the migrations directory in CI (Flyway has no non-JVM callback
 surface; a Java callback can shell out to `rowdiet` if you want runtime coupling).
