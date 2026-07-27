@@ -174,6 +174,16 @@ The gate also carries degradation: counts of skipped statements and incomplete t
 the outcome (a bytes-only gate would stay green over an unparseable migration set), and
 `fail_on_degraded` turns them into a failure — off by default so sqlparser users are not
 punished for known parser gaps, cheap to enable under pg-exact where skips should be zero.
+The degradation set is deliberately narrow: a skipped statement (a table that should be gated
+went unparsed), an incomplete table (columns only partly known), or an empty scan (a path
+matched no SQL). Notes for constructs rowdiet structurally does not gate stay loud but are not
+degradation — a `CREATE TABLE AS SELECT` (columns come from the query, so the table is a ghost,
+never gated), a temp table (no persistent storage), a dropped column (bitmap cost is modeled),
+an assumed type (a separate honesty axis), or dynamic DDL in a `DO` body. Nothing that should be
+gated passes green silently; a consumer wanting any of those to fail asserts on the specific note
+kind, and `Analysis::degraded()` exposes the same set to library adopters. The membership lives
+in one wildcard-free `NoteKind::is_degradation` match, so adding a note kind is a compile error
+until it is classified — the catch-all cannot silently miss a future kind.
 Reports and baselines key on the fold key (lowercased unless quoted), which is identical across
 parser backends; the as-written spelling is carried separately as `display`. Verdicts per
 non-ignored table: `pass`, `new_violation` (no entry, over fail-over),
