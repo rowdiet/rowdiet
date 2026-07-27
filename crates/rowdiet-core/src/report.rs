@@ -5,7 +5,7 @@
 //! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get long-form-scenario
 //! numbers, labeled as estimates and never claimed as guaranteed savings.
 
-use crate::fold::{FoldedTable, Note, NoteKind, Origin};
+use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
 
 /// The complete result of one analysis run — what renderers, gates, and adapters consume.
@@ -48,10 +48,7 @@ impl Analysis {
     /// but it also silently misses any degradation kind a later release adds, which this method,
     /// kept current by rowdiet, does not.
     pub fn degraded(&self) -> bool {
-        self.notes
-            .iter()
-            .any(|note| matches!(note.kind, NoteKind::SkippedStatement | NoteKind::EmptyScan))
-            || self.gated_tables().any(|table| table.incomplete)
+        self.notes.iter().any(|note| note.kind.is_degradation()) || self.gated_tables().any(|table| table.incomplete)
     }
 }
 

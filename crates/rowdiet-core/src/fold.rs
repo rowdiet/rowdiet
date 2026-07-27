@@ -72,6 +72,35 @@ pub enum NoteKind {
     EmptyScan,
 }
 
+impl NoteKind {
+    /// Whether a note of this kind means the analysis is degraded — the analyzer could not fully
+    /// account for the input — feeding [`Analysis::degraded`](crate::Analysis::degraded) and the
+    /// gate's `--fail-on-degraded`. Incomplete *tables* are tracked by the `incomplete` flag, not
+    /// here, so kinds that only mark a table incomplete resolve `false`.
+    ///
+    /// The match is deliberately WILDCARD-FREE: adding a `NoteKind` must break compilation here so
+    /// the new kind gets a keep/drop decision — a `_ =>` arm would swallow it silently and dissolve
+    /// the exact enumeration guarantee this exists to provide. The membership is today's shipped
+    /// `--fail-on-degraded` set; growing it is a deliberate behavior change, not a convenience edit.
+    pub fn is_degradation(self) -> bool {
+        match self {
+            Self::SkippedStatement | Self::EmptyScan => true,
+            Self::AlterUnknownTable
+            | Self::AlterSkippedTable
+            | Self::CtasSkipped
+            | Self::IncompleteColumns
+            | Self::DroppedColumn
+            | Self::UnknownType
+            | Self::Redefined
+            | Self::DuplicateColumn
+            | Self::UnknownColumn
+            | Self::DoBlockDdl
+            | Self::UnusedIgnoreMarker
+            | Self::TempTableSkipped => false,
+        }
+    }
+}
+
 /// The kind's stable tag — the same word the serde representation carries
 /// (`skipped_statement`, `empty_scan`, …), so logs and JSON name note kinds identically.
 /// Renderers may still label kinds with their own shorter vocabulary.

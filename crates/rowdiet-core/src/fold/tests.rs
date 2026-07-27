@@ -227,6 +227,31 @@ fn origin_display_keeps_the_line_zero_convention() {
     assert_eq!(path_level.to_string(), "migrations");
 }
 
+#[test]
+fn degradation_membership_is_the_shipped_set() {
+    // Pins today's --fail-on-degraded membership so a flipped classification surfaces as a
+    // deliberate test change; a newly added NoteKind is caught by the wildcard-free match itself.
+    for kind in [NoteKind::SkippedStatement, NoteKind::EmptyScan] {
+        assert!(kind.is_degradation(), "{kind}");
+    }
+    for kind in [
+        NoteKind::AlterUnknownTable,
+        NoteKind::AlterSkippedTable,
+        NoteKind::CtasSkipped,
+        NoteKind::IncompleteColumns,
+        NoteKind::DroppedColumn,
+        NoteKind::UnknownType,
+        NoteKind::Redefined,
+        NoteKind::DuplicateColumn,
+        NoteKind::UnknownColumn,
+        NoteKind::DoBlockDdl,
+        NoteKind::UnusedIgnoreMarker,
+        NoteKind::TempTableSkipped,
+    ] {
+        assert!(!kind.is_degradation(), "{kind}");
+    }
+}
+
 // Display promises the serde tag vocabulary; a divergence would let logs and JSON name the
 // same kind differently.
 #[cfg(feature = "serde")]
