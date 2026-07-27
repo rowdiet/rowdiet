@@ -256,6 +256,27 @@ fn outcome_degraded_mirrors_the_fail_on_degraded_condition() {
     assert!(strict.exceeded, "fail_on_degraded escalates exactly degraded()");
 }
 
+#[test]
+fn analysis_degraded_agrees_with_gate_outcome() {
+    // The Analysis-level twin must never diverge from the gate's own degraded() — across a clean
+    // run, an empty scan (note-driven), and an incomplete table (flag-driven).
+    let clean = analysis(WASTEFUL);
+    assert!(!clean.degraded());
+    let mut empty = analysis(WASTEFUL);
+    empty.notes.push(crate::fold::Note::empty_scan("migrations"));
+    assert!(empty.degraded(), "an empty scan is degradation");
+    let incomplete = analysis("CREATE TABLE t (a int NOT NULL, a bigint NOT NULL);");
+    assert!(incomplete.degraded(), "a duplicate-column table is left incomplete");
+    for a in [&clean, &empty, &incomplete] {
+        assert_eq!(
+            a.degraded(),
+            evaluate(a, Some(100), false, None).degraded(),
+            "{:#?}",
+            a.notes
+        );
+    }
+}
+
 // Display promises the serde `verdict` tag; a divergence would let logs and JSON name the
 // same verdict differently.
 #[cfg(feature = "serde")]

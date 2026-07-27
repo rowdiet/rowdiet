@@ -5,7 +5,7 @@
 //! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get long-form-scenario
 //! numbers, labeled as estimates and never claimed as guaranteed savings.
 
-use crate::fold::{FoldedTable, Note, Origin};
+use crate::fold::{FoldedTable, Note, NoteKind, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
 
 /// The complete result of one analysis run — what renderers, gates, and adapters consume.
@@ -36,6 +36,22 @@ impl Analysis {
             .map(|table| table.avoidable_bytes_per_row)
             .max()
             .unwrap_or(0)
+    }
+
+    /// True when the analysis is degraded in a way rowdiet recognizes: a statement was skipped, a
+    /// gated table is incomplete, or a scanned path held no SQL. The analysis-level twin of
+    /// [`GateOutcome::degraded`](crate::baseline::GateOutcome::degraded), which it always agrees
+    /// with (pinned by a test).
+    ///
+    /// Reach for this as a backstop *beside* explicit per-note-kind checks, not instead of them:
+    /// an explicit filter names the failing class in its panic message, which a boolean cannot —
+    /// but it also silently misses any degradation kind a later release adds, which this method,
+    /// kept current by rowdiet, does not.
+    pub fn degraded(&self) -> bool {
+        self.notes
+            .iter()
+            .any(|note| matches!(note.kind, NoteKind::SkippedStatement | NoteKind::EmptyScan))
+            || self.gated_tables().any(|table| table.incomplete)
     }
 }
 
