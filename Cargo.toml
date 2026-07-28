@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/rowdiet-core", "crates/rowdiet", "crates/rowdiet-wasm"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 # Verified by the msrv job in ci.yml; the floor comes from the dependency tree (edition 2024
 # alone would allow 1.85).
@@ -22,7 +22,7 @@ codegen-units = 1
 strip = true
 
 [workspace.dependencies]
-rowdiet-core = { path = "crates/rowdiet-core", version = "0.1.2", default-features = false }
+rowdiet-core = { path = "crates/rowdiet-core", version = "0.1.3", default-features = false }
 sqlparser = "0.62"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
