@@ -373,6 +373,10 @@ pub enum Tier {
     Exact,
     /// At least one varlena: long-form-scenario numbers — bounds, not guarantees.
     Estimate,
+    /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
+    /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`
+    /// — an empty but complete table is still [`Exact`](Self::Exact).
+    Unknown,
 }
 
 /// The tier's stable tag — the same word the serde representation carries (`exact`,
@@ -383,6 +387,7 @@ impl std::fmt::Display for Tier {
         let tag = match self {
             Self::Exact => "exact",
             Self::Estimate => "estimate",
+            Self::Unknown => "unknown",
         };
         f.write_str(tag)
     }

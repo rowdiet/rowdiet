@@ -285,6 +285,7 @@ fn verdict_display_matches_serde_tag() {
     // Every variant — extend when the enum grows.
     let all = [
         TableVerdict::Pass,
+        TableVerdict::Incomplete,
         TableVerdict::NewViolation { avoidable: 1 },
         TableVerdict::Regression {
             avoidable: 2,

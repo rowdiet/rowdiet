@@ -88,7 +88,8 @@ pub struct TableReport {
     /// avoidable.
     pub suggested_order: Vec<String>,
     /// The headline number gates compare: footprint delta (exact tier) or scenario-padding
-    /// delta (estimate tier) between current and suggested order. 0 = reordering gains nothing.
+    /// delta (estimate tier) between current and suggested order. 0 = reordering gains nothing,
+    /// or the table is incomplete (unknown tier), where no waste can be claimed.
     pub avoidable_bytes_per_row: u64,
     /// Type spellings that resolved by assumption, sorted and deduplicated — the table's
     /// numbers are only as good as those assumptions.
@@ -130,16 +131,23 @@ pub struct ColumnReport {
 pub struct OrderStats {
     /// Inter-column alignment padding, bytes per row (meaningful at both tiers).
     pub padding: u64,
-    /// Whole-row on-disk size, header included and MAXALIGN-rounded, bytes. None at the
-    /// estimate tier — varlena payloads make it unknowable.
+    /// Whole-row on-disk size, header included and MAXALIGN-rounded, bytes. None at the estimate
+    /// tier (varlena payloads make it unknowable) and the unknown tier (columns not fully known).
     pub footprint: Option<u64>,
-    /// Rows of that footprint per 8 kB heap page. None at the estimate tier.
+    /// Rows of that footprint per 8 kB heap page. None at the estimate and unknown tiers.
     pub rows_per_page: Option<u64>,
 }
 
 pub(crate) fn build(table: FoldedTable) -> TableReport {
     let kinds: Vec<ColumnKind> = table.columns.iter().map(|c| c.kind).collect();
-    let tier = layout::tier(&kinds);
+    // An incomplete table's columns are not the whole table, so no footprint can be claimed —
+    // scoring the partial (or empty) column list as if it were complete is how a table nobody
+    // could model would otherwise report a confident `exact`/`pass`.
+    let tier = if table.incomplete {
+        Tier::Unknown
+    } else {
+        layout::tier(&kinds)
+    };
     // Dropped attributes are stored as NULL in every subsequent row, so the bitmap (sized by
     // the ORIGINAL natts) is unconditionally present; the all-non-NULL scenario otherwise
     // starts data at MAXALIGN(23) = 24.
@@ -164,6 +172,9 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             .unwrap_or(0)
             .saturating_sub(suggested.footprint.unwrap_or(0)),
         Tier::Estimate => current.padding.saturating_sub(suggested.padding),
+        // Columns unknown: no avoidable waste can be claimed. The incomplete verdict, not a
+        // fabricated byte count, carries the "not analyzed" signal.
+        Tier::Unknown => 0,
     };
     // With nothing avoidable the suggestion IS the current order; the stats must say the same
     // thing, or the JSON contradicts itself (suggested.padding 0 beside the original order).
@@ -257,6 +268,13 @@ fn stats(tier: Tier, walk: &Walk, t_hoff: u64) -> OrderStats {
             }
         }
         Tier::Estimate => OrderStats {
+            padding: walk.padding,
+            footprint: None,
+            rows_per_page: None,
+        },
+        // Unknown columns: the padding of the partial walk is not the table's, and no footprint
+        // exists to report.
+        Tier::Unknown => OrderStats {
             padding: walk.padding,
             footprint: None,
             rows_per_page: None,

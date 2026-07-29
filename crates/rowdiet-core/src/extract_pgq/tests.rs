@@ -219,11 +219,11 @@ fn sqlparser_gaps_parse_natively_here() {
     }
     match one("CREATE TABLE t2 (LIKE t1 INCLUDING ALL)") {
         DdlOp::CreateTable {
-            incomplete_columns,
-            columns,
-            ..
+            like_source, columns, ..
         } => {
-            assert!(incomplete_columns);
+            // The source name is captured (so the fold can expand it); INCLUDING options are
+            // layout-inert and dropped.
+            assert_eq!(like_source.unwrap().key, "t1");
             assert!(columns.is_empty());
         }
         other => panic!("{other:?}"),

@@ -96,6 +96,7 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
         || (cs.partbound.is_some() && partition_of.is_none());
     let mut columns = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
+    let mut like_source = None;
     for elt in cs.table_elts.iter().chain(cs.constraints.iter()) {
         match elt.node.as_ref() {
             // A ColumnDef without a type is not a column: on a partition child the grammar
@@ -110,7 +111,7 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
                 }
             }
             Some(NodeEnum::Constraint(c)) => pk_columns.extend(pk_keys(c)),
-            Some(NodeEnum::TableLikeClause(_)) => incomplete_columns = true,
+            Some(NodeEnum::TableLikeClause(tlc)) => like_source = tlc.relation.as_ref().map(rangevar_name),
             _ => {}
         }
     }
@@ -123,6 +124,7 @@ fn map_create_table(cs: &pb::CreateStmt) -> DdlOp {
         incomplete_columns,
         temporary: cs.relation.as_ref().is_some_and(|rv| rv.relpersistence == "t"),
         partition_of,
+        like_source,
     }
 }
 
@@ -315,6 +317,7 @@ fn map_ctas(ctas: &pb::CreateTableAsStmt) -> Vec<DdlOp> {
             incomplete_columns: false,
             temporary: rv.relpersistence == "t",
             partition_of: None,
+            like_source: None,
         }],
         None => vec![DdlOp::Irrelevant],
     }

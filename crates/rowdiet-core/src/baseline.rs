@@ -49,6 +49,10 @@ pub struct BaselineEntry {
 pub enum TableVerdict {
     /// Within the applicable limit (allowance or `fail_over`), or no limit is in force.
     Pass,
+    /// The table could not be fully modeled (an unexpanded LIKE/INHERITS/typed table): no
+    /// avoidable-bytes judgment is possible, so it is neither a pass nor a violation. Non-failing
+    /// on its own; `--fail-on-degraded` escalates it like any other incomplete table.
+    Incomplete,
     /// No baseline entry and avoidable exceeds `fail_over`.
     NewViolation {
         /// Current avoidable bytes/row.
@@ -108,6 +112,7 @@ impl std::fmt::Display for TableVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tag = match self {
             Self::Pass => "pass",
+            Self::Incomplete => "incomplete",
             Self::NewViolation { .. } => "new_violation",
             Self::Regression { .. } => "regression",
             Self::GrownSinceBaseline { .. } => "grown_since_baseline",
@@ -217,6 +222,12 @@ fn table_verdict(
     entry: Option<&BaselineEntry>,
     default_limit: Option<u64>,
 ) -> (TableVerdict, bool) {
+    // A table nobody could fully model has no avoidable-bytes judgment to make — it is not a
+    // pass (the false negative this guards against) and not a violation. `--fail-on-degraded`
+    // escalates it via the incomplete-tables count, same as before.
+    if table.incomplete {
+        return (TableVerdict::Incomplete, false);
+    }
     let avoidable = table.avoidable_bytes_per_row;
     let over_limit = |limit: Option<u64>| limit.is_some_and(|l| avoidable > l);
     let Some(entry) = entry else {

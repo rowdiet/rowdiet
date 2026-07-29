@@ -270,6 +270,7 @@ impl Folder {
                 incomplete_columns,
                 temporary,
                 partition_of,
+                like_source,
             } => {
                 if temporary {
                     self.temp_table_skipped(&name.display, origin);
@@ -282,6 +283,7 @@ impl Folder {
                         is_ctas,
                         incomplete_columns,
                         partition_of,
+                        like_source,
                         origin,
                         ignore_marker,
                     );
@@ -331,6 +333,7 @@ impl Folder {
         is_ctas: bool,
         incomplete_columns: bool,
         partition_of: Option<RawName>,
+        like_source: Option<RawName>,
         origin: &Origin,
         ignore_marker: bool,
     ) {
@@ -382,6 +385,35 @@ impl Folder {
                     self.note(origin, NoteKind::IncompleteColumns, detail);
                     incomplete = true;
                 }
+            }
+        } else if let Some(source) = &like_source {
+            // Plain `(LIKE source)` reproduces the source's column names, types, and NOT-NULL, so
+            // the copy's physical layout is the source's — expand it when the source is a known
+            // table and nothing was declared alongside the LIKE. A LIKE mixed with explicit
+            // columns loses its positional order across backends, so it stays incomplete.
+            if columns.is_empty() {
+                match self.tables.get(&source.key) {
+                    Some(src) => {
+                        inherited.clone_from(&src.columns);
+                        inherited_dropped = src.dropped_count;
+                        incomplete = incomplete || src.incomplete;
+                    }
+                    None => {
+                        let detail = format!(
+                            "table {}: LIKE {} — source not in the analyzed set, columns not expanded",
+                            name.display, source.display
+                        );
+                        self.note(origin, NoteKind::IncompleteColumns, detail);
+                        incomplete = true;
+                    }
+                }
+            } else {
+                let detail = format!(
+                    "table {}: LIKE {} combined with explicit columns — not expanded",
+                    name.display, source.display
+                );
+                self.note(origin, NoteKind::IncompleteColumns, detail);
+                incomplete = true;
             }
         }
         let mut table = FoldedTable {

@@ -49,12 +49,17 @@ pub enum DdlOp {
         /// `CREATE TABLE AS SELECT` — the column set is unknown statically; the fold skips the
         /// table loudly.
         is_ctas: bool,
-        /// LIKE / INHERITS / typed table — declared columns are not the whole story.
+        /// INHERITS / typed table — declared columns are not the whole story. LIKE is carried
+        /// separately in `like_source`, since a same-run source can be expanded.
         incomplete_columns: bool,
         /// CREATE TEMPORARY TABLE — session-lived, excluded from analysis.
         temporary: bool,
         /// `PARTITION OF parent`: the child's physical layout is the parent's, verbatim.
         partition_of: Option<RawName>,
+        /// `(LIKE source)`: plain LIKE copies the source's columns verbatim, so when the source
+        /// is a known table and no columns were declared alongside it, the fold expands to its
+        /// layout instead of leaving the copy incomplete.
+        like_source: Option<RawName>,
     },
     /// `ALTER TABLE .. ADD COLUMN` — appends to the physical order, as Postgres does.
     AddColumn {
@@ -223,8 +228,11 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
 
 fn map_create_table(ct: sq::CreateTable) -> DdlOp {
     let is_ctas = ct.query.is_some() && ct.columns.is_empty();
-    let incomplete_columns = ct.like.is_some() || ct.inherits.is_some();
+    let incomplete_columns = ct.inherits.is_some();
     let partition_of = ct.partition_of.as_ref().map(table_name);
+    let like_source = ct.like.as_ref().map(|kind| match kind {
+        sq::CreateTableLikeKind::Parenthesized(like) | sq::CreateTableLikeKind::Plain(like) => table_name(&like.name),
+    });
     let pk_columns = ct.constraints.iter().flat_map(pk_constraint_columns).collect();
     let columns = ct.columns.iter().map(map_column).collect();
     DdlOp::CreateTable {
@@ -236,6 +244,7 @@ fn map_create_table(ct: sq::CreateTable) -> DdlOp {
         incomplete_columns,
         temporary: ct.temporary,
         partition_of,
+        like_source,
     }
 }
 

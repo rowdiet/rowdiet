@@ -354,7 +354,7 @@ mod minimality_property {
 #[cfg(feature = "serde")]
 #[test]
 fn tier_display_matches_serde() {
-    for tier in [Tier::Exact, Tier::Estimate] {
+    for tier in [Tier::Exact, Tier::Estimate, Tier::Unknown] {
         let json = serde_json::to_value(tier).unwrap();
         assert_eq!(json.as_str().unwrap(), tier.to_string(), "{tier:?}");
     }

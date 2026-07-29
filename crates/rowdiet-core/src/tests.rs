@@ -308,6 +308,7 @@ mod differential {
                 incomplete_columns,
                 temporary,
                 partition_of,
+                like_source,
             } => DdlOp::CreateTable {
                 name: norm_name(name),
                 columns: columns.into_iter().map(norm_col).collect(),
@@ -317,6 +318,7 @@ mod differential {
                 incomplete_columns,
                 temporary,
                 partition_of: partition_of.map(norm_name),
+                like_source: like_source.map(norm_name),
             },
             DdlOp::AddColumn {
                 table,
@@ -1135,4 +1137,49 @@ fn analysis_accessors_mirror_the_gate_filter() {
     assert!(analysis.worst_avoidable() > 0);
     let empty = analyze_sources(&[], &Config::default());
     assert_eq!(empty.worst_avoidable(), 0);
+}
+
+#[test]
+fn like_expands_from_a_known_same_run_source() {
+    // Plain `(LIKE s)` copies s's columns verbatim, so the copy carries s's exact layout — same
+    // signature, same avoidable waste — instead of landing incomplete.
+    let a = analyze_sources(
+        &[src(
+            "V1.sql",
+            "CREATE TABLE s (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
+             CREATE TABLE cp (LIKE s);",
+        )],
+        &Config::default(),
+    );
+    let s = a.tables.iter().find(|t| t.name == "s").unwrap();
+    let cp = a.tables.iter().find(|t| t.name == "cp").unwrap();
+    assert!(!cp.incomplete, "a LIKE of a known table expands");
+    assert_eq!(cp.natts, 4);
+    assert_eq!(cp.layout_signature, s.layout_signature);
+    assert_eq!(cp.avoidable_bytes_per_row, s.avoidable_bytes_per_row);
+    assert_eq!(cp.avoidable_bytes_per_row, 8);
+    assert!(a.notes.is_empty(), "{:#?}", a.notes);
+}
+
+#[test]
+fn incomplete_table_reports_unknown_not_a_false_pass() {
+    // A LIKE of a table not in the analyzed set cannot be expanded — it must not look like a
+    // clean, fully-analyzed pass (the false negative behind the report).
+    let a = analyze_sources(&[src("V1.sql", "CREATE TABLE c (LIKE nowhere);")], &Config::default());
+    let c = &a.tables[0];
+    assert!(c.incomplete);
+    assert_eq!(c.tier, layout::Tier::Unknown);
+    assert_eq!(c.current.footprint, None);
+    assert_eq!(c.avoidable_bytes_per_row, 0);
+    let outcome = baseline::evaluate(&a, Some(0), false, None);
+    assert_eq!(outcome.verdicts["c"], baseline::TableVerdict::Incomplete);
+    assert!(!outcome.exceeded, "incomplete alone does not fail the gate");
+    assert!(
+        baseline::evaluate(&a, Some(0), true, None).exceeded,
+        "but --fail-on-degraded escalates it"
+    );
+    // A genuinely empty but complete table stays exact — the fix keys on incompleteness, not natts.
+    let empty = analyze_sources(&[src("V2.sql", "CREATE TABLE e ();")], &Config::default());
+    assert!(!empty.tables[0].incomplete);
+    assert_eq!(empty.tables[0].tier, layout::Tier::Exact);
 }

@@ -48,7 +48,8 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
             TableVerdict::GrownSinceBaseline { .. } => grown += 1,
             TableVerdict::ModifiedSinceBaseline { .. } => modified += 1,
             TableVerdict::RatchetOpportunity { .. } => ratchets += 1,
-            TableVerdict::Pass => {}
+            // Counted in gate.incomplete_tables and reported on the degraded line below.
+            TableVerdict::Pass | TableVerdict::Incomplete => {}
         }
     }
     if gate.skipped_statements > 0 || gate.incomplete_tables > 0 || gate.empty_scans > 0 {
@@ -105,10 +106,16 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.display);
         return;
     }
-    // An empty modeled column set (partition child / LIKE / typed table) passes the gate
-    // vacuously — report it as not analyzable rather than as "optimal [exact]".
-    if t.natts == 0 {
-        let _ = writeln!(out, "◌ {} ({loc}) — no modeled columns — not analyzable", t.display);
+    // A table we could not fully model (unexpanded LIKE/INHERITS/typed table, or a partition
+    // child of an unknown parent) has no footprint to compare — report it as not analyzable
+    // rather than letting it pass the gate vacuously as "optimal".
+    if t.incomplete {
+        let detail = if t.natts == 0 {
+            "no modeled columns"
+        } else {
+            "columns not fully known"
+        };
+        let _ = writeln!(out, "◌ {} ({loc}) — {detail} — not analyzable", t.display);
         render_flags(out, t);
         return;
     }
@@ -117,6 +124,8 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
             (_, 0) => "optimal: zero padding".to_string(),
             (Tier::Exact, p) => format!("{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain"),
             (Tier::Estimate, p) => format!("{p} B scenario padding, none avoidable by reordering"),
+            // Incomplete tables return above as "not analyzable"; unreachable here in practice.
+            (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
         let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.display, tier_label(t.tier));
         render_flags(out, t);
@@ -182,7 +191,7 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
                 t.name
             );
         }
-        Some(TableVerdict::Pass | TableVerdict::NewViolation { .. }) | None => {}
+        Some(TableVerdict::Pass | TableVerdict::NewViolation { .. } | TableVerdict::Incomplete) | None => {}
     }
 }
 
@@ -241,6 +250,7 @@ fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Exact => "exact — fixed-width only",
         Tier::Estimate => "estimate — long-form varlena scenario",
+        Tier::Unknown => "unknown — columns not fully known",
     }
 }
 
@@ -431,10 +441,12 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
             }
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "**modified since baseline**".to_string(),
             Some(TableVerdict::RatchetOpportunity { allowed, .. }) => format!("ratchet (allowed {allowed})"),
+            Some(TableVerdict::Incomplete) => "incomplete".to_string(),
         };
         let tier = match t.tier {
             Tier::Exact => "exact",
             Tier::Estimate => "estimate",
+            Tier::Unknown => "unknown",
         };
         let _ = writeln!(
             out,
