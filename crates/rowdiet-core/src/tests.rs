@@ -1178,6 +1178,18 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
         baseline::evaluate(&a, Some(0), true, None).exceeded,
         "but --fail-on-degraded escalates it"
     );
+    // INHERITS of an unknown parent is the same class — the unknown/incomplete path must be
+    // exercised by a fixture, since a corpus where every LIKE expands never reaches it.
+    let inh = analyze_sources(
+        &[src("V3.sql", "CREATE TABLE k () INHERITS (unknown_parent);")],
+        &Config::default(),
+    );
+    assert!(inh.tables[0].incomplete);
+    assert_eq!(inh.tables[0].tier, layout::Tier::Unknown);
+    assert_eq!(
+        baseline::evaluate(&inh, Some(0), false, None).verdicts["k"],
+        baseline::TableVerdict::Incomplete
+    );
     // A genuinely empty but complete table stays exact — the fix keys on incompleteness, not natts.
     let empty = analyze_sources(&[src("V2.sql", "CREATE TABLE e ();")], &Config::default());
     assert!(!empty.tables[0].incomplete);
