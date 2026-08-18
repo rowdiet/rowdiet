@@ -65,11 +65,11 @@ fn baseline_input_gates_and_reports_verdicts() {
     let out: serde_json::Value = serde_json::from_str(&lint_json(baselined)).unwrap();
     assert_eq!(out["gate_exceeded"], false);
     assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "pass");
-    assert_eq!(out["fail_over"], 0);
+    assert_eq!(out["fail_over"], 0.0);
     assert_eq!(out["analysis"]["tables"][0]["layout_signature"], "f4i,f8d,f4i,f8d");
     let tightened = baselined.replace("\"bytes\": 8", "\"bytes\": 4");
     let out: serde_json::Value = serde_json::from_str(&lint_json(&tightened)).unwrap();
     assert_eq!(out["gate_exceeded"], true);
     assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "regression");
-    assert_eq!(out["gate"]["verdicts"]["m"]["allowed"], 4);
+    assert_eq!(out["gate"]["verdicts"]["m"]["allowed"], 4.0);
 }
