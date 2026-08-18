@@ -2,8 +2,9 @@
 //!
 //! Reporting contract: for fixed-width-only tables everything is byte-exact —
 //! the headline is the MAXALIGN-rounded footprint delta, and a reorder that does not cross an
-//! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get long-form-scenario
-//! numbers, labeled as estimates and never claimed as guaranteed savings.
+//! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get expected-value
+//! numbers with a data-dependent min/max range (columns after a varlena sit at unknown
+//! offsets), labeled as estimates and never claimed as guaranteed savings.
 
 use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
@@ -27,15 +28,14 @@ impl Analysis {
     }
 
     /// The largest [`avoidable_bytes_per_row`](TableReport::avoidable_bytes_per_row) among
-    /// gated tables — 0 when every layout is tight (or nothing was analyzed). The number a
+    /// gated tables — 0.0 when every layout is tight (or nothing was analyzed). The number a
     /// zero-tolerance test asserts on. A clean maximum still says nothing about skipped
     /// statements, so pair it with a look at [`notes`](Self::notes) or use
     /// [`baseline::evaluate`](crate::baseline::evaluate) with `fail_on_degraded`.
-    pub fn worst_avoidable(&self) -> u64 {
+    pub fn worst_avoidable(&self) -> f64 {
         self.gated_tables()
             .map(|table| table.avoidable_bytes_per_row)
-            .max()
-            .unwrap_or(0)
+            .fold(0.0, f64::max)
     }
 
     /// True when the analysis is degraded in a way rowdiet recognizes: a statement was skipped, a
@@ -87,10 +87,11 @@ pub struct TableReport {
     /// Column names (display spelling) in suggested order; the original order when nothing is
     /// avoidable.
     pub suggested_order: Vec<String>,
-    /// The headline number gates compare: footprint delta (exact tier) or scenario-padding
-    /// delta (estimate tier) between current and suggested order. 0 = reordering gains nothing,
-    /// or the table is incomplete (unknown tier), where no waste can be claimed.
-    pub avoidable_bytes_per_row: u64,
+    /// The headline number gates compare: footprint delta (exact tier) or expected-padding
+    /// delta (estimate tier) between current and suggested order — fractional when the delta
+    /// rides on data-dependent pads. 0 = reordering gains nothing, or the table is incomplete
+    /// (unknown tier), where no waste can be claimed.
+    pub avoidable_bytes_per_row: f64,
     /// Type spellings that resolved by assumption, sorted and deduplicated — the table's
     /// numbers are only as good as those assumptions.
     pub assumed_types: Vec<String>,
@@ -118,10 +119,12 @@ pub struct ColumnReport {
     pub known_type: bool,
     /// Resolved storage class.
     pub kind: ColumnKind,
-    /// Padding before this column in the current order, bytes.
-    pub pad_before: u64,
-    /// Data start within the data area, bytes (tuple header not included).
-    pub offset: u64,
+    /// Padding before this column in the current order, bytes — when its value is certain;
+    /// None when it depends on the payload lengths of preceding varlenas.
+    pub pad_before: Option<u64>,
+    /// Data start within the data area, bytes (tuple header not included); None from the first
+    /// varlena on (its payload moves every later offset).
+    pub offset: Option<u64>,
 }
 
 /// Layout numbers for one column order — [`TableReport::current`] and
@@ -129,8 +132,17 @@ pub struct ColumnReport {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct OrderStats {
-    /// Inter-column alignment padding, bytes per row (meaningful at both tiers).
+    /// Certain inter-column padding, bytes per row: pads whose value the DDL fixes. For an
+    /// all-fixed table this is the whole padding.
     pub padding: u64,
+    /// Expected total padding, bytes per row: `padding` plus the expected values of the
+    /// data-dependent pads (equals `padding` when there are none; fractional otherwise).
+    pub expected_padding: f64,
+    /// Smallest possible total padding, bytes per row (equals `padding` when nothing is
+    /// data-dependent).
+    pub padding_min: u64,
+    /// Largest possible total padding, bytes per row.
+    pub padding_max: u64,
     /// Whole-row on-disk size, header included and MAXALIGN-rounded, bytes. None at the estimate
     /// tier (varlena payloads make it unknowable) and the unknown tier (columns not fully known).
     pub footprint: Option<u64>,
@@ -160,7 +172,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     let mut order = layout::suggested_order(&kinds);
     let ordered_kinds: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
     let mut suggested_walk = layout::walk(&ordered_kinds);
-    if suggested_walk.padding > current_walk.padding {
+    if suggested_walk.expected_padding_eighths() > current_walk.expected_padding_eighths() {
         order = (0..kinds.len()).collect();
         suggested_walk = current_walk.clone();
     }
@@ -170,15 +182,21 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         Tier::Exact => current
             .footprint
             .unwrap_or(0)
-            .saturating_sub(suggested.footprint.unwrap_or(0)),
-        Tier::Estimate => current.padding.saturating_sub(suggested.padding),
+            .saturating_sub(suggested.footprint.unwrap_or(0)) as f64,
+        // Expected-padding delta, in exact eighths of a byte.
+        Tier::Estimate => {
+            current_walk
+                .expected_padding_eighths()
+                .saturating_sub(suggested_walk.expected_padding_eighths()) as f64
+                / 8.0
+        }
         // Columns unknown: no avoidable waste can be claimed. The incomplete verdict, not a
         // fabricated byte count, carries the "not analyzed" signal.
-        Tier::Unknown => 0,
+        Tier::Unknown => 0.0,
     };
     // With nothing avoidable the suggestion IS the current order; the stats must say the same
     // thing, or the JSON contradicts itself (suggested.padding 0 beside the original order).
-    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable == 0 {
+    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable == 0.0 {
         ((0..kinds.len()).collect(), current.clone())
     } else {
         (order, suggested)
@@ -194,7 +212,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             not_null: c.not_null,
             known_type: c.known_type,
             kind: c.kind,
-            pad_before: w.pad_before,
+            pad_before: w.pad_before.exact(),
             offset: w.offset,
         })
         .collect();
@@ -258,26 +276,18 @@ fn align_letter(align: layout::Align) -> char {
 }
 
 fn stats(tier: Tier, walk: &Walk, t_hoff: u64) -> OrderStats {
-    match tier {
-        Tier::Exact => {
-            let footprint = layout::footprint_at(t_hoff, walk.scenario_end);
-            OrderStats {
-                padding: walk.padding,
-                footprint: Some(footprint),
-                rows_per_page: Some(layout::rows_per_page(footprint)),
-            }
-        }
-        Tier::Estimate => OrderStats {
-            padding: walk.padding,
-            footprint: None,
-            rows_per_page: None,
-        },
-        // Unknown columns: the padding of the partial walk is not the table's, and no footprint
-        // exists to report.
-        Tier::Unknown => OrderStats {
-            padding: walk.padding,
-            footprint: None,
-            rows_per_page: None,
-        },
+    // The end is known exactly iff the table has no varlena, which is exactly the exact tier;
+    // the estimate tier has no footprint to claim, and the unknown tier claims nothing.
+    let footprint = match (tier, walk.end) {
+        (Tier::Exact, Some(end)) => Some(layout::footprint_at(t_hoff, end)),
+        _ => None,
+    };
+    OrderStats {
+        padding: walk.padding,
+        expected_padding: walk.expected_padding(),
+        padding_min: walk.padding_min(),
+        padding_max: walk.padding_max(),
+        footprint,
+        rows_per_page: footprint.map(layout::rows_per_page),
     }
 }

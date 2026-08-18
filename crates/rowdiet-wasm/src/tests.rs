@@ -9,7 +9,7 @@ const INPUT: &str = r#"{
 fn lint_json_end_to_end() {
     let out: serde_json::Value = serde_json::from_str(&lint_json(INPUT)).unwrap();
     assert_eq!(out["gate_exceeded"], true);
-    assert_eq!(out["analysis"]["tables"][0]["avoidable_bytes_per_row"], 8);
+    assert_eq!(out["analysis"]["tables"][0]["avoidable_bytes_per_row"], 8.0);
     let expected_parser = if cfg!(feature = "pg-exact") {
         "pg-exact"
     } else {

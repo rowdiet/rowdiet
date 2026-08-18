@@ -38,7 +38,9 @@ fn walk_classic_bool_int8_interleave() {
         fixed(8, Align::Double),
     ]);
     assert_eq!(w.padding, 14);
-    assert_eq!(w.scenario_end, 32);
+    assert_eq!(w.end, Some(32));
+    assert_eq!(w.expected_padding(), 14.0);
+    assert_eq!((w.padding_min(), w.padding_max()), (14, 14));
     let s = walk(&[
         fixed(8, Align::Double),
         fixed(8, Align::Double),
@@ -46,7 +48,7 @@ fn walk_classic_bool_int8_interleave() {
         fixed(1, Align::Char),
     ]);
     assert_eq!(s.padding, 0);
-    assert_eq!(s.scenario_end, 18);
+    assert_eq!(s.end, Some(18));
 }
 
 #[test]
@@ -57,14 +59,14 @@ fn footprint_rung_crossing() {
         fixed(4, Align::Int),
         fixed(8, Align::Double),
     ]);
-    assert_eq!(footprint(cur.scenario_end), 56);
+    assert_eq!(footprint(cur.end.unwrap()), 56);
     let sug = walk(&[
         fixed(8, Align::Double),
         fixed(8, Align::Double),
         fixed(4, Align::Int),
         fixed(4, Align::Int),
     ]);
-    assert_eq!(footprint(sug.scenario_end), 48);
+    assert_eq!(footprint(sug.end.unwrap()), 48);
     assert_eq!(rows_per_page(56), 136);
     assert_eq!(rows_per_page(48), 157);
 }
@@ -75,7 +77,7 @@ fn footprint_rung_not_crossed() {
     let sug = walk(&[fixed(8, Align::Double), fixed(8, Align::Double), fixed(1, Align::Char)]);
     assert_eq!(cur.padding, 7);
     assert_eq!(sug.padding, 0);
-    assert_eq!(footprint(cur.scenario_end), footprint(sug.scenario_end));
+    assert_eq!(footprint(cur.end.unwrap()), footprint(sug.end.unwrap()));
 }
 
 #[test]
@@ -205,17 +207,148 @@ fn varlena_cluster_and_align_desc() {
 }
 
 #[test]
-fn proven_short_never_pads() {
+fn proven_short_never_pads_and_never_restores_certainty() {
     let w = walk(&[fixed(1, Align::Char), short(), fixed(8, Align::Double)]);
-    assert_eq!(w.columns[1].pad_before, 0);
-    assert_eq!(w.columns[2].pad_before, 6);
+    assert_eq!(w.columns[1].pad_before, PadRange::certain(0));
+    assert_eq!(w.columns[1].offset, Some(1));
+    // The proven-short header is 1 byte, but the payload byte length still varies (multibyte
+    // encodings), so the following column pads over the full residue set.
+    assert_eq!(
+        w.columns[2].pad_before,
+        PadRange {
+            min: 0,
+            max: 7,
+            expected_eighths: 28
+        }
+    );
+    assert_eq!(w.columns[2].offset, None);
+    assert_eq!(w.end, None);
 }
 
 #[test]
-fn scenario_varlena_headers() {
+fn fixed_after_a_varlena_pads_data_dependently() {
     let w = walk(&[varlena(Align::Int), fixed(8, Align::Double)]);
+    assert_eq!(w.columns[0].pad_before, PadRange::certain(0));
+    assert_eq!(w.columns[0].offset, Some(0));
+    assert_eq!(w.columns[1].offset, None);
+    assert_eq!(w.padding, 0);
+    assert_eq!(w.uncertain_expected_eighths, 28);
+    assert_eq!((w.padding_min(), w.padding_max()), (0, 7));
+    assert_eq!(w.expected_padding(), 3.5);
+    assert_eq!(w.end, None);
+}
+
+#[test]
+fn residue_narrowing_algebra() {
+    assert_eq!(Residues::FULL.aligned(8), Residues::START);
+    assert_eq!(Residues(0b0000_0110).aligned(8), Residues::START);
+    assert_eq!(Residues::FULL.aligned(4), Residues(0b0001_0001));
+    assert_eq!(Residues::FULL.aligned(2), Residues(0b0101_0101));
+    assert_eq!(Residues::FULL.aligned(1), Residues::FULL);
+    assert_eq!(Residues(0b0001_0001).aligned(2), Residues(0b0001_0001));
+    assert_eq!(Residues::START.shifted(3), Residues(0b0000_1000));
+    assert_eq!(Residues::START.shifted(11), Residues(0b0000_1000));
+    assert_eq!(Residues::FULL.shifted(5), Residues::FULL);
+}
+
+#[test]
+fn expected_pads_over_the_full_set_match_the_closed_form() {
+    assert_eq!(
+        Residues::FULL.pad_to(8),
+        PadRange {
+            min: 0,
+            max: 7,
+            expected_eighths: 28
+        }
+    );
+    assert_eq!(
+        Residues::FULL.pad_to(4),
+        PadRange {
+            min: 0,
+            max: 3,
+            expected_eighths: 12
+        }
+    );
+    assert_eq!(
+        Residues::FULL.pad_to(2),
+        PadRange {
+            min: 0,
+            max: 1,
+            expected_eighths: 4
+        }
+    );
+    assert_eq!(Residues::FULL.pad_to(1), PadRange::certain(0));
+}
+
+#[test]
+fn eight_aligned_column_restores_determinism() {
+    let w = walk(&[
+        varlena(Align::Int),
+        fixed(8, Align::Double),
+        fixed(4, Align::Int),
+        fixed(8, Align::Double),
+    ]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 7,
+            expected_eighths: 28
+        }
+    );
+    // Aligning to 8 collapsed the residue set back to {0}: later pads are certain again.
+    assert_eq!(w.columns[2].pad_before, PadRange::certain(0));
+    assert_eq!(w.columns[3].pad_before, PadRange::certain(4));
     assert_eq!(w.padding, 4);
-    assert_eq!(w.scenario_end, 16);
+    assert_eq!(w.uncertain_expected_eighths, 28);
+    // Offsets stay unknown even where the pad is certain: the pad is pinned mod 8 alone.
+    assert_eq!(w.columns[2].offset, None);
+}
+
+#[test]
+fn four_aligned_column_narrows_to_two_residues() {
+    let w = walk(&[varlena(Align::Int), fixed(4, Align::Int), fixed(4, Align::Int)]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 3,
+            expected_eighths: 12
+        }
+    );
+    // After a 4-aligned column the set is {0, 4} shifted by 4 = {0, 4}: the next 4-aligned
+    // column pads zero on both members, so its pad is certain.
+    assert_eq!(w.columns[2].pad_before, PadRange::certain(0));
+    assert_eq!(w.padding, 0);
+}
+
+#[test]
+fn interleaved_vs_grouped_kind_sequences() {
+    // The issue-1 repro at the kind level: same multiset, opposite orders.
+    let interleaved = walk(&[
+        varlena(Align::Int),
+        fixed(4, Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        fixed(8, Align::Double),
+        fixed(8, Align::Double),
+    ]);
+    let grouped = walk(&[
+        fixed(8, Align::Double),
+        fixed(8, Align::Double),
+        fixed(4, Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+        varlena(Align::Int),
+    ]);
+    assert_eq!(interleaved.expected_padding(), 9.5);
+    assert_eq!((interleaved.padding_min(), interleaved.padding_max()), (0, 19));
+    assert_eq!(grouped.expected_padding(), 6.0);
+    assert_eq!((grouped.padding_min(), grouped.padding_max()), (0, 12));
 }
 
 #[test]

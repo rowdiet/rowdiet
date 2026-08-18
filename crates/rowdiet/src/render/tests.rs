@@ -90,7 +90,7 @@ fn baseline_verdicts_in_text_output() {
     let sig = &analysis.tables[0].layout_signature;
     let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4, sig)]));
     assert!(
-        regressed.contains("✗ regression: 8 B/row exceeds the baselined allowance of 4"),
+        regressed.contains("✗ regression: 8.0 B/row exceeds the baselined allowance of 4"),
         "{regressed}"
     );
     assert!(regressed.contains("FAIL: 1 regression(s) vs baseline"), "{regressed}");
@@ -153,17 +153,18 @@ fn json_shape() {
     assert_eq!(value["gate_exceeded"], true);
     assert_eq!(value["gate"]["exceeded"], true);
     assert_eq!(value["gate"]["verdicts"]["account"]["verdict"], "new_violation");
-    assert_eq!(value["gate"]["verdicts"]["account"]["avoidable"], 8);
-    assert_eq!(value["analysis"]["tables"][0]["avoidable_bytes_per_row"], 8);
+    assert_eq!(value["gate"]["verdicts"]["account"]["avoidable"], 8.0);
+    assert_eq!(value["analysis"]["tables"][0]["avoidable_bytes_per_row"], 8.0);
     assert_eq!(value["analysis"]["tables"][0]["tier"], "exact");
     assert_eq!(value["analysis"]["tables"][0]["layout_signature"], "f1c,f8d,f2s,f8d");
 }
 
 #[test]
 fn human_units() {
-    assert_eq!(human_bytes(999), "999 B");
-    assert_eq!(human_bytes(8_000_000), "8.0 MB");
-    assert_eq!(human_bytes(12_500_000_000), "12.5 GB");
+    assert_eq!(human_bytes(999.0), "999 B");
+    assert_eq!(human_bytes(10.5), "10.5 B");
+    assert_eq!(human_bytes(8_000_000.0), "8.0 MB");
+    assert_eq!(human_bytes(12_500_000_000.0), "12.5 GB");
 }
 
 #[test]
@@ -217,7 +218,7 @@ fn github_step_summary_carries_the_full_report() {
     let summary = github_step_summary(&analysis, &gate(&analysis, Some(0)));
     for i in 0..13 {
         assert!(
-            summary.contains(&format!("| t{i:02} | 8 | exact | **new violation** |")),
+            summary.contains(&format!("| t{i:02} | 8.0 | exact | **new violation** |")),
             "{summary}"
         );
     }

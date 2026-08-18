@@ -34,21 +34,27 @@ split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touchi
   templates keep the loud summary note. DML-only DO bodies are silent — same as any other DML.
   A `rowdiet:ignore` marker inside a DO waives its scan entirely.
 
-## The scenario model (what the numbers mean)
+## The offset model (what the numbers mean)
 
-All row numbers are computed for the **canonical scenario**: every column non-NULL, every
-varlena stored long-form, varlena payload bytes excluded from the walk (payloads are unknowable
-from DDL and order-invariant; only headers, fixed data, and padding are counted). Proven-short
-varlenas contribute a 1-byte header, unaligned.
+All row numbers assume every column non-NULL. Varlena payload bytes are never counted toward
+sizes (they are unknowable from DDL), but they determine the offset residue mod 8 that every
+later column aligns against — the total payload is order-invariant while its effect on
+downstream padding is order-dependent. The walk therefore carries the offset as a set of possible
+residues mod 8: exact until the first varlena, the full set after any varlena (a proven-short
+typmod bounds only the header form, payload byte length still varies), narrowed again by
+alignment (an 8-aligned
+column collapses any set back to a single residue). Each pad placed over a non-singleton set is
+reported as min/max/expected, with residues taken as uniformly likely — a stated assumption.
+Pads placed while the residue is exactly known stay exact.
 
 Tiers:
 
 - **Exact** — table has only fixed-width columns. Padding and footprint are byte-exact
   (fixed-width values are never toasted/compressed). Headline = MAXALIGN-rounded footprint delta;
   `avoidable == 0` whenever the reorder doesn't cross an 8-byte rung, even if raw padding drops.
-- **Estimate** — any varlena present. Headline = scenario padding delta, labeled. Real rows
-  differ (short-form/TOAST make varlena alignment data-dependent three ways), so no guarantee is
-  claimed.
+- **Estimate** — any varlena present. Headline = expected-padding delta, labeled, possibly
+  fractional. Real rows differ (short-form/TOAST make varlena alignment data-dependent three
+  ways), so no guarantee is claimed.
 
 Why no middle tier: even for "fixed prefix + varlena tail preserved" the *total* delta is not
 byte-guaranteed — payload lengths shift downstream pads in both orders. There is a useful
@@ -62,9 +68,9 @@ actual length, so presenting that number as guaranteed for the as-written order 
 
 Null bitmap: present per-row when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it never changes reorder
-advice. The scenario (all non-NULL) uses `t_hoff = 24` — except after `DROP COLUMN`, where the
+advice. The all-non-NULL assumption uses `t_hoff = 24` — except after `DROP COLUMN`, where the
 bitmap is unconditionally present in new rows (dropped attributes are stored as NULL forever),
-so the scenario uses `t_hoff = null_thoff(original natts)`; see Folding semantics.
+so the walk uses `t_hoff = null_thoff(original natts)`; see Folding semantics.
 
 ## Suggested order
 
@@ -75,7 +81,7 @@ their group keeps every following smaller-alignment column aligned. For all-regu
 result is provably zero-padding under any NULL mask (a subsequence of a desc-aligned regular
 sequence is still one). With ≥2 irregulars in one group a sorted order can leave padding an
 interposed smaller column would absorb (two `timetz` pad 4 between; `timetz, int4, timetz` is
-zero) — when the sorted fixed block still pads, `refine_fixed_block` finds the exact scenario
+zero) — when the sorted fixed block still pads, `refine_fixed_block` finds the exact padding
 minimum with a memoized search over (alignment, len mod 8) classes × offset residue (ties prefer
 the heuristic's class order; capped at 24 fixed columns / 12 classes, falling back to the sort).
 The report never overclaims: both layouts are *computed*, never assumed, and a safety guard

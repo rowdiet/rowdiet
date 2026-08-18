@@ -1,9 +1,12 @@
 //! On-disk tuple layout math. Assumes 64-bit PostgreSQL (MAXALIGN = 8, `d` alignment = 8 bytes);
 //! a 32-bit knob is out of scope for v1.
 //!
-//! All row-size numbers are computed for the canonical scenario: every column non-NULL and every
-//! varlena stored in long form, with varlena payload bytes excluded (payload size is unknowable
-//! from DDL and order-invariant; only headers, fixed data, and alignment padding are counted).
+//! All row numbers assume every column non-NULL. Varlena payload bytes never count toward sizes
+//! (they are unknowable from DDL), but they do move every later column's offset: from the first
+//! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
+//! later pad is reported as a min/max/expected range over that set (residues taken as uniformly
+//! likely, by assumption). Pads placed while the offset is exactly
+//! known stay exact, so all-fixed tables keep byte-exact numbers.
 
 /// The 64-bit PostgreSQL MAXALIGN: tuple headers, data starts, and footprints all round to
 /// 8-byte boundaries.
@@ -12,8 +15,6 @@ const TUPLE_HEADER: u64 = 23;
 const PAGE_SIZE: u64 = 8192;
 const PAGE_HEADER: u64 = 24;
 const LINE_POINTER: u64 = 4;
-const VARLENA_LONG_HEADER: u64 = 4;
-const VARLENA_SHORT_HEADER: u64 = 1;
 
 /// pg_type.typalign storage alignment class — the boundary a value's first byte must sit on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,7 +53,8 @@ pub enum ColumnKind {
         /// Storage alignment.
         align: Align,
     },
-    /// Variable-length type, counted at header size only (payload bytes are unknowable from DDL).
+    /// Variable-length type. Its payload length is unknowable from DDL, so every column placed
+    /// after one sits at a data-dependent offset.
     Varlena {
         /// Alignment of the long form; the short form never aligns.
         align: Align,
@@ -95,68 +97,222 @@ pub fn maxalign(n: u64) -> u64 {
     n + pad(n, MAXALIGN)
 }
 
+/// One pad's bounds and expectation. When the column sits at an exactly known offset (or every
+/// possible offset pads the same), `min == max` and the pad is that one value; otherwise the
+/// numbers range over the possible offset residues mod MAXALIGN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadRange {
+    /// Smallest possible pad, bytes.
+    pub min: u64,
+    /// Largest possible pad, bytes.
+    pub max: u64,
+    /// Mean pad over the possible residues, in eighths of a byte — eighths keep it exact, since
+    /// reachable residue sets have 1, 2, 4, or 8 members, all dividing 8.
+    pub expected_eighths: u64,
+}
+
+impl PadRange {
+    /// A pad of exactly `bytes`.
+    pub fn certain(bytes: u64) -> Self {
+        Self {
+            min: bytes,
+            max: bytes,
+            expected_eighths: bytes * MAXALIGN,
+        }
+    }
+
+    /// The pad when its value is certain (`min == max`), even if the absolute offset is not.
+    pub fn exact(&self) -> Option<u64> {
+        (self.min == self.max).then_some(self.min)
+    }
+
+    /// Mean pad in bytes (a multiple of 1/8, exactly representable in f64).
+    pub fn expected(&self) -> f64 {
+        self.expected_eighths as f64 / 8.0
+    }
+}
+
+/// The offsets a column can start at, reduced mod MAXALIGN: a bitmask over residues 0..=7.
+/// Starts as `{0}`; a fixed column narrows the set by its alignment then shifts it by its
+/// length; any varlena replaces it with the full set — a proven-short typmod bounds only the
+/// header form, the payload byte length still varies (multibyte encodings), so the set stays full.
+/// Expected pads treat the members as uniformly likely. That assumption is made once, at the
+/// widening: alignment maps preserve uniformity (reachable sets are cosets in Z/8, and each
+/// surviving residue absorbs equally many predecessors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Residues(u8);
+
+impl Residues {
+    /// The walk's start: offset 0 exactly.
+    const START: Self = Self(1);
+    /// Every residue possible: the state after any varlena.
+    const FULL: Self = Self(0xFF);
+
+    fn contains(self, residue: u64) -> bool {
+        self.0 & (1u8 << residue) != 0
+    }
+
+    fn len(self) -> u64 {
+        u64::from(self.0.count_ones())
+    }
+
+    /// Pad statistics for aligning to `align` from any residue in the set.
+    fn pad_to(self, align: u64) -> PadRange {
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        let mut sum = 0u64;
+        for residue in 0..MAXALIGN {
+            if self.contains(residue) {
+                let p = pad(residue, align);
+                min = min.min(p);
+                max = max.max(p);
+                sum += p;
+            }
+        }
+        // Coset sizes are 1, 2, 4, or 8, so the mean in eighths divides exactly.
+        debug_assert_eq!(sum * MAXALIGN % self.len(), 0);
+        PadRange {
+            min,
+            max,
+            expected_eighths: sum * MAXALIGN / self.len(),
+        }
+    }
+
+    /// The set after aligning to `align`: each residue moves to its next `align` boundary.
+    /// Aligning to 8 collapses any set to `{0}`; aligning the full set to 4 leaves `{0, 4}`.
+    fn aligned(self, align: u64) -> Self {
+        let mut mask = 0u8;
+        for residue in 0..MAXALIGN {
+            if self.contains(residue) {
+                mask |= 1u8 << ((residue + pad(residue, align)) % MAXALIGN);
+            }
+        }
+        Self(mask)
+    }
+
+    /// The set after advancing by `len` bytes.
+    fn shifted(self, len: u64) -> Self {
+        Self(self.0.rotate_left((len % MAXALIGN) as u32))
+    }
+}
+
 /// One column's placement in a [`Walk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnWalk {
-    /// Padding inserted immediately before this column, bytes.
-    pub pad_before: u64,
-    /// The column's data start, bytes from the beginning of the data area (t_hoff not included).
-    pub offset: u64,
+    /// Padding inserted immediately before this column.
+    pub pad_before: PadRange,
+    /// The column's data start, bytes from the beginning of the data area (t_hoff not
+    /// included) — known only until the first varlena, whose payload moves every later offset.
+    pub offset: Option<u64>,
 }
 
-/// A column order laid out into offsets, under the module doc's canonical scenario.
+/// A column order laid out into offsets, under the module doc's no-NULL assumption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Walk {
     /// Placement per column, same order as the walked input.
     pub columns: Vec<ColumnWalk>,
-    /// Total inter-column padding: the sum of every `pad_before`. Trailing MAXALIGN rounding is
-    /// not part of it — that happens in [`footprint_at`].
+    /// Total certain padding: the sum of every pad whose value is known, bytes — all of it, for
+    /// an all-fixed table. Trailing MAXALIGN rounding is not part of it — that happens in
+    /// [`footprint_at`].
     pub padding: u64,
-    /// Offset just past the last column's data: the data-area size before footprint rounding.
-    pub scenario_end: u64,
+    /// Sum of the smallest possible values of the data-dependent pads, bytes.
+    pub uncertain_min: u64,
+    /// Sum of the largest possible values of the data-dependent pads, bytes.
+    pub uncertain_max: u64,
+    /// Sum of the expected values of the data-dependent pads, eighths of a byte.
+    pub uncertain_expected_eighths: u64,
+    /// Offset just past the last column's data, when exactly known: None once the table has a
+    /// varlena (its payload length moves the end).
+    pub end: Option<u64>,
 }
 
-/// Place `kinds` in the given order and total the padding (canonical scenario: every column
-/// non-NULL, varlenas at header size — 4 bytes aligned, or 1 byte unaligned when proven short).
+impl Walk {
+    /// Expected total padding in eighths of a byte: certain pads plus the expected values of
+    /// the data-dependent ones. Exact integer arithmetic — compare orders on this.
+    pub fn expected_padding_eighths(&self) -> u64 {
+        self.padding * MAXALIGN + self.uncertain_expected_eighths
+    }
+
+    /// Expected total padding, bytes (a multiple of 1/8, exactly representable in f64).
+    pub fn expected_padding(&self) -> f64 {
+        self.expected_padding_eighths() as f64 / 8.0
+    }
+
+    /// Smallest possible total padding, bytes.
+    pub fn padding_min(&self) -> u64 {
+        self.padding + self.uncertain_min
+    }
+
+    /// Largest possible total padding, bytes.
+    pub fn padding_max(&self) -> u64 {
+        self.padding + self.uncertain_max
+    }
+}
+
+/// Place `kinds` in the given order and total the padding (every column non-NULL; pads placed
+/// after the first varlena are min/max/expected ranges over the possible offset residues).
 pub fn walk(kinds: &[ColumnKind]) -> Walk {
-    let mut off = 0u64;
+    let mut residues = Residues::START;
+    let mut end = Some(0u64);
     let mut padding = 0u64;
+    let mut uncertain_min = 0u64;
+    let mut uncertain_max = 0u64;
+    let mut uncertain_expected_eighths = 0u64;
     let mut columns = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        let (p, size) = match kind {
-            ColumnKind::Fixed { len, align } => (pad(off, align.bytes()), *len),
+        let pad_before = match kind {
+            ColumnKind::Fixed { align, .. } => residues.pad_to(align.bytes()),
             // A short varlena (1-byte header) is stored with no alignment at all (tupmacs.h).
-            ColumnKind::Varlena { proven_short: true, .. } => (0, VARLENA_SHORT_HEADER),
+            ColumnKind::Varlena { proven_short: true, .. } => PadRange::certain(0),
             ColumnKind::Varlena {
                 align,
                 proven_short: false,
-            } => (pad(off, align.bytes()), VARLENA_LONG_HEADER),
+            } => residues.pad_to(align.bytes()),
         };
-        off += p;
+        match pad_before.exact() {
+            Some(p) => padding += p,
+            None => {
+                uncertain_min += pad_before.min;
+                uncertain_max += pad_before.max;
+                uncertain_expected_eighths += pad_before.expected_eighths;
+            }
+        }
         columns.push(ColumnWalk {
-            pad_before: p,
-            offset: off,
+            pad_before,
+            // While `end` is known the residue set is a singleton, so `min` is the pad.
+            offset: end.map(|e| e + pad_before.min),
         });
-        off += size;
-        padding += p;
+        match kind {
+            ColumnKind::Fixed { len, align } => {
+                residues = residues.aligned(align.bytes()).shifted(*len);
+                end = end.map(|e| e + pad_before.min + len);
+            }
+            ColumnKind::Varlena { .. } => {
+                residues = Residues::FULL;
+                end = None;
+            }
+        }
     }
     Walk {
         columns,
         padding,
-        scenario_end: off,
+        uncertain_min,
+        uncertain_max,
+        uncertain_expected_eighths,
+        end,
     }
 }
 
 /// Per-row on-disk footprint for a table of only fixed-width columns, no-NULL scenario:
 /// MAXALIGN(t_hoff) + data, MAXALIGN-rounded as the page placement does (bufpage.c).
-pub fn footprint(scenario_end_all_fixed: u64) -> u64 {
-    footprint_at(maxalign(TUPLE_HEADER), scenario_end_all_fixed)
+pub fn footprint(data_end_all_fixed: u64) -> u64 {
+    footprint_at(maxalign(TUPLE_HEADER), data_end_all_fixed)
 }
 
 /// Footprint with an explicit data-start offset — used when dropped columns force a null
 /// bitmap into every new row (`t_hoff = null_thoff(original natts)`).
-pub fn footprint_at(t_hoff: u64, scenario_end_all_fixed: u64) -> u64 {
-    maxalign(t_hoff + scenario_end_all_fixed)
+pub fn footprint_at(t_hoff: u64, data_end_all_fixed: u64) -> u64 {
+    maxalign(t_hoff + data_end_all_fixed)
 }
 
 /// Rows of this footprint per 8192-byte heap page, after the 24-byte page header and one 4-byte
@@ -363,15 +519,15 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 }
 
 /// How solid the reported numbers are. `Exact`: only fixed-width columns — padding and footprint
-/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — numbers describe the
-/// long-form scenario; real rows are data-dependent (short-form/TOAST), so savings are bounds,
-/// never guarantees.
+/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — columns after it sit
+/// at data-dependent offsets, so padding is an expected value with a min/max range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
     /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
-    /// At least one varlena: long-form-scenario numbers — bounds, not guarantees.
+    /// At least one varlena: columns after it sit at data-dependent offsets — padding is
+    /// reported as expected values with bounds.
     Estimate,
     /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
     /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`

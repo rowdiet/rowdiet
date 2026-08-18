@@ -16,8 +16,8 @@
 //! let table = &analysis.tables[0];
 //! assert_eq!(table.current.footprint, Some(56));
 //! assert_eq!(table.suggested.footprint, Some(48));
-//! assert_eq!(table.avoidable_bytes_per_row, 8);
-//! assert_eq!(analysis.worst_avoidable(), 8);
+//! assert_eq!(table.avoidable_bytes_per_row, 8.0);
+//! assert_eq!(analysis.worst_avoidable(), 8.0);
 //! ```
 
 pub mod baseline;

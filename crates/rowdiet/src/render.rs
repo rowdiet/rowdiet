@@ -19,7 +19,7 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOu
     let wasteful = analysis
         .tables
         .iter()
-        .filter(|t| !t.ignored && t.avoidable_bytes_per_row > 0)
+        .filter(|t| !t.ignored && t.avoidable_bytes_per_row > 0.0)
         .count();
     let skipped = analysis
         .notes
@@ -119,11 +119,14 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         render_flags(out, t);
         return;
     }
-    if t.avoidable_bytes_per_row == 0 {
+    if t.avoidable_bytes_per_row == 0.0 {
         let detail = match (t.tier, t.current.padding) {
+            _ if t.current.padding_min != t.current.padding_max => {
+                format!("{}, none avoidable by reordering", stats_line(&t.current))
+            }
             (_, 0) => "optimal: zero padding".to_string(),
             (Tier::Exact, p) => format!("{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain"),
-            (Tier::Estimate, p) => format!("{p} B scenario padding, none avoidable by reordering"),
+            (Tier::Estimate, p) => format!("{p} B padding/row, none avoidable by reordering"),
             // Incomplete tables return above as "not analyzable"; unreachable here in practice.
             (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
@@ -142,7 +145,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     let _ = writeln!(out, "  current  : {}", stats_line(&t.current));
     let _ = writeln!(
         out,
-        "  suggested: {} → {} B/row avoidable",
+        "  suggested: {} → {:.1} B/row avoidable",
         stats_line(&t.suggested),
         t.avoidable_bytes_per_row
     );
@@ -151,7 +154,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         let _ = writeln!(
             out,
             "  × {n} rows ≈ {}",
-            human_bytes(t.avoidable_bytes_per_row.saturating_mul(n))
+            human_bytes(t.avoidable_bytes_per_row * n as f64)
         );
     }
     render_flags(out, t);
@@ -166,7 +169,7 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
         Some(TableVerdict::Regression { avoidable, allowed }) => {
             let _ = writeln!(
                 out,
-                "  ✗ regression: {avoidable} B/row exceeds the baselined allowance of {allowed}"
+                "  ✗ regression: {avoidable:.1} B/row exceeds the baselined allowance of {allowed}"
             );
         }
         Some(TableVerdict::GrownSinceBaseline { allowed, .. }) => {
@@ -185,9 +188,11 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
             );
         }
         Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
+            // Entries store whole bytes, so accepting would write the ceiling.
             let _ = writeln!(
                 out,
-                "  ↓ ratchet: allowance {allowed} can tighten to {avoidable} — --accept {}",
+                "  ↓ ratchet: allowance {allowed} can tighten to {} — --accept {}",
+                rowdiet_core::baseline::ceil_bytes(avoidable),
                 t.name
             );
         }
@@ -198,7 +203,11 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
 fn stats_line(s: &OrderStats) -> String {
     match (s.footprint, s.rows_per_page) {
         (Some(fp), Some(rp)) => format!("{} B padding, {fp} B/row footprint, {rp} rows/8kB page", s.padding),
-        _ => format!("{} B padding/row (long-form scenario)", s.padding),
+        _ if s.padding_min == s.padding_max => format!("{} B padding/row", s.padding),
+        _ => format!(
+            "{:.1} B/row expected padding ({} B deterministic, range {}–{}, data-dependent)",
+            s.expected_padding, s.padding, s.padding_min, s.padding_max
+        ),
     }
 }
 
@@ -249,7 +258,7 @@ fn maybe_quote(ident: &str) -> String {
 fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Exact => "exact — fixed-width only",
-        Tier::Estimate => "estimate — long-form varlena scenario",
+        Tier::Estimate => "estimate — columns placed at data-dependent offsets",
         Tier::Unknown => "unknown — columns not fully known",
     }
 }
@@ -273,13 +282,13 @@ fn kind_label(kind: NoteKind) -> &'static str {
     }
 }
 
-fn human_bytes(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / 1e9)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / 1e6)
-    } else if bytes >= 1_000 {
-        format!("{:.1} kB", bytes as f64 / 1e3)
+fn human_bytes(bytes: f64) -> String {
+    if bytes >= 1e9 {
+        format!("{:.1} GB", bytes / 1e9)
+    } else if bytes >= 1e6 {
+        format!("{:.1} MB", bytes / 1e6)
+    } else if bytes >= 1e3 {
+        format!("{:.1} kB", bytes / 1e3)
     } else {
         format!("{bytes} B")
     }
@@ -289,7 +298,7 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
     let mut out = String::new();
     let mut budget = AnnotationBudget::new();
     for t in &analysis.tables {
-        if t.ignored || t.avoidable_bytes_per_row == 0 {
+        if t.ignored || t.avoidable_bytes_per_row == 0.0 {
             continue;
         }
         let verdict = gate.verdicts.get(&t.name).copied();
@@ -305,7 +314,7 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             _ => "rowdiet",
         };
         let message = format!(
-            "table {}: {} B/row avoidable ({}) — suggested order: {}",
+            "table {}: {:.1} B/row avoidable ({}) — suggested order: {}",
             t.name,
             t.avoidable_bytes_per_row,
             tier_label(t.tier),
@@ -450,7 +459,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {tier} | {verdict} | {}:{} |",
+            "| {} | {:.1} | {tier} | {verdict} | {}:{} |",
             markdown_cell(&t.display),
             t.avoidable_bytes_per_row,
             markdown_cell(&t.origin.source),

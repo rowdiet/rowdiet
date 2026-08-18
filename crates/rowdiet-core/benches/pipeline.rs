@@ -293,7 +293,7 @@ fn bench_gate(c: &mut Criterion) {
             (
                 t.name.clone(),
                 BaselineEntry {
-                    bytes: t.avoidable_bytes_per_row,
+                    bytes: baseline::ceil_bytes(t.avoidable_bytes_per_row),
                     layout: t.layout_signature.clone(),
                 },
             )

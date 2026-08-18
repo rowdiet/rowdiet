@@ -33,14 +33,16 @@ pub struct Baseline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BaselineEntry {
-    /// Accepted avoidable bytes/row, in force while `layout` still describes the table.
+    /// Accepted avoidable bytes/row, in force while `layout` still describes the table. Whole
+    /// bytes: a fractional expected value rounds up on acceptance (an allowance is an upper
+    /// bound, so up is the conservative direction).
     pub bytes: u64,
     /// The table's [`crate::report::layout_signature`] at acceptance time.
     pub layout: String,
 }
 
 /// Per-table gate result. `allowed` is the baselined allowance that applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize),
@@ -56,14 +58,14 @@ pub enum TableVerdict {
     /// No baseline entry and avoidable exceeds `fail_over`.
     NewViolation {
         /// Current avoidable bytes/row.
-        avoidable: u64,
+        avoidable: f64,
     },
     /// Entry applies (signature unchanged) but avoidable exceeds the allowance. With an
     /// unchanged layout the number can only move through hand-tightened entries or analyzer
     /// improvements — either way the recorded allowance is the contract.
     Regression {
         /// Current avoidable bytes/row.
-        avoidable: u64,
+        avoidable: f64,
         /// The baselined allowance in force.
         allowed: u64,
     },
@@ -72,7 +74,7 @@ pub enum TableVerdict {
     /// appending migration is unapplied — reorder the new columns — or acceptable explicitly.
     GrownSinceBaseline {
         /// Current avoidable bytes/row.
-        avoidable: u64,
+        avoidable: f64,
         /// The baselined allowance in force.
         allowed: u64,
     },
@@ -80,12 +82,12 @@ pub enum TableVerdict {
     /// meet `fail_over`. Re-accept deliberately or fix the layout in the rewriting migration.
     ModifiedSinceBaseline {
         /// Current avoidable bytes/row.
-        avoidable: u64,
+        avoidable: f64,
     },
     /// Passing, and better than the allowance — the entry can be tightened (explicitly).
     RatchetOpportunity {
         /// Current avoidable bytes/row.
-        avoidable: u64,
+        avoidable: f64,
         /// The baselined allowance the table now beats.
         allowed: u64,
     },
@@ -124,7 +126,7 @@ impl std::fmt::Display for TableVerdict {
 }
 
 /// What [`evaluate`] concluded: the overall pass/fail plus everything a renderer needs to say why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GateOutcome {
     /// The gate failed: some verdict is failing, or the analysis degraded under
@@ -229,7 +231,7 @@ fn table_verdict(
         return (TableVerdict::Incomplete, false);
     }
     let avoidable = table.avoidable_bytes_per_row;
-    let over_limit = |limit: Option<u64>| limit.is_some_and(|l| avoidable > l);
+    let over_limit = |limit: Option<u64>| limit.is_some_and(|l| avoidable > l as f64);
     let Some(entry) = entry else {
         let verdict = if over_limit(default_limit) {
             TableVerdict::NewViolation { avoidable }
@@ -240,9 +242,13 @@ fn table_verdict(
     };
     let allowed = entry.bytes;
     let verdict = match relation(&entry.layout, &table.layout_signature) {
-        SignatureRelation::Match if avoidable > allowed => TableVerdict::Regression { avoidable, allowed },
-        SignatureRelation::Grown if avoidable > allowed => TableVerdict::GrownSinceBaseline { avoidable, allowed },
-        SignatureRelation::Match | SignatureRelation::Grown if avoidable < allowed => {
+        SignatureRelation::Match if avoidable > allowed as f64 => TableVerdict::Regression { avoidable, allowed },
+        SignatureRelation::Grown if avoidable > allowed as f64 => {
+            TableVerdict::GrownSinceBaseline { avoidable, allowed }
+        }
+        // Ratchet on the value an acceptance would store: a fractional avoidable under a
+        // ceiling-stored allowance is already as tight as an entry can record it.
+        SignatureRelation::Match | SignatureRelation::Grown if ceil_bytes(avoidable) < allowed => {
             TableVerdict::RatchetOpportunity { avoidable, allowed }
         }
         SignatureRelation::Match | SignatureRelation::Grown => TableVerdict::Pass,
@@ -250,6 +256,11 @@ fn table_verdict(
         SignatureRelation::Different => return (TableVerdict::Pass, true),
     };
     (verdict, false)
+}
+
+/// A fractional avoidable value rounded up to the whole bytes a baseline entry stores.
+pub fn ceil_bytes(avoidable: f64) -> u64 {
+    avoidable.ceil() as u64
 }
 
 enum SignatureRelation {
@@ -279,12 +290,12 @@ fn relation(baselined: &str, current: &str) -> SignatureRelation {
 pub fn build_from(analysis: &Analysis, fail_over: u64, version: &str) -> Baseline {
     let tables = analysis
         .gated_tables()
-        .filter(|t| t.avoidable_bytes_per_row > fail_over)
+        .filter(|t| t.avoidable_bytes_per_row > fail_over as f64)
         .map(|t| {
             (
                 t.name.clone(),
                 BaselineEntry {
-                    bytes: t.avoidable_bytes_per_row,
+                    bytes: ceil_bytes(t.avoidable_bytes_per_row),
                     layout: t.layout_signature.clone(),
                 },
             )
@@ -314,11 +325,11 @@ pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[Stri
             .ok_or_else(|| format!("cannot accept `{name}`: no such table in the analyzed DDL (or it is ignored)"))?;
         // Entries are stored under the canonical fold key regardless of which spelling the
         // caller used to name the table — an entry keyed by display would never match a gate.
-        if table.avoidable_bytes_per_row > baseline.fail_over {
+        if table.avoidable_bytes_per_row > baseline.fail_over as f64 {
             baseline.tables.insert(
                 table.name.clone(),
                 BaselineEntry {
-                    bytes: table.avoidable_bytes_per_row,
+                    bytes: ceil_bytes(table.avoidable_bytes_per_row),
                     layout: table.layout_signature.clone(),
                 },
             );
