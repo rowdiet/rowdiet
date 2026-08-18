@@ -42,29 +42,48 @@ later column aligns against — the total payload is order-invariant while its e
 downstream padding is order-dependent. The walk therefore carries the offset as a set of possible
 residues mod 8: exact until the first varlena, the full set after any varlena (a proven-short
 typmod bounds only the header form, payload byte length still varies), narrowed again by
-alignment (an 8-aligned
-column collapses any set back to a single residue). Each pad placed over a non-singleton set is
-reported as min/max/expected, with residues taken as uniformly likely — a stated assumption.
-Pads placed while the residue is exactly known stay exact.
+alignment (an 8-aligned column collapses any set back to a single residue). Each pad placed over
+a non-singleton set is reported as min/max/expected. Pads placed while the residue is exactly
+known stay exact.
+
+A varlena has three on-disk forms, and only one of them pads. Postgres packs any payload of
+126 bytes or less into the 1-byte-header short form and stores it **unaligned**
+(`heap_compute_data_size` converts, `att_align_datum` skips alignment); a toasted value is an
+18-byte pointer, also unaligned; only the in-line long form (4-byte header, payloads from
+127 bytes up to the TOAST threshold) aligns. pageinspect confirms all three: a
+`(float8, timestamp, int4, text×5)` table with short payloads is flat at zero padding, and
+4 kB `STORAGE EXTERNAL` payloads leave 18-byte unaligned pointers.
+
+Expected values therefore rest on two stated assumptions, both printed in the estimate tier's
+label:
+
+1. **Varlena pads are scored at the short-form/TOAST value of zero.** The long form
+   contributes only to the pad's max. Payloads that land in the long-form band raise the real
+   number toward that max.
+2. **Offset residues after a varlena are taken as uniformly likely.** Real payload-width
+   distributions can be skewed mod 8 (fixed-length codes; a TOAST pointer pins the residue
+   entirely), which moves later fixed-column pads inside the reported min/max range.
+
+The min/max bounds hold without either assumption: they range over every residue and every
+storage form, and both ends are jointly achievable across a walk (each varlena resets the
+reachable set to full, so per-column extremes compose; pinned by an enumeration test that
+simulates concrete tuples).
 
 Tiers:
 
 - **Exact** — table has only fixed-width columns. Padding and footprint are byte-exact
   (fixed-width values are never toasted/compressed). Headline = MAXALIGN-rounded footprint delta;
   `avoidable == 0` whenever the reorder doesn't cross an 8-byte rung, even if raw padding drops.
-- **Estimate** — any varlena present. Headline = expected-padding delta, labeled, possibly
-  fractional. Real rows differ (short-form/TOAST make varlena alignment data-dependent three
-  ways), so no guarantee is claimed.
+- **Estimate** — any varlena present. Headline = expected-padding delta under the two stated
+  assumptions, labeled, possibly fractional. No guarantee is claimed; the min/max range is the
+  guaranteed envelope.
 
 Why no middle tier: even for "fixed prefix + varlena tail preserved" the *total* delta is not
-byte-guaranteed — payload lengths shift downstream pads in both orders. There is a useful
-provable fact recorded here for a future refinement: with the tail sequence preserved, the
-realized recovery is **never negative** (induction over the walk: a running delta `D ≥ 0` before
-an item of alignment `a` becomes `D' = D + pad(x+D,a) − pad(x,a) ≥ 0`). So the current Estimate
-label is conservative, not wrong. A tempting third metric — "guaranteed padding computed over
-the fixed columns alone" — is deliberately absent: it only describes the *clustered* layout,
-while in an interleaved table a fixed column's real offset rides on the preceding varlena's
-actual length, so presenting that number as guaranteed for the as-written order would overclaim.
+byte-guaranteed — payload lengths shift downstream pads in both orders. The report does carry a
+"deterministic" component (`OrderStats.padding`, the pads whose value the DDL fixes), and it
+always appears beside the expected value and the range: in an interleaved table a fixed
+column's real offset rides on the preceding varlena's actual length, so a fixed-columns-only
+number presented alone would overclaim for the as-written order.
 
 Null bitmap: present per-row when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it never changes reorder
@@ -78,14 +97,22 @@ Sort key: `(fixed=0 | varlena=1 | proven-short=2, alignment desc, irregular-last
 index)`. Irregulars are fixed types whose size isn't a multiple of their own alignment — exactly
 `timetz (12,d)` and `macaddr (6,i)` among built-ins (also `tid (6,s)`); putting them last in
 their group keeps every following smaller-alignment column aligned. For all-regular schemas the
-result is provably zero-padding under any NULL mask (a subsequence of a desc-aligned regular
-sequence is still one). With ≥2 irregulars in one group a sorted order can leave padding an
-interposed smaller column would absorb (two `timetz` pad 4 between; `timetz, int4, timetz` is
-zero) — when the sorted fixed block still pads, `refine_fixed_block` finds the exact padding
-minimum with a memoized search over (alignment, len mod 8) classes × offset residue (ties prefer
-the heuristic's class order; capped at 24 fixed columns / 12 classes, falling back to the sort).
-The report never overclaims: both layouts are *computed*, never assumed, and a safety guard
-keeps the original order whenever the suggestion doesn't strictly improve the metric.
+result expects zero padding under any NULL mask (a subsequence of a desc-aligned regular
+sequence is still one; varlena pads score zero and long-form storage can still add bytes, shown
+as the range). When the heuristic order still expects padding, `refine_order` finds the exact
+minimum of the expected objective: expected padding depends only on (alignment, len mod 8)
+classes (all varlenas collapse into one class: expected pad 0, residue set widens to full)
+and the running residue-set state (the 15 cosets of Z/8), so a memoized search over class
+counts × set states is exhaustive. That search covers both irregular-block repairs
+(`timetz, int4, timetz` is zero where the sort pads 4) and cases where a block that cannot pack
+flat expects less with a fixed column placed behind a varlena (`timetz, text, timetz` expects
+3.5 against a certain 4, advice that leans on the uniformity assumption, like every expected
+value here). Ties prefer the heuristic's class order; capped at 24 columns / 12 classes,
+falling back to the sort. A property test pins the search's minimality against exhaustive
+permutation search, varlenas included. The report never overclaims: both layouts are
+*computed*, never assumed, and a safety guard keeps the original order whenever the suggestion
+doesn't strictly improve the expected objective (reachable only past the caps, where the
+heuristic answer is not exact).
 
 ## Type catalog provenance
 
@@ -175,6 +202,13 @@ about everything new. Design points, in the order they were decided:
   `--update-baseline` rewrites the whole file from the current analysis, `--accept <table>`
   refreshes exactly one entry (the reviewable one-line diff for accepting one table's growth,
   and the same mechanism prunes an entry once its table comes clean).
+- **Entries store the exact reported value, fractions included.** Estimate-tier avoidable
+  numbers move in eighths of a byte, and eighths are exact in both f64 and JSON, so an entry
+  accepted at 3.5 is stored as 3.5: any later exceedance is a regression and any improvement
+  is a ratchet opportunity. Rounding the stored value up would open a window between the real
+  number and its ceiling where regressions pass silently (accepting 0.5 as 1 permits a 2×
+  regression); storing exactly closes it. `--fail-over` accepts fractions for the same reason.
+  Files from versions that stored whole bytes load unchanged (integers parse as the same f64).
 
 The gate also carries degradation: counts of skipped statements and incomplete tables ride in
 the outcome (a bytes-only gate would stay green over an unparseable migration set), and
