@@ -3,8 +3,9 @@
 //! Reporting contract: for fixed-width-only tables everything is byte-exact —
 //! the headline is the MAXALIGN-rounded footprint delta, and a reorder that does not cross an
 //! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get expected-value
-//! numbers with a data-dependent min/max range (columns after a varlena sit at unknown
-//! offsets), labeled as estimates and never claimed as guaranteed savings.
+//! numbers with a data-dependent min/max range, under the layout module doc's two stated
+//! assumptions (varlena pads scored at the short/TOAST form, offset residues uniform), labeled
+//! as estimates and never claimed as guaranteed savings.
 
 use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
@@ -120,10 +121,11 @@ pub struct ColumnReport {
     /// Resolved storage class.
     pub kind: ColumnKind,
     /// Padding before this column in the current order, bytes — when its value is certain;
-    /// None when it depends on the payload lengths of preceding varlenas.
+    /// None when it depends on the payload lengths of preceding varlenas or, for a varlena,
+    /// on its own storage form.
     pub pad_before: Option<u64>,
-    /// Data start within the data area, bytes (tuple header not included); None from the first
-    /// varlena on (its payload moves every later offset).
+    /// Data start within the data area, bytes (tuple header not included); None once it is
+    /// data-dependent (payload lengths of earlier varlenas, or this varlena's own pad).
     pub offset: Option<u64>,
 }
 
@@ -137,6 +139,8 @@ pub struct OrderStats {
     pub padding: u64,
     /// Expected total padding, bytes per row: `padding` plus the expected values of the
     /// data-dependent pads (equals `padding` when there are none; fractional otherwise).
+    /// Expected values follow the layout module doc's stated assumptions: varlena pads scored
+    /// at the short/TOAST form, offset residues uniform.
     pub expected_padding: f64,
     /// Smallest possible total padding, bytes per row (equals `padding` when nothing is
     /// data-dependent).
@@ -178,25 +182,27 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     }
     let current = stats(tier, &current_walk, t_hoff);
     let suggested = stats(tier, &suggested_walk, t_hoff);
-    let avoidable = match tier {
-        Tier::Exact => current
-            .footprint
-            .unwrap_or(0)
-            .saturating_sub(suggested.footprint.unwrap_or(0)) as f64,
-        // Expected-padding delta, in exact eighths of a byte.
-        Tier::Estimate => {
-            current_walk
-                .expected_padding_eighths()
-                .saturating_sub(suggested_walk.expected_padding_eighths()) as f64
-                / 8.0
+    // Integer eighths of a byte until the very end: the zero check carries no float error.
+    let avoidable_eighths = match tier {
+        Tier::Exact => {
+            current
+                .footprint
+                .unwrap_or(0)
+                .saturating_sub(suggested.footprint.unwrap_or(0))
+                * 8
         }
-        // Columns unknown: no avoidable waste can be claimed. The incomplete verdict, not a
-        // fabricated byte count, carries the "not analyzed" signal.
-        Tier::Unknown => 0.0,
+        // Expected-padding delta under the stated model (see the layout module doc).
+        Tier::Estimate => current_walk
+            .expected_padding_eighths()
+            .saturating_sub(suggested_walk.expected_padding_eighths()),
+        // Columns unknown: no avoidable waste can be claimed, and the incomplete verdict
+        // carries the "not analyzed" signal.
+        Tier::Unknown => 0,
     };
+    let avoidable = avoidable_eighths as f64 / 8.0;
     // With nothing avoidable the suggestion IS the current order; the stats must say the same
     // thing, or the JSON contradicts itself (suggested.padding 0 beside the original order).
-    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable == 0.0 {
+    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable_eighths == 0 {
         ((0..kinds.len()).collect(), current.clone())
     } else {
         (order, suggested)

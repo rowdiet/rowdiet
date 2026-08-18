@@ -4,9 +4,22 @@
 //! All row numbers assume every column non-NULL. Varlena payload bytes never count toward sizes
 //! (they are unknowable from DDL), but they do move every later column's offset: from the first
 //! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
-//! later pad is reported as a min/max/expected range over that set (residues taken as uniformly
-//! likely, by assumption). Pads placed while the offset is exactly
-//! known stay exact, so all-fixed tables keep byte-exact numbers.
+//! later pad is reported as a min/max/expected range over that set.
+//!
+//! Two stated modeling assumptions feed every expected value, and only bounds hold without them:
+//!
+//! 1. **Varlena pads are scored at the short-form/TOAST value of zero.** Postgres stores a
+//!    varlena payload of 126 bytes or less with a 1-byte header and no alignment
+//!    (`heap_compute_data_size` packs it, `att_align_datum` skips alignment), and a toasted
+//!    value as an 18-byte unaligned pointer. Only the in-line long form (payloads of roughly
+//!    127 bytes up to the TOAST threshold) aligns, so a varlena's own pad is zero in two of the
+//!    three storage regimes; the long form contributes only to the pad's `max`.
+//! 2. **Offset residues after a varlena are taken as uniformly likely.** Real payload-width
+//!    distributions can be skewed mod 8 (fixed-length codes, TOAST pointers pin the residue),
+//!    which moves the expectation of later fixed-column pads inside the reported min/max range.
+//!
+//! Pads placed while the offset is exactly known stay exact, so all-fixed tables keep
+//! byte-exact numbers.
 
 /// The 64-bit PostgreSQL MAXALIGN: tuple headers, data starts, and footprints all round to
 /// 8-byte boundaries.
@@ -97,17 +110,20 @@ pub fn maxalign(n: u64) -> u64 {
     n + pad(n, MAXALIGN)
 }
 
-/// One pad's bounds and expectation. When the column sits at an exactly known offset (or every
-/// possible offset pads the same), `min == max` and the pad is that one value; otherwise the
-/// numbers range over the possible offset residues mod MAXALIGN.
+/// One pad's bounds and expectation. When the pad's value is certain, `min == max` and the pad
+/// is that one value; otherwise the bounds range over the possible offset residues mod MAXALIGN
+/// and, for a varlena, over its storage forms. `min` and `max` are jointly achievable across a
+/// whole walk: any residue stays reachable after any earlier extreme, so the per-column extremes
+/// compose (pinned by a test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PadRange {
     /// Smallest possible pad, bytes.
     pub min: u64,
     /// Largest possible pad, bytes.
     pub max: u64,
-    /// Mean pad over the possible residues, in eighths of a byte — eighths keep it exact, since
-    /// reachable residue sets have 1, 2, 4, or 8 members, all dividing 8.
+    /// Expected pad under the module doc's stated assumptions (short/TOAST varlena forms,
+    /// uniform residues), in eighths of a byte — eighths keep it exact, since reachable residue
+    /// sets have 1, 2, 4, or 8 members, all dividing 8.
     pub expected_eighths: u64,
 }
 
@@ -153,17 +169,22 @@ impl Residues {
     }
 
     fn len(self) -> u64 {
+        debug_assert!(self.0 != 0, "empty residue set");
         u64::from(self.0.count_ones())
     }
 
-    /// Pad statistics for aligning to `align` from any residue in the set.
+    /// Pad statistics for aligning to `align` from any residue in the set. Singleton sets (the
+    /// whole walk of an all-fixed table, and most search states) skip the residue loop.
     fn pad_to(self, align: u64) -> PadRange {
+        if self.0.count_ones() == 1 {
+            return PadRange::certain(pad_pow2(u64::from(self.0.trailing_zeros()), align));
+        }
         let mut min = u64::MAX;
         let mut max = 0u64;
         let mut sum = 0u64;
         for residue in 0..MAXALIGN {
             if self.contains(residue) {
-                let p = pad(residue, align);
+                let p = pad_pow2(residue, align);
                 min = min.min(p);
                 max = max.max(p);
                 sum += p;
@@ -181,10 +202,14 @@ impl Residues {
     /// The set after aligning to `align`: each residue moves to its next `align` boundary.
     /// Aligning to 8 collapses any set to `{0}`; aligning the full set to 4 leaves `{0, 4}`.
     fn aligned(self, align: u64) -> Self {
+        if self.0.count_ones() == 1 {
+            let residue = u64::from(self.0.trailing_zeros());
+            return Self(1u8 << ((residue + pad_pow2(residue, align)) % MAXALIGN));
+        }
         let mut mask = 0u8;
         for residue in 0..MAXALIGN {
             if self.contains(residue) {
-                mask |= 1u8 << ((residue + pad(residue, align)) % MAXALIGN);
+                mask |= 1u8 << ((residue + pad_pow2(residue, align)) % MAXALIGN);
             }
         }
         Self(mask)
@@ -202,7 +227,8 @@ pub struct ColumnWalk {
     /// Padding inserted immediately before this column.
     pub pad_before: PadRange,
     /// The column's data start, bytes from the beginning of the data area (t_hoff not
-    /// included) — known only until the first varlena, whose payload moves every later offset.
+    /// included), claimed only while it is certain: the first varlena's payload moves every
+    /// later offset, and a varlena whose own pad depends on its storage form has none either.
     pub offset: Option<u64>,
 }
 
@@ -264,10 +290,15 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
             ColumnKind::Fixed { align, .. } => residues.pad_to(align.bytes()),
             // A short varlena (1-byte header) is stored with no alignment at all (tupmacs.h).
             ColumnKind::Varlena { proven_short: true, .. } => PadRange::certain(0),
+            // Short/TOAST forms store unaligned (expected pad 0); only the long form sets the max.
             ColumnKind::Varlena {
                 align,
                 proven_short: false,
-            } => residues.pad_to(align.bytes()),
+            } => PadRange {
+                min: 0,
+                max: residues.pad_to(align.bytes()).max,
+                expected_eighths: 0,
+            },
         };
         match pad_before.exact() {
             Some(p) => padding += p,
@@ -279,8 +310,8 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
         }
         columns.push(ColumnWalk {
             pad_before,
-            // While `end` is known the residue set is a singleton, so `min` is the pad.
-            offset: end.map(|e| e + pad_before.min),
+            // An offset is claimed only while both the running end and this pad are certain.
+            offset: end.and_then(|e| pad_before.exact().map(|p| e + p)),
         });
         match kind {
             ColumnKind::Fixed { len, align } => {
@@ -332,89 +363,101 @@ pub fn null_thoff(natts: usize) -> u64 {
     maxalign(TUPLE_HEADER + (natts as u64).div_ceil(8))
 }
 
-/// Suggested column order: fixed before varlena; alignment descending; within a fixed alignment
-/// group regular sizes before irregulars; varlenas alignment-descending with typmod-proven-short
-/// ones last (they never align); stable by original position everywhere else.
+/// Suggested column order: the heuristic sort (fixed before varlena; alignment descending;
+/// within a fixed alignment group regular sizes before irregulars; varlenas
+/// alignment-descending with typmod-proven-short ones last; stable by original position),
+/// refined by an exact search whenever the heuristic still expects padding. Within the search's
+/// caps (24 columns, 12 padding classes) the result minimizes expected padding under the module
+/// doc's stated assumptions.
 pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..kinds.len()).collect();
     order.sort_by_key(|&i| sort_key(&kinds[i], i));
-    refine_fixed_block(kinds, &mut order);
+    refine_order(kinds, &mut order);
     order
 }
 
-/// Descending-alignment sorting is provably zero-padding only while every size is a multiple of
-/// its own alignment; with two or more irregulars (timetz, macaddr, …) it can leave padding an
-/// interposed smaller column would absorb. When the sorted fixed block still pads, find the
-/// exact minimum: padding depends only on (alignment, len mod MAXALIGN) classes and the running
-/// offset mod MAXALIGN, so a small memoized search over class counts is exhaustive. Ties prefer
-/// the heuristic's own class order, so regular schemas keep their familiar shape.
-fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
-    let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
-    if !(3..=24).contains(&fixed_len) {
+/// Descending-alignment sorting expects zero padding for most schemas, but not all: with two or
+/// more irregulars (timetz, macaddr, …) the fixed block can keep padding an interposed smaller
+/// column would absorb, and a block that cannot pack flat can even expect less by placing a
+/// fixed column after a varlena (a certain pad of 4 loses to an expected 3.5 over the full
+/// residue set). When the heuristic order still expects padding, find the exact minimum:
+/// expected padding depends only on (alignment, len mod MAXALIGN) classes (all varlenas form
+/// one class: expected pad 0, set widens to full) and the running residue set, so a memoized
+/// search over class counts × set states is exhaustive. Ties prefer the heuristic's own class
+/// order, so regular schemas keep their familiar shape.
+fn refine_order(kinds: &[ColumnKind], order: &mut [usize]) {
+    let total = order.len();
+    if !(2..=24).contains(&total) {
         return;
     }
-    let sorted_fixed: Vec<ColumnKind> = order[..fixed_len].iter().map(|&i| kinds[i]).collect();
-    if walk(&sorted_fixed).padding == 0 {
+    let heuristic: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+    // Zero expected padding is the global minimum, so the heuristic order stands.
+    if walk(&heuristic).expected_padding_eighths() == 0 {
         return;
     }
-    let classes = fixed_classes(kinds, &order[..fixed_len]);
+    let classes = padding_classes(kinds, order);
     if classes.len() > 12 {
         return;
     }
-    // Upper bound of the reachable state space: every count combination × offset residue.
+    // Upper bound of the reachable state space: every count combination × residue-set state.
     // Pre-sizing spares the memo a dozen rehashes of an ever-growing table; the cap keeps the
-    // up-front allocation modest when the bound explodes (3^12 × 8 at the class/column caps);
-    // past the cap the map grows the rest of the way as before.
+    // up-front allocation modest when the bound explodes; past the cap the map grows the rest
+    // of the way as before.
     let states: usize = classes
         .iter()
         .map(|c| c.members.len() + 1)
         .product::<usize>()
-        .saturating_mul(MAXALIGN as usize)
+        .saturating_mul(SET_STATES)
         .min(1 << 17);
     let mut dp = Dp {
         classes: &classes,
         memo: std::collections::HashMap::with_capacity_and_hasher(states, PackedKeyHasherBuilder),
     };
     let mut counts: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
-    let mut remaining = fixed_len;
-    let mut off = 0u64;
+    let mut remaining = total;
+    let mut set = Residues::START;
     let mut queues: Vec<std::collections::VecDeque<usize>> =
         classes.iter().map(|c| c.members.iter().copied().collect()).collect();
-    let mut refined = Vec::with_capacity(fixed_len);
+    let mut refined = Vec::with_capacity(total);
     while remaining > 0 {
-        let target = dp.min_padding(&mut counts, remaining, off);
+        let target = dp.min_expected_eighths(&mut counts, remaining, set);
         for class_index in 0..classes.len() {
             if counts[class_index] == 0 {
                 continue;
             }
-            let (align, len_mod) = classes[class_index].key;
-            let step = pad(off, align);
+            let key = classes[class_index].key;
+            let step = key.expected_pad_eighths(set);
             counts[class_index] -= 1;
-            let rest = dp.min_padding(&mut counts, remaining - 1, (off + step + len_mod) % MAXALIGN);
+            let rest = dp.min_expected_eighths(&mut counts, remaining - 1, key.next_set(set));
             if step + rest == target {
                 refined.push(queues[class_index].pop_front().expect("count tracked"));
-                off = (off + step + len_mod) % MAXALIGN;
+                set = key.next_set(set);
                 remaining -= 1;
                 break;
             }
             counts[class_index] += 1;
         }
     }
-    order[..fixed_len].copy_from_slice(&refined);
+    order.copy_from_slice(&refined);
 }
 
-/// Group the fixed prefix of `order` into its padding-equivalence classes, heuristic order
-/// preserved (first appearance) so the search's tie-breaking keeps the familiar shape.
-fn fixed_classes(kinds: &[ColumnKind], fixed_order: &[usize]) -> Vec<FixedClass> {
-    let mut classes: Vec<FixedClass> = Vec::new();
-    for &index in fixed_order {
-        let ColumnKind::Fixed { len, align } = kinds[index] else {
-            unreachable!("fixed prefix")
+/// Group `order` into its padding-equivalence classes, heuristic order preserved (first
+/// appearance) so the search's tie-breaking keeps the familiar shape. Every varlena falls into
+/// one class: proven short or not, its expected pad is 0 and it widens the set to full, so the
+/// walk cannot tell them apart (their relative order stays the heuristic's).
+fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
+    let mut classes: Vec<PaddingClass> = Vec::new();
+    for &index in order {
+        let key = match kinds[index] {
+            ColumnKind::Fixed { len, align } => ClassKey::Fixed {
+                align: align.bytes(),
+                len_mod: len % MAXALIGN,
+            },
+            ColumnKind::Varlena { .. } => ClassKey::Varlena,
         };
-        let key = (align.bytes(), len % MAXALIGN);
         match classes.iter_mut().find(|c| c.key == key) {
             Some(class) => class.members.push(index),
-            None => classes.push(FixedClass {
+            None => classes.push(PaddingClass {
                 key,
                 members: vec![index],
             }),
@@ -423,32 +466,84 @@ fn fixed_classes(kinds: &[ColumnKind], fixed_order: &[usize]) -> Vec<FixedClass>
     classes
 }
 
-struct FixedClass {
-    key: (u64, u64),
+struct PaddingClass {
+    key: ClassKey,
     members: Vec<usize>,
 }
 
-/// [`pad`] for the search's hot loop: alignments are powers of two (1/2/4/8), so the modulo
-/// pair reduces to a mask — the div unit is measurable at the memo's node volume.
+/// What the walk sees of a column class: its expected-pad cost from a residue-set state and the
+/// state it leaves behind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassKey {
+    Fixed { align: u64, len_mod: u64 },
+    Varlena,
+}
+
+impl ClassKey {
+    fn expected_pad_eighths(self, set: Residues) -> u64 {
+        match self {
+            Self::Fixed { align, .. } => set.pad_to(align).expected_eighths,
+            // Scored at the short/TOAST form, which never aligns (module doc, assumption 1).
+            Self::Varlena => 0,
+        }
+    }
+
+    fn next_set(self, set: Residues) -> Residues {
+        match self {
+            Self::Fixed { align, len_mod } => set.aligned(align).shifted(len_mod),
+            Self::Varlena => Residues::FULL,
+        }
+    }
+}
+
+/// Count of reachable residue-set states: the 15 cosets in Z/8 (8 singletons, 4 pairs, the even
+/// and odd sets, and the full set).
+const SET_STATES: usize = 15;
+
+/// Dense index of a reachable set state, for the DP key: cosets only, 0..15.
+fn set_state_index(set: Residues) -> u64 {
+    let mask = set.0;
+    let tz = u64::from(mask.trailing_zeros());
+    match mask.count_ones() {
+        1 => tz,
+        2 => {
+            debug_assert_eq!(mask, (1 << tz) | (1 << (tz + 4)), "not a coset of 4Z");
+            8 + tz
+        }
+        4 => {
+            debug_assert_eq!(mask, 0b0101_0101 << tz, "not a coset of 2Z");
+            12 + tz
+        }
+        _ => {
+            debug_assert_eq!(mask, 0xFF, "not a coset");
+            14
+        }
+    }
+}
+
+/// [`pad`] for the walk's and the search's hot loops: alignments are powers of two (1/2/4/8),
+/// so the modulo pair reduces to a mask — the div unit is measurable at the memo's node volume.
 fn pad_pow2(offset: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     align.wrapping_sub(offset) & (align - 1)
 }
 
 struct Dp<'a> {
-    classes: &'a [FixedClass],
+    classes: &'a [PaddingClass],
     memo: std::collections::HashMap<u64, u64, PackedKeyHasherBuilder>,
 }
 
 impl Dp<'_> {
     /// `remaining` is the sum of `counts`, carried so the all-placed base case is O(1). The
     /// state fits one u64 — ≤ 12 classes (cap above) of ≤ 24 columns each (5 bits) plus the
-    /// offset residue (3 bits) — so the memo never hashes heap data.
-    fn min_padding(&mut self, counts: &mut [u8], remaining: usize, off: u64) -> u64 {
+    /// residue-set state (4 bits) — so the memo never hashes heap data.
+    fn min_expected_eighths(&mut self, counts: &mut [u8], remaining: usize, set: Residues) -> u64 {
         if remaining == 0 {
             return 0;
         }
-        let key = counts.iter().fold(off, |k, &c| (k << 5) | u64::from(c));
+        let key = counts
+            .iter()
+            .fold(set_state_index(set), |k, &c| (k << 5) | u64::from(c));
         if let Some(&cached) = self.memo.get(&key) {
             return cached;
         }
@@ -457,10 +552,10 @@ impl Dp<'_> {
             if counts[class_index] == 0 {
                 continue;
             }
-            let (align, len_mod) = self.classes[class_index].key;
-            let step = pad_pow2(off, align);
+            let class = self.classes[class_index].key;
+            let step = class.expected_pad_eighths(set);
             counts[class_index] -= 1;
-            let total = step + self.min_padding(counts, remaining - 1, (off + step + len_mod) & (MAXALIGN - 1));
+            let total = step + self.min_expected_eighths(counts, remaining - 1, class.next_set(set));
             counts[class_index] += 1;
             best = best.min(total);
         }
@@ -519,15 +614,16 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 }
 
 /// How solid the reported numbers are. `Exact`: only fixed-width columns — padding and footprint
-/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — columns after it sit
-/// at data-dependent offsets, so padding is an expected value with a min/max range.
+/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — padding is an
+/// expected value with a min/max range, under the module doc's two stated assumptions
+/// (varlena pads scored at the short/TOAST form, offset residues uniform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
     /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
-    /// At least one varlena: columns after it sit at data-dependent offsets — padding is
-    /// reported as expected values with bounds.
+    /// At least one varlena: padding is reported as expected values with bounds — expected
+    /// values assume short-form/TOAST varlena storage and uniform offset residues.
     Estimate,
     /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
     /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`

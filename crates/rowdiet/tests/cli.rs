@@ -93,31 +93,74 @@ fn version_order_folds_alters_after_create() {
 #[test]
 fn interleaved_varlenas_report_data_dependent_waste() {
     // The issue-1 repro: same column multiset, opposite orders. Interleaving must surface the
-    // reorder with a fractional expected saving; grouping must pass clean.
-    let out = bin().arg(fixtures("varlena")).output().unwrap();
+    // reorder with a fractional expected saving; grouping must pass clean with an expectation
+    // matching its measured zero padding. Behavior is asserted on the JSON, and the text output
+    // only for the pieces prose edits must not lose (the stated assumptions, the order line).
+    let out = bin()
+        .arg(fixtures("varlena"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tables = value["analysis"]["tables"].as_array().unwrap();
+    let interleaved = &tables[0];
+    assert_eq!(interleaved["name"], "interleaved");
+    assert_eq!(interleaved["current"]["padding"], 0);
+    assert_eq!(interleaved["current"]["expected_padding"], 5.0);
+    assert_eq!(interleaved["current"]["padding_min"], 0);
+    assert_eq!(interleaved["current"]["padding_max"], 19);
+    assert_eq!(interleaved["suggested"]["expected_padding"], 0.0);
+    assert_eq!(interleaved["suggested"]["padding_max"], 12);
+    assert_eq!(interleaved["avoidable_bytes_per_row"], 5.0);
+    let order: Vec<&str> = interleaved["suggested_order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+    // The control table measures flat zero padding on disk; the expectation must agree and
+    // only the long-form bound may exceed it.
+    let grouped = &tables[1];
+    assert_eq!(grouped["name"], "grouped");
+    assert_eq!(grouped["current"]["expected_padding"], 0.0);
+    assert_eq!(grouped["current"]["padding_max"], 12);
+    assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
+    // Columns at data-dependent offsets claim no point placement.
+    assert!(interleaved["columns"][6]["offset"].is_null(), "{interleaved}");
+    assert!(interleaved["columns"][6]["pad_before"].is_null(), "{interleaved}");
+    assert!(value["estimate_assumptions"].as_str().unwrap().contains("assume"));
+}
+
+#[test]
+fn varlena_text_output_states_the_assumptions_and_gates_fractionally() {
+    let text = bin().arg(fixtures("varlena")).output().unwrap();
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
     assert!(stdout.contains("■ interleaved"), "{stdout}");
-    assert!(
-        stdout.contains("current  : 9.5 B/row expected padding (0 B deterministic, range 0–19, data-dependent)"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("→ 3.5 B/row avoidable"), "{stdout}");
+    assert!(stdout.contains("✓ grouped"), "{stdout}");
     assert!(
         stdout.contains("order    : score, seen, tag, a, b, c, d, e"),
         "{stdout}"
     );
-    assert!(stdout.contains("✓ grouped"), "{stdout}");
+    assert!(stdout.contains("expected padding"), "{stdout}");
     assert!(
-        stdout.contains("6.0 B/row expected padding (0 B deterministic, range 0–12, data-dependent)"),
-        "{stdout}"
+        stdout.contains("expected values assume short-form varlenas and uniform offsets"),
+        "the assumptions must be stated where the numbers are shown: {stdout}"
     );
     let gated = bin()
         .arg(fixtures("varlena"))
         .args(["--fail-over", "0"])
         .output()
         .unwrap();
-    assert_eq!(gated.status.code(), Some(1), "3.5 B/row expected must trip a zero gate");
+    assert_eq!(gated.status.code(), Some(1), "5.0 B/row expected must trip a zero gate");
+    let fractional = bin()
+        .arg(fixtures("varlena"))
+        .args(["--fail-over", "4.5"])
+        .output()
+        .unwrap();
+    assert_eq!(fractional.status.code(), Some(1), "fail-over accepts fractions");
 }
 
 #[test]

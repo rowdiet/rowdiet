@@ -323,8 +323,107 @@ fn four_aligned_column_narrows_to_two_residues() {
 }
 
 #[test]
+fn varlena_pads_score_the_short_form_and_bound_the_long_form() {
+    // int2 then text: the text pad is 0 short-form (unaligned) and 2 long-form. pageinspect
+    // measures such tables flat at zero padding; the old long-form pin printed a certain 2.
+    let w = walk(&[fixed(2, Align::Short), varlena(Align::Int)]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 2,
+            expected_eighths: 0
+        }
+    );
+    assert_eq!(w.columns[1].offset, None, "the start depends on the storage form");
+    assert_eq!(w.padding, 0);
+    assert_eq!(w.expected_padding(), 0.0);
+    assert_eq!((w.padding_min(), w.padding_max()), (0, 2));
+}
+
+#[test]
+fn d_aligned_varlena_expects_zero_and_bounds_at_its_long_form_pad() {
+    // polygon/bigint[] class after int4: long form would pad 4, short form and TOAST pointers
+    // pad 0 (both measured unaligned on disk).
+    let w = walk(&[fixed(4, Align::Int), varlena(Align::Double), varlena(Align::Int)]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 4,
+            expected_eighths: 0
+        }
+    );
+    assert_eq!(w.expected_padding(), 0.0);
+    assert_eq!((w.padding_min(), w.padding_max()), (0, 7));
+}
+
+#[test]
+fn a_lone_proven_short_varlena_is_certain_zero() {
+    let w = walk(&[short()]);
+    assert_eq!(w.columns[0].pad_before, PadRange::certain(0));
+    assert_eq!(w.padding, 0);
+    assert_eq!((w.padding_min(), w.padding_max()), (0, 0));
+    assert_eq!(w.expected_padding(), 0.0);
+    assert_eq!(w.end, None, "the payload still makes the end unknowable");
+    assert_eq!(tier(&[short()]), Tier::Estimate);
+}
+
+#[test]
+fn irregular_shift_reaches_a_partial_coset() {
+    // macaddr after a varlena: {0,4} shifted by 6 gives {2,6}, where a float8 pads 2 or 6,
+    // expected 4.0, above the full set's 3.5.
+    let w = walk(&[varlena(Align::Int), fixed(6, Align::Int), fixed(8, Align::Double)]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 3,
+            expected_eighths: 12
+        }
+    );
+    assert_eq!(
+        w.columns[2].pad_before,
+        PadRange {
+            min: 2,
+            max: 6,
+            expected_eighths: 32
+        }
+    );
+    assert_eq!(w.expected_padding(), 5.5);
+    assert_eq!((w.padding_min(), w.padding_max()), (2, 9));
+}
+
+#[test]
+fn text_before_macaddr_surfaces_the_fixed_first_win() {
+    // (text, macaddr) expects 1.5; (macaddr, text) expects 0; measured: 1.5 vs flat 0. The old
+    // objective scored the swap at 2.0 and suppressed the advice.
+    let current = walk(&[varlena(Align::Int), fixed(6, Align::Int)]);
+    assert_eq!(current.expected_padding(), 1.5);
+    let kinds = [varlena(Align::Int), fixed(6, Align::Int)];
+    let order = suggested_order(&kinds);
+    assert_eq!(order, vec![1, 0]);
+    let suggested = walk(&order.iter().map(|&i| kinds[i]).collect::<Vec<_>>());
+    assert_eq!(suggested.expected_padding(), 0.0);
+}
+
+#[test]
+fn padded_fixed_block_can_expect_less_behind_a_varlena() {
+    // Two timetz cannot pack flat (certain 4 between them); hiding the second behind the text
+    // trades that for an expected 3.5 over the full set. The exact search must find it.
+    let kinds = [fixed(12, Align::Double), fixed(12, Align::Double), varlena(Align::Int)];
+    let order = suggested_order(&kinds);
+    let suggested = walk(&order.iter().map(|&i| kinds[i]).collect::<Vec<_>>());
+    assert_eq!(suggested.expected_padding_eighths(), 28);
+    assert_eq!(order, vec![0, 2, 1], "timetz, varlena, timetz");
+}
+
+#[test]
 fn interleaved_vs_grouped_kind_sequences() {
-    // The issue-1 repro at the kind level: same multiset, opposite orders.
+    // The issue-1 repro at the kind level: same multiset, opposite orders. Only the stranded
+    // fixed columns expect padding (int4 1.5 + float8 3.5); varlena pads expect 0 (short/TOAST
+    // form) and contribute only to the max. Grouping expects zero, and pageinspect measures
+    // the grouped table flat at zero padding.
     let interleaved = walk(&[
         varlena(Align::Int),
         fixed(4, Align::Int),
@@ -345,9 +444,10 @@ fn interleaved_vs_grouped_kind_sequences() {
         varlena(Align::Int),
         varlena(Align::Int),
     ]);
-    assert_eq!(interleaved.expected_padding(), 9.5);
+    assert_eq!(interleaved.expected_padding(), 5.0);
     assert_eq!((interleaved.padding_min(), interleaved.padding_max()), (0, 19));
-    assert_eq!(grouped.expected_padding(), 6.0);
+    assert_eq!(grouped.expected_padding(), 0.0);
+    assert_eq!(grouped.padding, 0);
     assert_eq!((grouped.padding_min(), grouped.padding_max()), (0, 12));
 }
 
@@ -449,10 +549,32 @@ fn brute_force_min_padding(kinds: &[ColumnKind]) -> u64 {
 }
 
 /// Property form of the brute-force cross-check: random small multisets from the realistic
-/// kind pool, minimality asserted against exhaustive permutation search.
+/// kind pool, minimality asserted against exhaustive permutation search, on the certain
+/// padding for all-fixed multisets and on the expected objective once varlenas join the pool.
 mod minimality_property {
     use super::*;
     use proptest::prelude::*;
+
+    fn brute_force_min_expected_eighths(kinds: &[ColumnKind]) -> u64 {
+        fn go(kinds: &[ColumnKind], current: &mut Vec<ColumnKind>, used: &mut Vec<bool>, best: &mut u64) {
+            if current.len() == kinds.len() {
+                *best = (*best).min(walk(current).expected_padding_eighths());
+                return;
+            }
+            for i in 0..kinds.len() {
+                if !used[i] {
+                    used[i] = true;
+                    current.push(kinds[i]);
+                    go(kinds, current, used, best);
+                    current.pop();
+                    used[i] = false;
+                }
+            }
+        }
+        let mut best = u64::MAX;
+        go(kinds, &mut Vec::new(), &mut vec![false; kinds.len()], &mut best);
+        best
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
@@ -480,6 +602,221 @@ mod minimality_property {
             }
             let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
             prop_assert_eq!(walk(&ordered).padding, brute_force_min_padding(&kinds), "kinds: {:?}", kinds);
+        }
+
+        /// The shipped objective is expected padding; the suggestion must minimize exactly it,
+        /// varlenas and irregulars included. The old fixed-first heuristic fails this on
+        /// (timetz, timetz, text) and on d-aligned varlenas behind a misaligned block.
+        #[test]
+        fn suggested_order_minimizes_expected_padding_with_varlenas(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                ],
+                3..=6
+            )
+        ) {
+            let order = suggested_order(&kinds);
+            let mut seen = vec![false; kinds.len()];
+            for &i in &order {
+                prop_assert!(!seen[i], "not a permutation: {:?}", order);
+                seen[i] = true;
+            }
+            let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+            prop_assert_eq!(
+                walk(&ordered).expected_padding_eighths(),
+                brute_force_min_expected_eighths(&kinds),
+                "kinds: {:?}, order: {:?}",
+                kinds,
+                order
+            );
+        }
+    }
+}
+
+/// Simulate one concrete tuple layout: every varlena gets a storage form and a payload length,
+/// fixed columns pad exactly as Postgres places them. This is the model's oracle: the reported
+/// bounds and expectation are checked against exhaustive enumeration of concrete rows.
+fn concrete_padding(kinds: &[ColumnKind], varlena_vals: &[(bool, u64)]) -> u64 {
+    let mut off = 0u64;
+    let mut total = 0u64;
+    let mut vi = 0;
+    for kind in kinds {
+        match kind {
+            ColumnKind::Fixed { len, align } => {
+                let p = pad(off, align.bytes());
+                total += p;
+                off += p + len;
+            }
+            ColumnKind::Varlena { align, proven_short } => {
+                let (short, payload) = varlena_vals[vi];
+                vi += 1;
+                assert!(short || !proven_short, "proven-short columns store short-form only");
+                if short {
+                    off += 1 + payload;
+                } else {
+                    let p = pad(off, align.bytes());
+                    total += p;
+                    off += 4 + payload;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Every combination of per-varlena (form, payload residue). Short payloads use 0..=7 directly;
+/// long payloads use 128 + r, which is a legal long-form length and sweeps every residue.
+fn enumerate_concrete(kinds: &[ColumnKind], short_only: bool) -> Vec<u64> {
+    let varlenas: Vec<bool> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            ColumnKind::Varlena { proven_short, .. } => Some(*proven_short),
+            ColumnKind::Fixed { .. } => None,
+        })
+        .collect();
+    let v = varlenas.len();
+    let forms_per = if short_only { 1 } else { 2 };
+    let combos = (forms_per * 8u64).pow(v as u32);
+    let mut out = Vec::with_capacity(combos as usize);
+    for combo in 0..combos {
+        let mut vals = Vec::with_capacity(v);
+        let mut rest = combo;
+        let mut legal = true;
+        for &proven in &varlenas {
+            let residue = rest % 8;
+            rest /= 8;
+            let long = !short_only && rest % 2 == 1;
+            rest /= forms_per;
+            if long && proven {
+                legal = false;
+                break;
+            }
+            if long {
+                vals.push((false, 128 + residue));
+            } else {
+                vals.push((true, residue));
+            }
+        }
+        if legal {
+            out.push(concrete_padding(kinds, &vals));
+        }
+    }
+    out
+}
+
+/// The model's three semantic claims, checked against enumerated concrete tuples:
+/// min/max bound every storage-form/payload combination and are both attained (joint
+/// achievability), and the expectation equals the exact mean over short-form tuples with
+/// uniform independent payload residues (the two stated assumptions, made executable).
+#[test]
+fn bounds_and_expectation_match_enumerated_concrete_tuples() {
+    let cases: Vec<Vec<ColumnKind>> = vec![
+        vec![fixed(2, Align::Short), varlena(Align::Int)],
+        vec![varlena(Align::Int), fixed(6, Align::Int), fixed(8, Align::Double)],
+        vec![fixed(4, Align::Int), varlena(Align::Double), varlena(Align::Int)],
+        vec![
+            varlena(Align::Int),
+            fixed(4, Align::Int),
+            varlena(Align::Int),
+            fixed(8, Align::Double),
+        ],
+        vec![fixed(12, Align::Double), varlena(Align::Int), fixed(12, Align::Double)],
+        vec![fixed(1, Align::Char), short(), fixed(8, Align::Double)],
+        vec![varlena(Align::Double), varlena(Align::Double), fixed(8, Align::Double)],
+        vec![
+            fixed(8, Align::Double),
+            fixed(4, Align::Int),
+            short(),
+            varlena(Align::Int),
+        ],
+    ];
+    for kinds in cases {
+        let w = walk(&kinds);
+        let all = enumerate_concrete(&kinds, false);
+        let observed_min = *all.iter().min().unwrap();
+        let observed_max = *all.iter().max().unwrap();
+        assert_eq!(observed_min, w.padding_min(), "min bound: {kinds:?}");
+        assert_eq!(observed_max, w.padding_max(), "max bound: {kinds:?}");
+        let short_runs = enumerate_concrete(&kinds, true);
+        let sum: u64 = short_runs.iter().sum();
+        let n = short_runs.len() as u64;
+        assert_eq!(sum * 8 % n, 0, "the short-form mean must be an exact eighth: {kinds:?}");
+        assert_eq!(
+            sum * 8 / n,
+            w.expected_padding_eighths(),
+            "expectation vs short-form uniform mean: {kinds:?}"
+        );
+    }
+}
+
+/// Reachable residue sets stay cosets in Z/8 (sizes 1, 2, 4, 8; equally spaced members), so
+/// expected pads divide exactly into eighths, the arithmetic [`Residues::pad_to`] relies on.
+mod residue_coset_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn is_coset(mask: u8) -> bool {
+        let size = mask.count_ones();
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return false;
+        }
+        let step = 8 / size;
+        let tz = mask.trailing_zeros();
+        (0..size).all(|k| mask & (1u8 << ((tz + k * step) % 8)) != 0)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Aligned(u64),
+        Shifted(u64),
+        Widen,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn walk_operations_preserve_cosets_and_exact_eighths(
+            ops in proptest::collection::vec(
+                prop_oneof![
+                    (0u32..4).prop_map(|i| Op::Aligned(1 << i)),
+                    (0u64..16).prop_map(Op::Shifted),
+                    Just(Op::Widen),
+                ],
+                0..12
+            )
+        ) {
+            let mut set = Residues::START;
+            for op in ops {
+                set = match op {
+                    Op::Aligned(a) => set.aligned(a),
+                    Op::Shifted(l) => set.shifted(l),
+                    Op::Widen => Residues::FULL,
+                };
+                prop_assert!(is_coset(set.0), "not a coset: {:#010b}", set.0);
+                for align in [1u64, 2, 4, 8] {
+                    let range = set.pad_to(align);
+                    let mut sum = 0u64;
+                    let mut count = 0u64;
+                    for r in 0..8u64 {
+                        if set.contains(r) {
+                            sum += pad(r, align);
+                            count += 1;
+                        }
+                    }
+                    prop_assert_eq!(sum * 8 % count, 0, "mean not an exact eighth");
+                    prop_assert_eq!(range.expected_eighths, sum * 8 / count);
+                    prop_assert!(range.min <= range.max);
+                }
+            }
         }
     }
 }

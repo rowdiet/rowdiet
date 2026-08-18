@@ -188,11 +188,9 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
             );
         }
         Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
-            // Entries store whole bytes, so accepting would write the ceiling.
             let _ = writeln!(
                 out,
-                "  ↓ ratchet: allowance {allowed} can tighten to {} — --accept {}",
-                rowdiet_core::baseline::ceil_bytes(avoidable),
+                "  ↓ ratchet: allowance {allowed} can tighten to {avoidable} — --accept {}",
                 t.name
             );
         }
@@ -205,7 +203,7 @@ fn stats_line(s: &OrderStats) -> String {
         (Some(fp), Some(rp)) => format!("{} B padding, {fp} B/row footprint, {rp} rows/8kB page", s.padding),
         _ if s.padding_min == s.padding_max => format!("{} B padding/row", s.padding),
         _ => format!(
-            "{:.1} B/row expected padding ({} B deterministic, range {}–{}, data-dependent)",
+            "{:.1} B/row expected padding ({} B deterministic, range {}-{}, data-dependent)",
             s.expected_padding, s.padding, s.padding_min, s.padding_max
         ),
     }
@@ -258,10 +256,16 @@ fn maybe_quote(ident: &str) -> String {
 fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Exact => "exact — fixed-width only",
-        Tier::Estimate => "estimate — columns placed at data-dependent offsets",
+        Tier::Estimate => ESTIMATE_LABEL,
         Tier::Unknown => "unknown — columns not fully known",
     }
 }
+
+/// The estimate tier's label names its two modeling assumptions wherever a number is shown:
+/// varlena pads are scored at the short-form/TOAST value (0, unaligned), and offset residues
+/// after a varlena are taken as uniformly likely. The printed min/max range bounds all storage
+/// forms without either assumption.
+const ESTIMATE_LABEL: &str = "estimate — expected values assume short-form varlenas and uniform offsets";
 
 fn kind_label(kind: NoteKind) -> &'static str {
     match kind {
@@ -468,6 +472,9 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     }
     let ignored = analysis.tables.iter().filter(|t| t.ignored).count();
     let _ = writeln!(out);
+    if analysis.tables.iter().any(|t| !t.ignored && t.tier == Tier::Estimate) {
+        let _ = writeln!(out, "{ESTIMATE_LABEL}.\n");
+    }
     if ignored > 0 {
         let _ = writeln!(out, "{ignored} table(s) ignored via rowdiet:ignore.\n");
     }
@@ -499,11 +506,13 @@ fn markdown_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-pub fn json(analysis: &Analysis, fail_over: Option<u64>, gate: &GateOutcome) -> Result<String, String> {
+pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> Result<String, String> {
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "fail_over": fail_over,
         "gate_exceeded": gate.exceeded,
+        // Estimate-tier numbers are meaningless without their model; state it in the payload.
+        "estimate_assumptions": ESTIMATE_LABEL,
         "gate": serde_json::to_value(gate).map_err(|e| e.to_string())?,
         "analysis": serde_json::to_value(analysis).map_err(|e| e.to_string())?,
     });
