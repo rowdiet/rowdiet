@@ -33,9 +33,12 @@ fn end_to_end_migration_series() {
     // full residue set on top of the 7 certain bytes.
     assert_eq!(t.current.expected_padding, 10.5);
     assert_eq!((t.current.padding_min, t.current.padding_max), (7, 14));
-    assert_eq!(t.suggested.padding, 3);
-    assert_eq!(t.suggested.expected_padding, 4.5);
-    assert_eq!(t.avoidable_bytes_per_row, 6.0);
+    // In the suggested order note lands at offset 21: its pad is 0 short-form and 3 long-form,
+    // expected 0, so nothing deterministic remains.
+    assert_eq!(t.suggested.padding, 0);
+    assert_eq!(t.suggested.expected_padding, 0.0);
+    assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 6));
+    assert_eq!(t.avoidable_bytes_per_row, 10.5);
     assert_eq!(
         t.suggested_order,
         vec!["id", "created_at", "status", "flag", "note", "meta"]
@@ -911,11 +914,11 @@ mod audit_fixes_gate {
     fn degradation_is_surfaced_and_optionally_gating() {
         let sql = "CREATE TABLE ok (a bigint NOT NULL);\nALTER TABLE ok ADD COLUMN x @@@ bad;";
         let analysis = analyze_sources(&[src("V1__b.sql", sql)], &Config::default());
-        let lenient = baseline::evaluate(&analysis, Some(0), false, None);
+        let lenient = baseline::evaluate(&analysis, Some(0.0), false, None);
         assert!(lenient.skipped_statements > 0);
         assert!(lenient.incomplete_tables > 0);
         assert!(!lenient.exceeded, "{lenient:#?}");
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert!(strict.exceeded);
     }
 }
@@ -980,7 +983,7 @@ mod postaudit_pins {
             &[src("V1__c.sql", "CREATE TABLE ok (a bigint NOT NULL);")],
             &Config::default(),
         );
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert_eq!(strict.skipped_statements, 0);
         assert_eq!(strict.incomplete_tables, 0);
         assert!(!strict.exceeded, "{strict:#?}");
@@ -992,7 +995,7 @@ mod postaudit_pins {
         let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
         let mut base = baseline::Baseline {
             rowdiet: "test".into(),
-            fail_over: 0,
+            fail_over: 0.0,
             tables: std::collections::BTreeMap::new(),
         };
         baseline::accept_tables(&mut base, &analysis, &["MyTable".into()]).unwrap();
@@ -1176,11 +1179,11 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert_eq!(c.tier, layout::Tier::Unknown);
     assert_eq!(c.current.footprint, None);
     assert_eq!(c.avoidable_bytes_per_row, 0.0);
-    let outcome = baseline::evaluate(&a, Some(0), false, None);
+    let outcome = baseline::evaluate(&a, Some(0.0), false, None);
     assert_eq!(outcome.verdicts["c"], baseline::TableVerdict::Incomplete);
     assert!(!outcome.exceeded, "incomplete alone does not fail the gate");
     assert!(
-        baseline::evaluate(&a, Some(0), true, None).exceeded,
+        baseline::evaluate(&a, Some(0.0), true, None).exceeded,
         "but --fail-on-degraded escalates it"
     );
     // INHERITS of an unknown parent is the same class — the unknown/incomplete path must be
@@ -1192,13 +1195,114 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert!(inh.tables[0].incomplete);
     assert_eq!(inh.tables[0].tier, layout::Tier::Unknown);
     assert_eq!(
-        baseline::evaluate(&inh, Some(0), false, None).verdicts["k"],
+        baseline::evaluate(&inh, Some(0.0), false, None).verdicts["k"],
         baseline::TableVerdict::Incomplete
     );
     // A genuinely empty but complete table stays exact — the fix keys on incompleteness, not natts.
     let empty = analyze_sources(&[src("V2.sql", "CREATE TABLE e ();")], &Config::default());
     assert!(!empty.tables[0].incomplete);
     assert_eq!(empty.tables[0].tier, layout::Tier::Exact);
+}
+
+/// The storage-form audit cases, each verified against pageinspect on PostgreSQL 16: expected
+/// values score varlenas at their short/TOAST form (measured unaligned on disk for payloads of
+/// 126 bytes or less and for external pointers), and only genuinely expected waste is reported.
+mod storage_form_scoring {
+    use super::src;
+    use crate::{Config, analyze_sources};
+
+    #[test]
+    fn short_form_varlena_alignment_is_not_charged() {
+        // (int2, text) measures flat 0 padding on disk; the long-form pin used to print a
+        // certain 2 B/row here through the unhedged branch.
+        let a = analyze_sources(
+            &[src("V1__t.sql", "CREATE TABLE t (n int2 NOT NULL, t text NOT NULL);")],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 0);
+        assert_eq!(t.current.expected_padding, 0.0);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 2));
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.columns[1].pad_before, None, "the pad depends on the storage form");
+        assert_eq!(t.columns[1].offset, None);
+    }
+
+    #[test]
+    fn fixed_column_behind_a_varlena_is_a_real_finding() {
+        // (text, macaddr) measures a 1.5 B/row mean; (macaddr, text) measures flat 0. The old
+        // objective scored the swap at 2.0 and the safety guard hid the win.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.current.expected_padding, 1.5);
+        assert_eq!(t.avoidable_bytes_per_row, 1.5);
+        assert_eq!(t.suggested_order, vec!["m", "t"]);
+        let small = analyze_sources(
+            &[src("V1__s.sql", "CREATE TABLE s (t text NOT NULL, n int2 NOT NULL);")],
+            &Config::default(),
+        );
+        assert_eq!(small.tables[0].avoidable_bytes_per_row, 0.5);
+        assert_eq!(small.tables[0].suggested_order, vec!["n", "t"]);
+    }
+
+    #[test]
+    fn d_aligned_varlena_orders_tie_at_zero_expected() {
+        // (int4, polygon, text) and (int4, text, polygon) both measure flat 0 on disk; the old
+        // model scored them 5.5 vs 3.5 and preferred the former.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE a (n int4 NOT NULL, p polygon NOT NULL, t text NOT NULL);
+                 CREATE TABLE b (n int4 NOT NULL, t text NOT NULL, p polygon NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        for t in &a.tables {
+            assert_eq!(t.current.expected_padding, 0.0, "{}", t.name);
+            assert_eq!(t.avoidable_bytes_per_row, 0.0, "{}", t.name);
+        }
+    }
+
+    #[test]
+    fn stranded_bigint_is_the_full_expected_finding() {
+        // (text, boolean, bigint): suggested (bigint, boolean, text) measures flat 0 and the
+        // current order strands the bigint behind the text (measured avoidable ~3.5, which the
+        // old exact objective reported as 0 and the long-form objective as 0.5).
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, b boolean NOT NULL, x bigint NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.current.expected_padding, 3.5);
+        assert_eq!(t.avoidable_bytes_per_row, 3.5);
+        assert_eq!(t.suggested_order, vec!["x", "b", "t"]);
+        assert_eq!(t.suggested.expected_padding, 0.0);
+    }
+
+    #[test]
+    fn beyond_the_search_caps_the_guard_keeps_the_better_current_order() {
+        // 25 columns exceed the exact search's cap, and the heuristic sort (both timetz
+        // adjacent) is worse than the hand-packed current order: the guard must fall back
+        // instead of suggesting a worse layout.
+        let uuids: String = (0..22).map(|i| format!(", u{i} uuid NOT NULL")).collect();
+        let sql = format!("CREATE TABLE g (a timetz NOT NULL, b int4 NOT NULL, c timetz NOT NULL{uuids});");
+        let a = analyze_sources(&[src("V1__g.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 25);
+        assert_eq!(t.current.padding, 0);
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested, t.current);
+        assert_eq!(t.suggested_order[..3], ["a", "b", "c"], "{:?}", t.suggested_order);
+    }
 }
 
 /// The issue-1 repro: identical column multisets, opposite orders. Interleaving fixed columns
@@ -1215,25 +1319,31 @@ mod varlena_residue_uncertainty {
 
     #[test]
     fn interleaved_reports_expected_avoidable_and_surfaces_the_reorder() {
+        // Expected 5.0 = tag 1.5 (behind the first text) + score 3.5 (behind five texts);
+        // pageinspect on independently varying payloads measures a 4.54 B/row mean.
         let analysis = analyze_sources(&[src("V1__i.sql", INTERLEAVED)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.current.padding, 0, "no pad in this order is certain");
-        assert_eq!(t.current.expected_padding, 9.5);
+        assert_eq!(t.current.expected_padding, 5.0);
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 19));
-        assert_eq!(t.suggested.expected_padding, 6.0);
+        assert_eq!(t.suggested.expected_padding, 0.0);
         assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 12));
-        assert_eq!(t.avoidable_bytes_per_row, 3.5);
+        assert_eq!(t.avoidable_bytes_per_row, 5.0);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
     }
 
     #[test]
     fn grouped_reports_zero_avoidable() {
+        // The issue's control table: pageinspect measures it flat at zero padding, and the
+        // expectation must agree; only the long-form max (0-12) is data-dependent.
         let analysis = analyze_sources(&[src("V1__g.sql", GROUPED)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.avoidable_bytes_per_row, 0.0);
-        assert_eq!(t.current.expected_padding, 6.0);
+        assert_eq!(t.current.expected_padding, 0.0);
+        assert_eq!(t.current.padding, 0);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 12));
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
     }
