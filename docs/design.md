@@ -38,10 +38,11 @@ split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touchi
 
 All row numbers assume every column non-NULL. Varlena payload bytes are never counted toward
 sizes (they are unknowable from DDL), but they determine the offset residue mod 8 that every
-later column aligns against — payloads are order-invariant in the total, not in their effect on
-downstream padding. The walk therefore carries the offset as a set of possible residues mod 8:
-exact until the first varlena, the full set after any varlena (proving the short header form
-bounds the header, not the payload byte length), narrowed again by alignment (an 8-aligned
+later column aligns against — the total payload is order-invariant while its effect on
+downstream padding is order-dependent. The walk therefore carries the offset as a set of possible
+residues mod 8: exact until the first varlena, the full set after any varlena (a proven-short
+typmod bounds only the header form, payload byte length still varies), narrowed again by
+alignment (an 8-aligned
 column collapses any set back to a single residue). Each pad placed over a non-singleton set is
 reported as min/max/expected, with residues taken as uniformly likely — a stated assumption.
 Pads placed while the residue is exactly known stay exact.

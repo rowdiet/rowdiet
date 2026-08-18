@@ -5,7 +5,7 @@
 //! (they are unknowable from DDL), but they do move every later column's offset: from the first
 //! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
 //! later pad is reported as a min/max/expected range over that set (residues taken as uniformly
-//! likely — a stated assumption, not a measurement). Pads placed while the offset is exactly
+//! likely, by assumption). Pads placed while the offset is exactly
 //! known stay exact, so all-fixed tables keep byte-exact numbers.
 
 /// The 64-bit PostgreSQL MAXALIGN: tuple headers, data starts, and footprints all round to
@@ -134,8 +134,8 @@ impl PadRange {
 
 /// The offsets a column can start at, reduced mod MAXALIGN: a bitmask over residues 0..=7.
 /// Starts as `{0}`; a fixed column narrows the set by its alignment then shifts it by its
-/// length; any varlena replaces it with the full set — proving the short header form bounds the
-/// header, not the payload byte length (multibyte encodings), so it never restores certainty.
+/// length; any varlena replaces it with the full set — a proven-short typmod bounds only the
+/// header form, the payload byte length still varies (multibyte encodings), so the set stays full.
 /// Expected pads treat the members as uniformly likely. That assumption is made once, at the
 /// widening: alignment maps preserve uniformity (reachable sets are cosets in Z/8, and each
 /// surviving residue absorbs equally many predecessors).
@@ -520,15 +520,14 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 
 /// How solid the reported numbers are. `Exact`: only fixed-width columns — padding and footprint
 /// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — columns after it sit
-/// at data-dependent offsets, so padding is an expected value with a min/max range, never a
-/// guarantee.
+/// at data-dependent offsets, so padding is an expected value with a min/max range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
     /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
-    /// At least one varlena: columns after it sit at data-dependent offsets — expected values
-    /// and bounds, not guarantees.
+    /// At least one varlena: columns after it sit at data-dependent offsets — padding is
+    /// reported as expected values with bounds.
     Estimate,
     /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
     /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`

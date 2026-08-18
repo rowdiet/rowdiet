@@ -332,7 +332,7 @@ mod fractional_avoidable {
         assert_eq!(base.tables["t"].bytes, 4, "3.5 rounds up on acceptance");
         let outcome = evaluate(&a, None, false, Some(&base));
         assert!(!outcome.exceeded);
-        // 3.5 under an allowance of 4 is as tight as an entry can record: Pass, not a ratchet.
+        // 3.5 under an allowance of 4 is as tight as an entry can record, so it stays a Pass.
         assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
     }
 

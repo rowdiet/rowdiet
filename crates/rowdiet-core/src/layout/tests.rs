@@ -301,7 +301,7 @@ fn eight_aligned_column_restores_determinism() {
     assert_eq!(w.columns[3].pad_before, PadRange::certain(4));
     assert_eq!(w.padding, 4);
     assert_eq!(w.uncertain_expected_eighths, 28);
-    // Offsets stay unknown even where the pad is certain: certainty is mod 8, not absolute.
+    // Offsets stay unknown even where the pad is certain: the pad is pinned mod 8 alone.
     assert_eq!(w.columns[2].offset, None);
 }
 

@@ -159,10 +159,10 @@ rowdiet therefore reports per table:
   reports **0 avoidable bytes** by design (raw padding is still shown).
 - **estimate tier** (any varlena): every column after a varlena sits at a data-dependent offset,
   so its padding is reported as an expected value with a min/max range (offset residues mod 8
-  taken as uniformly likely) — never guaranteed savings. Pads placed before the first varlena
+  taken as uniformly likely). Pads placed before the first varlena
   stay exact. `varchar(n≤31)` is upgraded to *proven short, unaligned* (typmod bounds the
-  payload under the short-varlena limit) — that fixes the header, not the payload length, so it
-  does not restore offset certainty for later columns.
+  payload under the short-varlena limit) — that pins the header form while the payload length
+  still varies, so later columns keep data-dependent offsets.
 
 The suggested order is: fixed columns before varlena, alignment descending, irregular-size types
 (`timetz`, `macaddr`) at the end of their group, varlenas alignment-descending with proven-short
