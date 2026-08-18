@@ -54,8 +54,9 @@ A varlena has three on-disk forms, and only one of them pads. Postgres packs any
 `(float8, timestamp, int4, text×5)` table with short payloads is flat at zero padding, and
 4 kB `STORAGE EXTERNAL` payloads leave 18-byte unaligned pointers.
 
-Expected values therefore rest on two stated assumptions, both printed in the estimate tier's
-label:
+Expected values rest on two stated assumptions, both printed in the estimate tier's label, and
+they are **display only** — nothing gates, recommends, or rewrites on them (see the decision
+policy below and the impossibility section for why):
 
 1. **Varlena pads are scored at the short-form/TOAST value of zero.** The long form
    contributes only to the pad's max. Payloads that land in the long-form band raise the real
@@ -74,9 +75,9 @@ Tiers:
 - **Exact** — table has only fixed-width columns. Padding and footprint are byte-exact
   (fixed-width values are never toasted/compressed). Headline = MAXALIGN-rounded footprint delta;
   `avoidable == 0` whenever the reorder doesn't cross an 8-byte rung, even if raw padding drops.
-- **Estimate** — any varlena present. Headline = expected-padding delta under the two stated
-  assumptions, labeled, possibly fractional. No guarantee is claimed; the min/max range is the
-  guaranteed envelope.
+- **Estimate** — any varlena present. Headline = deterministic plus dominance-proven avoidable
+  padding (the decision policy below). The min/max range is the guaranteed envelope; expected
+  values are display fields.
 
 Why no middle tier: even for "fixed prefix + varlena tail preserved" the *total* delta is not
 byte-guaranteed — payload lengths shift downstream pads in both orders. The report does carry a
@@ -91,28 +92,91 @@ advice. The all-non-NULL assumption uses `t_hoff = 24` — except after `DROP CO
 bitmap is unconditionally present in new rows (dropped attributes are stored as NULL forever),
 so the walk uses `t_hoff = null_thoff(original natts)`; see Folding semantics.
 
+## Why no point prior can rank varlena orders (issue #10, condensed)
+
+A varlena's own pad depends on its storage form: the short form (payload <= 126 B inline) and
+TOAST pointers store unaligned, the inline long form aligns to typalign. The form depends on
+payload bytes, and payload bytes are absent from DDL. Two realizable workloads on the same DDL
+then want different orders — `(int8, text, float8[])` wants text first under 200 B texts with
+tiny arrays, and array first under short texts with 20-element arrays. Any deterministic
+hint-free tool picks one order and is strictly suboptimal on the other workload; the missing
+information is a property of the input, so no model refinement removes it.
+
+Both point priors tried before this policy failed measurably. P(long) = 1 fabricated 6.0 B/row
+on a control table that measures flat zero. P(short) = 1 scored every varlena self-pad at its
+minimum, which made varlena-vs-varlena orders unrankable (0.000 vs 4.000 B/row measured on
+identical columns, both reported clean) and recommended a reorder measuring 4.000 B/row worse
+than the order it replaced. Expected values under any prior are therefore display conveniences,
+and everything that acts — the gate, the recommendation, the `--suggest` rewrite — acts on
+realization-independent facts only.
+
+## The decision policy
+
+Three rungs, in order:
+
+1. **Dominance (gate + recommend).** Order A dominates order B when A's total padding is less
+   than or equal to B's in **every** realization of storage forms and payload lengths, and
+   strictly less in at least one. A reorder is recommended, and gates, only on dominance. Much
+   resolves here: repacking the fixed block with the varlena tail preserved dominates (the
+   never-negative-recovery induction), and the search finds stronger wins such as handing a
+   varlena the one guaranteed-aligned slot with char-aligned columns parked behind it —
+   `(text, boolean, bigint)` reordered to `(bigint, text, boolean)` pads zero in every
+   realization.
+2. **Minimax (tie-break, labeled).** Among dominating candidates the one with the smallest
+   worst case is recommended. Findings carry the guaranteed-to-maximum saving range and never
+   say "expected savings".
+3. **Frontier (report only).** When no candidate dominates but one is strictly better
+   somewhere (or by worst case), both orders are printed with the decision boundary: per
+   storage-form band, who wins and by how much. Never an exit-code consequence. The reader
+   owns the workload knowledge; the tool hands over the boundary.
+
+Gate rule: `avoidable_deterministic` (waste in exactly-known pads the recommended reorder
+removes) plus `avoidable_dominance` (further worst-case waste the dominating reorder removes).
+Frontier bands never gate. "No dominating reorder found" is printed only for what was actually
+searched, and a capped search says so in the same line.
+
+**The dominance engine** (`dominance.rs`) computes exact bounds of `pad(A) − pad(B)` over all
+realizations. Padding depends on a realization only through each varlena's (form, payload mod
+8), so: when both orders keep the varlenas in the same relative sequence, a joint walk over the
+pair of offset residues (64 states, extremes merged per state) is exact at any column count;
+otherwise exhaustive enumeration runs within a budget (about 2M assignments), and past it the
+pair is reported as undecided — `dominance_evaluated: false`, never a guess. Frontier bands fix
+each varlena's form (up to 6 long-capable varlenas, else the frontier prints without band
+detail) and reuse the same engines.
+
+**The search** (`layout::search`) emits three candidate poles: the fixed-first heuristic
+(fixed-prefix refined), the lexicographic (deterministic, worst-case) minimum — the certainty
+pole, free to hide fixed columns behind varlenas — and the (worst-case, deterministic) minimum,
+the minimax pole. Both lexicographic pairs are additive per (class, residue-set state), so the
+memoized DP over class counts × the 15 cosets of Z/8 minimizes them exactly; a property test
+pins both poles against brute-force permutation search with irregulars and varlenas in the
+pool. The whole-order search runs within 24 columns and a state budget (`Π(count+1) × 15 <=
+2^20`, worst measured cost about 180 ms); past either cap it degrades to the base fixed-prefix
+block search (3..=24 fixed columns, 12 fixed classes — the pre-existing worst case), and past
+that to the plain sort. The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and
+labeled in the text output, because a capped search claiming nothing was avoidable is the worst
+defect this tool can have: the fixed-prefix fallback is exactly what keeps a 25-column table
+with 24 B/row of deterministic waste gating (a measured false negative of an earlier revision).
+
+The certainty pole exists for the frontier: `(timetz, timetz, text)` pays a certain 4 B/row,
+and interposing the text trades that for a data-dependent 0..=7 — measured 3 B/row worse on
+4-byte texts, 3 B/row better on 2-byte texts. The policy never recommends that trade; it prints
+it with both worst cases and the bands.
+
 ## Suggested order
 
-Sort key: `(fixed=0 | varlena=1 | proven-short=2, alignment desc, irregular-last, original
-index)`. Irregulars are fixed types whose size isn't a multiple of their own alignment — exactly
-`timetz (12,d)` and `macaddr (6,i)` among built-ins (also `tid (6,s)`); putting them last in
-their group keeps every following smaller-alignment column aligned. For all-regular schemas the
-result expects zero padding under any NULL mask (a subsequence of a desc-aligned regular
-sequence is still one; varlena pads score zero and long-form storage can still add bytes, shown
-as the range). When the heuristic order still expects padding, `refine_order` finds the exact
-minimum of the expected objective: expected padding depends only on (alignment, len mod 8)
-classes (all varlenas collapse into one class: expected pad 0, residue set widens to full)
-and the running residue-set state (the 15 cosets of Z/8), so a memoized search over class
-counts × set states is exhaustive. That search covers both irregular-block repairs
-(`timetz, int4, timetz` is zero where the sort pads 4) and cases where a block that cannot pack
-flat expects less with a fixed column placed behind a varlena (`timetz, text, timetz` expects
-3.5 against a certain 4, advice that leans on the uniformity assumption, like every expected
-value here). Ties prefer the heuristic's class order; capped at 24 columns / 12 classes,
-falling back to the sort. A property test pins the search's minimality against exhaustive
-permutation search, varlenas included. The report never overclaims: both layouts are
-*computed*, never assumed, and a safety guard keeps the original order whenever the suggestion
-doesn't strictly improve the expected objective (reachable only past the caps, where the
-heuristic answer is not exact).
+Sort key of the heuristic pole: `(fixed=0 | varlena=1 | proven-short=2, alignment desc,
+irregular-last, original index)`. Irregulars are fixed types whose size isn't a multiple of
+their own alignment — exactly `timetz (12,d)` and `macaddr (6,i)` among built-ins (also
+`tid (6,s)`); putting them last in their group keeps every following smaller-alignment column
+aligned. For all-regular schemas the heuristic expects zero padding under any NULL mask (a
+subsequence of a desc-aligned regular sequence is still one), and a heuristic order achieving
+zero deterministic and zero worst-case padding is the proven global minimum of both
+lexicographic objectives, so the search completes without running. `refine_fixed_block` repairs
+irregular blocks exactly (`timetz, int4, timetz` is zero where the sort pads 4) with the
+varlena tail left in place, which keeps the repair dominance-safe. The report layer then
+compares the poles against the current order by dominance and either recommends, prints a
+frontier, or says what it searched (see the decision policy above).
 
 ## Type catalog provenance
 
@@ -202,13 +266,14 @@ about everything new. Design points, in the order they were decided:
   `--update-baseline` rewrites the whole file from the current analysis, `--accept <table>`
   refreshes exactly one entry (the reviewable one-line diff for accepting one table's growth,
   and the same mechanism prunes an entry once its table comes clean).
-- **Entries store the exact reported value, fractions included.** Estimate-tier avoidable
-  numbers move in eighths of a byte, and eighths are exact in both f64 and JSON, so an entry
-  accepted at 3.5 is stored as 3.5: any later exceedance is a regression and any improvement
-  is a ratchet opportunity. Rounding the stored value up would open a window between the real
-  number and its ceiling where regressions pass silently (accepting 0.5 as 1 permits a 2×
-  regression); storing exactly closes it. `--fail-over` accepts fractions for the same reason.
-  Files from versions that stored whole bytes load unchanged (integers parse as the same f64).
+- **Entries store the exact reported value, fractions included.** The gated quantity is
+  deterministic plus dominance-proven avoidable padding (whole bytes today), but entries and
+  `--fail-over` stay exact f64: fractional legacy values keep working, a fractional threshold
+  stays expressible, and rounding a stored value up would open a window where regressions pass
+  silently. Files from versions that stored whole bytes load unchanged (integers parse as the
+  same f64). `--fail-over` and loaded baseline values reject nan and non-finite numbers — a
+  templating bug that resolves an empty CI variable to `nan` would otherwise turn every
+  `avoidable > limit` comparison false and silently disable the gate.
 
 The gate also carries degradation: counts of skipped statements and incomplete tables ride in
 the outcome (a bytes-only gate would stay green over an unparseable migration set), and
@@ -268,6 +333,20 @@ toolchain-ownership reasons: frozen ABI, pin-a-tarball toolchain, no rustc↔lin
 pairing). sqlparser-rs remains the default parser and the native-primary path, and the
 differential oracle lives in the `pg-exact` backend's test suite. Build recipe + stub headers:
 `wasm/`.
+
+## Measured verification (xtask measure)
+
+`cargo run -p xtask -- measure` regression-tests the model against real tuples: it builds the
+release binary, applies the fixture DDL to a disposable Dockerized PostgreSQL with pageinspect,
+inserts short-heavy and long-heavy workloads (long-heavy payloads live in the 127 B..TOAST
+band that falsified both point priors), and asserts the three spec properties: measured
+padding inside every reported [min, max]; every recommended reorder measuring no worse than
+the current order on both workloads; every declared frontier boundary flipping the measured
+winner. Skipped loudly when no container is reachable (`ROWDIET_MEASURE_CONTAINER`, default
+`condescending_tu`), so plain CI stays database-free. Fixtures include the schemas that
+falsified earlier revisions: the issue #1 pair, the issue #10 band pair, `(float8[], int4)`
+both ways, `(timetz, timetz, text)`, the TOAST pointer case, and the 25-column and many-class
+cap tables.
 
 ## Platform assumption
 
