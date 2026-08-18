@@ -60,6 +60,12 @@ pub fn lint_json(input: &str) -> String {
 
 fn lint(input: &str) -> Result<String, String> {
     let input: Input = serde_json::from_str(input).map_err(|e| format!("bad input JSON: {e}"))?;
+    // Same guard as the CLI flag: a nan/inf threshold silently disables the gate.
+    if let Some(fail_over) = input.fail_over
+        && (!fail_over.is_finite() || fail_over < 0.0)
+    {
+        return Err("fail_over must be finite and non-negative".to_string());
+    }
     let mut config = Config::default();
     for spec in &input.assume {
         let (name, kind) = parse_assume_spec(spec)?;

@@ -1,5 +1,7 @@
 //! Output renderers: human text, GitHub Actions annotations, JSON.
 
+use rowdiet_core::layout::SearchScope;
+use rowdiet_core::report::{BandWinner, Frontier};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -121,16 +123,19 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     }
     if t.avoidable_bytes_per_row == 0.0 {
         let detail = match (t.tier, t.current.padding) {
-            _ if t.current.padding_min != t.current.padding_max => {
-                format!("{}, none avoidable by reordering", stats_line(&t.current))
+            (Tier::Estimate, _) => format!("{}, {}{}", stats_line(&t.current), verdict_phrase(t), scope_note(t)),
+            (Tier::Exact, 0) => format!("optimal: zero padding{}", scope_note(t)),
+            (Tier::Exact, p) => {
+                format!(
+                    "{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain{}",
+                    scope_note(t)
+                )
             }
-            (_, 0) => "optimal: zero padding".to_string(),
-            (Tier::Exact, p) => format!("{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain"),
-            (Tier::Estimate, p) => format!("{p} B padding/row, none avoidable by reordering"),
             // Incomplete tables return above as "not analyzable"; unreachable here in practice.
             (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
         let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.display, tier_label(t.tier));
+        render_frontier(out, t);
         render_flags(out, t);
         render_verdict(out, t, verdict);
         return;
@@ -143,9 +148,16 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         tier_label(t.tier)
     );
     let _ = writeln!(out, "  current  : {}", stats_line(&t.current));
+    let basis = match t.dominance_saving {
+        Some(saving) => format!(
+            " ({} B deterministic + {} B dominance-proven; saves {}-{} B/row in every realization)",
+            t.avoidable_deterministic, t.avoidable_dominance, saving.min, saving.max
+        ),
+        None => String::new(),
+    };
     let _ = writeln!(
         out,
-        "  suggested: {} → {:.1} B/row avoidable",
+        "  suggested: {} → {:.1} B/row avoidable{basis}",
         stats_line(&t.suggested),
         t.avoidable_bytes_per_row
     );
@@ -196,6 +208,86 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
         }
         Some(TableVerdict::Pass | TableVerdict::NewViolation { .. } | TableVerdict::Incomplete) | None => {}
     }
+}
+
+/// The clean-table phrase: honest about what the search proved and what it could not check.
+fn verdict_phrase(t: &TableReport) -> &'static str {
+    if t.dominance_evaluated {
+        "no dominating reorder found"
+    } else {
+        "dominance not fully evaluated (too many varlenas)"
+    }
+}
+
+/// Suffix naming an incomplete search scope; a capped search must say so wherever it would
+/// otherwise read as proof.
+fn scope_note(t: &TableReport) -> &'static str {
+    match t.search_scope {
+        SearchScope::Complete => "",
+        SearchScope::FixedPrefix => " (search capped: fixed prefix exact, varlena placement heuristic)",
+        SearchScope::SortOnly => " (search capped: heuristic sort only)",
+    }
+}
+
+/// The workload-dependent alternative: both orders, worst cases, and the decision boundary by
+/// storage-form band. Reported only; the gate never sees it.
+fn render_frontier(out: &mut String, t: &TableReport) {
+    let Some(frontier) = &t.frontier else { return };
+    let _ = writeln!(
+        out,
+        "  frontier : {} — worst case {} B/row vs current {} B/row (workload-dependent, not gated)",
+        frontier.order.join(", "),
+        frontier.alternative_worst,
+        frontier.current_worst
+    );
+    if frontier.current_deterministic != frontier.alternative_deterministic {
+        let _ = writeln!(
+            out,
+            "             deterministic padding: alternative {} B vs current {} B",
+            frontier.alternative_deterministic, frontier.current_deterministic
+        );
+    }
+    if !frontier.decided {
+        let _ = writeln!(
+            out,
+            "             decision boundary not computed (too many varlenas to enumerate)"
+        );
+        return;
+    }
+    for band in &frontier.bands {
+        let condition = match band.long_form.as_slice() {
+            [] => "when every varlena stays short or TOAST".to_string(),
+            [one] => format!("when {one} stores long form"),
+            many => format!("when {} store long form", many.join(", ")),
+        };
+        let line = match band.winner {
+            BandWinner::Alternative => Some(format!(
+                "alternative wins {condition} (saves {}-{} B/row)",
+                band.min_saving, band.max_saving
+            )),
+            BandWinner::Current => Some(format!(
+                "current wins {condition} (by {}-{} B/row)",
+                -band.max_saving, -band.min_saving
+            )),
+            BandWinner::Mixed => Some(format!(
+                "winner depends on payload lengths mod 8 {condition} ({} to {} B/row)",
+                band.min_saving, band.max_saving
+            )),
+            BandWinner::Tie => None,
+        };
+        if let Some(line) = line {
+            let _ = writeln!(out, "             {line}");
+        }
+    }
+    let _ = render_frontier_assumption_free(out, frontier);
+}
+
+/// Frontier bands carry no model assumption, but say so once to keep the block self-contained.
+fn render_frontier_assumption_free(out: &mut String, frontier: &Frontier) -> std::fmt::Result {
+    if frontier.bands.iter().all(|b| b.winner == BandWinner::Tie) {
+        writeln!(out, "             identical padding in every storage form")?;
+    }
+    Ok(())
 }
 
 fn stats_line(s: &OrderStats) -> String {
@@ -261,11 +353,12 @@ fn tier_label(tier: Tier) -> &'static str {
     }
 }
 
-/// The estimate tier's label names its two modeling assumptions wherever a number is shown:
-/// varlena pads are scored at the short-form/TOAST value (0, unaligned), and offset residues
-/// after a varlena are taken as uniformly likely. The printed min/max range bounds all storage
-/// forms without either assumption.
-const ESTIMATE_LABEL: &str = "estimate — expected values assume short-form varlenas and uniform offsets";
+/// The estimate tier's label states the decision policy and the display model wherever a
+/// number is shown: the gate and the reorder advice rest on deterministic pads and dominance
+/// (never worse in any storage-form/payload realization); expected values are display-only
+/// figures under the stated model (varlena pads scored at the short/TOAST form, offset
+/// residues uniform). The printed min/max range bounds all storage forms with no assumption.
+const ESTIMATE_LABEL: &str = "estimate — gates on deterministic and dominance-proven padding; expected values are display-only (short-form, uniform-offset model)";
 
 fn kind_label(kind: NoteKind) -> &'static str {
     match kind {

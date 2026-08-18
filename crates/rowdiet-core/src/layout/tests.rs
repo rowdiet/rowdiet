@@ -408,14 +408,39 @@ fn text_before_macaddr_surfaces_the_fixed_first_win() {
 }
 
 #[test]
-fn padded_fixed_block_can_expect_less_behind_a_varlena() {
+fn certainty_trade_splits_the_search_poles() {
     // Two timetz cannot pack flat (certain 4 between them); hiding the second behind the text
-    // trades that for an expected 3.5 over the full set. The exact search must find it.
+    // trades that for 0..=7. The certainty pole finds the trade, the minimax pole and the
+    // heuristic refuse it, and the decision policy reports it as a frontier only.
     let kinds = [fixed(12, Align::Double), fixed(12, Align::Double), varlena(Align::Int)];
-    let order = suggested_order(&kinds);
-    let suggested = walk(&order.iter().map(|&i| kinds[i]).collect::<Vec<_>>());
-    assert_eq!(suggested.expected_padding_eighths(), 28);
-    assert_eq!(order, vec![0, 2, 1], "timetz, varlena, timetz");
+    assert_eq!(
+        suggested_order(&kinds),
+        vec![0, 1, 2],
+        "the heuristic keeps fixed first"
+    );
+    let search = search(&kinds);
+    assert_eq!(search.scope, SearchScope::Complete);
+    assert_eq!(search.certainty_pole, Some(vec![0, 2, 1]), "timetz, varlena, timetz");
+    assert_eq!(
+        search.minimax_pole,
+        Some(vec![0, 1, 2]),
+        "a certain 4 beats a possible 7"
+    );
+    let veil = walk(&[kinds[0], kinds[2], kinds[1]]);
+    assert_eq!(veil.padding, 0);
+    assert_eq!(veil.padding_max(), 7);
+}
+
+#[test]
+fn aligned_slot_and_padless_tail_reach_zero_worst_case() {
+    // (text, boolean, bigint): the minimax pole hands the text the aligned slot behind the
+    // bigint and parks the boolean last, reaching zero padding in every storage form.
+    let kinds = [varlena(Align::Int), fixed(1, Align::Char), fixed(8, Align::Double)];
+    let search = search(&kinds);
+    let minimax = search.minimax_pole.unwrap();
+    assert_eq!(minimax, vec![2, 0, 1]);
+    let w = walk(&minimax.iter().map(|&i| kinds[i]).collect::<Vec<_>>());
+    assert_eq!((w.padding, w.padding_max()), (0, 0));
 }
 
 #[test]
@@ -555,27 +580,6 @@ mod minimality_property {
     use super::*;
     use proptest::prelude::*;
 
-    fn brute_force_min_expected_eighths(kinds: &[ColumnKind]) -> u64 {
-        fn go(kinds: &[ColumnKind], current: &mut Vec<ColumnKind>, used: &mut Vec<bool>, best: &mut u64) {
-            if current.len() == kinds.len() {
-                *best = (*best).min(walk(current).expected_padding_eighths());
-                return;
-            }
-            for i in 0..kinds.len() {
-                if !used[i] {
-                    used[i] = true;
-                    current.push(kinds[i]);
-                    go(kinds, current, used, best);
-                    current.pop();
-                    used[i] = false;
-                }
-            }
-        }
-        let mut best = u64::MAX;
-        go(kinds, &mut Vec::new(), &mut vec![false; kinds.len()], &mut best);
-        best
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
         #[test]
@@ -604,11 +608,13 @@ mod minimality_property {
             prop_assert_eq!(walk(&ordered).padding, brute_force_min_padding(&kinds), "kinds: {:?}", kinds);
         }
 
-        /// The shipped objective is expected padding; the suggestion must minimize exactly it,
-        /// varlenas and irregulars included. The old fixed-first heuristic fails this on
-        /// (timetz, timetz, text) and on d-aligned varlenas behind a misaligned block.
+        /// The shipped objectives are the two lexicographic pairs over (deterministic,
+        /// worst-case) padding; each search pole must hit the brute-force minimum of its pair
+        /// over all permutations. Irregulars (timetz, macaddr) and varlenas are in the pool, so
+        /// nonzero optima are common and the property can fail (the reviews found a
+        /// regular-only pool asserting 0 == 0 everywhere).
         #[test]
-        fn suggested_order_minimizes_expected_padding_with_varlenas(
+        fn search_poles_minimize_their_lexicographic_objectives(
             kinds in proptest::collection::vec(
                 prop_oneof![
                     Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
@@ -624,21 +630,70 @@ mod minimality_property {
                 3..=6
             )
         ) {
-            let order = suggested_order(&kinds);
-            let mut seen = vec![false; kinds.len()];
-            for &i in &order {
-                prop_assert!(!seen[i], "not a permutation: {:?}", order);
-                seen[i] = true;
+            let lex = |w: &Walk, certainty_first: bool| {
+                if certainty_first {
+                    w.padding * 512 + w.padding_max()
+                } else {
+                    w.padding_max() * 512 + w.padding
+                }
+            };
+            let search = search(&kinds);
+            prop_assert_eq!(search.scope, SearchScope::Complete);
+            for (pole, certainty_first) in [
+                (search.certainty_pole.as_ref().unwrap(), true),
+                (search.minimax_pole.as_ref().unwrap(), false),
+            ] {
+                let mut seen = vec![false; kinds.len()];
+                for &i in pole {
+                    prop_assert!(!seen[i], "not a permutation: {:?}", pole);
+                    seen[i] = true;
+                }
+                let ordered: Vec<ColumnKind> = pole.iter().map(|&i| kinds[i]).collect();
+                let achieved = lex(&walk(&ordered), certainty_first);
+                let brute = brute_force_lex_min(&kinds, certainty_first);
+                prop_assert_eq!(
+                    achieved,
+                    brute,
+                    "kinds {:?} pole {:?} certainty_first {}",
+                    kinds,
+                    pole,
+                    certainty_first
+                );
             }
-            let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
-            prop_assert_eq!(
-                walk(&ordered).expected_padding_eighths(),
-                brute_force_min_expected_eighths(&kinds),
-                "kinds: {:?}, order: {:?}",
-                kinds,
-                order
-            );
         }
+    }
+
+    fn brute_force_lex_min(kinds: &[ColumnKind], certainty_first: bool) -> u64 {
+        fn go(kinds: &[ColumnKind], current: &mut Vec<ColumnKind>, used: &mut Vec<bool>, best: &mut u64, cf: bool) {
+            if current.len() == kinds.len() {
+                let w = walk(current);
+                let cost = if cf {
+                    w.padding * 512 + w.padding_max()
+                } else {
+                    w.padding_max() * 512 + w.padding
+                };
+                *best = (*best).min(cost);
+                return;
+            }
+            for i in 0..kinds.len() {
+                if !used[i] {
+                    used[i] = true;
+                    current.push(kinds[i]);
+                    go(kinds, current, used, best, cf);
+                    current.pop();
+                    used[i] = false;
+                }
+            }
+        }
+        let mut best = u64::MAX;
+        go(
+            kinds,
+            &mut Vec::new(),
+            &mut vec![false; kinds.len()],
+            &mut best,
+            certainty_first,
+        );
+        best
     }
 }
 

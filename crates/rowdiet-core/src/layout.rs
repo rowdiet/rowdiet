@@ -6,6 +6,8 @@
 //! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
 //! later pad is reported as a min/max/expected range over that set.
 //!
+//! Expected values are display-only figures: the gate and the reorder recommendation act on
+//! deterministic pads and dominance instead (see [`crate::dominance`] and the report layer).
 //! Two stated modeling assumptions feed every expected value, and only bounds hold without them:
 //!
 //! 1. **Varlena pads are scored at the short-form/TOAST value of zero.** Postgres stores a
@@ -363,55 +365,179 @@ pub fn null_thoff(natts: usize) -> u64 {
     maxalign(TUPLE_HEADER + (natts as u64).div_ceil(8))
 }
 
-/// Suggested column order: the heuristic sort (fixed before varlena; alignment descending;
-/// within a fixed alignment group regular sizes before irregulars; varlenas
-/// alignment-descending with typmod-proven-short ones last; stable by original position),
-/// refined by an exact search whenever the heuristic still expects padding. Within the search's
-/// caps (24 columns, 12 padding classes) the result minimizes expected padding under the module
-/// doc's stated assumptions.
+/// Suggested column order under the fixed-first heuristic: fixed before varlena; alignment
+/// descending; within a fixed alignment group regular sizes before irregulars; varlenas
+/// alignment-descending with typmod-proven-short ones last; stable by original position. The
+/// fixed prefix is refined to its exact deterministic minimum within [`refine_fixed_block`]'s
+/// caps. This is one candidate pole; the decision policy in the report layer compares it (and
+/// the [`search`] poles) against the current order by dominance.
 pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..kinds.len()).collect();
     order.sort_by_key(|&i| sort_key(&kinds[i], i));
-    refine_order(kinds, &mut order);
+    refine_fixed_block(kinds, &mut order);
     order
 }
 
-/// Descending-alignment sorting expects zero padding for most schemas, but not all: with two or
-/// more irregulars (timetz, macaddr, …) the fixed block can keep padding an interposed smaller
-/// column would absorb, and a block that cannot pack flat can even expect less by placing a
-/// fixed column after a varlena (a certain pad of 4 loses to an expected 3.5 over the full
-/// residue set). When the heuristic order still expects padding, find the exact minimum:
-/// expected padding depends only on (alignment, len mod MAXALIGN) classes (all varlenas form
-/// one class: expected pad 0, set widens to full) and the running residue set, so a memoized
-/// search over class counts × set states is exhaustive. Ties prefer the heuristic's own class
-/// order, so regular schemas keep their familiar shape.
-fn refine_order(kinds: &[ColumnKind], order: &mut [usize]) {
-    let total = order.len();
-    if !(2..=24).contains(&total) {
+/// How much of the order space the search proved. Anything short of [`Complete`](Self::Complete)
+/// must be labeled in the output: a capped search claims nothing beyond what it walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
+pub enum SearchScope {
+    /// The whole-order search ran to completion (or the heuristic already proves the global
+    /// minimum): the emitted poles are exact lexicographic minima.
+    Complete,
+    /// The whole-order search was over budget; the fixed prefix was still searched exactly and
+    /// varlena placement follows the heuristic.
+    FixedPrefix,
+    /// Even the fixed-prefix search was out of caps; the order is the plain heuristic sort.
+    SortOnly,
+}
+
+/// The candidate orders the decision policy evaluates, plus how much was proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    /// Fixed-first heuristic, fixed prefix refined within caps. Always present.
+    pub heuristic: Vec<usize>,
+    /// Lexicographic minimum of (deterministic padding, worst-case padding): the certainty
+    /// pole, free to place fixed columns behind varlenas. None when the search was capped.
+    pub certainty_pole: Option<Vec<usize>>,
+    /// Lexicographic minimum of (worst-case padding, deterministic padding): the minimax pole.
+    /// None when the search was capped.
+    pub minimax_pole: Option<Vec<usize>>,
+    /// What the emitted poles prove.
+    pub scope: SearchScope,
+}
+
+/// Whole-order state budget: Π(class count + 1) × 15 set states. Past it the exact search
+/// degrades to the fixed-prefix search, keeping worst-case wall time at the pre-existing
+/// fixed-block level instead of the multi-second corner a 12-class 24-column table reaches.
+const WHOLE_ORDER_STATE_BUDGET: usize = 1 << 20;
+
+/// Run the order search: the heuristic pole always, and the two exact lexicographic poles when
+/// the whole-order state space fits [`WHOLE_ORDER_STATE_BUDGET`] and the table has at most 24
+/// columns. A heuristic order that already achieves zero deterministic and zero worst-case
+/// padding is the global minimum of both objectives, so the search is complete without running.
+pub fn search(kinds: &[ColumnKind]) -> Search {
+    let mut heuristic: Vec<usize> = (0..kinds.len()).collect();
+    heuristic.sort_by_key(|&i| sort_key(&kinds[i], i));
+    let heuristic_kinds: Vec<ColumnKind> = heuristic.iter().map(|&i| kinds[i]).collect();
+    let hw = walk(&heuristic_kinds);
+    if hw.padding == 0 && hw.padding_max() == 0 {
+        return Search {
+            certainty_pole: Some(heuristic.clone()),
+            minimax_pole: Some(heuristic.clone()),
+            heuristic,
+            scope: SearchScope::Complete,
+        };
+    }
+    let classes = padding_classes(kinds, &heuristic);
+    let states: usize = classes
+        .iter()
+        .map(|c| c.members.len() + 1)
+        .try_fold(SET_STATES, usize::checked_mul)
+        .unwrap_or(usize::MAX);
+    if kinds.len() <= 24 && states <= WHOLE_ORDER_STATE_BUDGET {
+        let certainty = lex_min_order(&classes, kinds.len(), LexMode::CertaintyFirst, states);
+        let minimax = lex_min_order(&classes, kinds.len(), LexMode::WorstCaseFirst, states);
+        // The heuristic pole keeps the fixed-prefix refinement so it stays a usable candidate.
+        refine_fixed_block(kinds, &mut heuristic);
+        return Search {
+            heuristic,
+            certainty_pole: Some(certainty),
+            minimax_pole: Some(minimax),
+            scope: SearchScope::Complete,
+        };
+    }
+    let fixed_len = heuristic.iter().take_while(|&&i| kinds[i].is_fixed()).count();
+    let fixed_refinable = fixed_len <= 24 && fixed_class_count(kinds) <= 12;
+    refine_fixed_block(kinds, &mut heuristic);
+    let scope = if fixed_refinable && fixed_len == kinds.len() {
+        // All-fixed: the fixed prefix is the whole order, so the block search is complete.
+        SearchScope::Complete
+    } else if fixed_refinable {
+        SearchScope::FixedPrefix
+    } else {
+        SearchScope::SortOnly
+    };
+    Search {
+        certainty_pole: (scope == SearchScope::Complete).then(|| heuristic.clone()),
+        minimax_pole: (scope == SearchScope::Complete).then(|| heuristic.clone()),
+        heuristic,
+        scope,
+    }
+}
+
+fn fixed_class_count(kinds: &[ColumnKind]) -> usize {
+    let mut keys: Vec<(u64, u64)> = kinds
+        .iter()
+        .filter_map(|k| match k {
+            ColumnKind::Fixed { len, align } => Some((align.bytes(), len % MAXALIGN)),
+            ColumnKind::Varlena { .. } => None,
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.len()
+}
+
+/// Descending-alignment sorting leaves the fixed block zero-padding for most schemas, but with
+/// two or more irregulars (timetz, macaddr, …) it can keep padding an interposed smaller column
+/// would absorb. When the sorted fixed block still pads, find the exact minimum over the block:
+/// deterministic padding depends only on (alignment, len mod MAXALIGN) classes and the running
+/// offset residue, so a memoized search over class counts is exhaustive. The varlena tail stays
+/// where the sort put it, which makes the refinement dominance-safe: with the tail sequence
+/// preserved, reducing the prefix padding reduces the total in every realization (the report
+/// layer relies on exactly this). Caps: 3 to 24 fixed columns, 12 fixed classes.
+fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
+    let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
+    if !(3..=24).contains(&fixed_len) {
         return;
     }
-    let heuristic: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
-    // Zero expected padding is the global minimum, so the heuristic order stands.
-    if walk(&heuristic).expected_padding_eighths() == 0 {
+    let sorted_fixed: Vec<ColumnKind> = order[..fixed_len].iter().map(|&i| kinds[i]).collect();
+    if walk(&sorted_fixed).padding == 0 {
         return;
     }
-    let classes = padding_classes(kinds, order);
+    let classes = padding_classes(kinds, &order[..fixed_len]);
     if classes.len() > 12 {
         return;
     }
-    // Upper bound of the reachable state space: every count combination × residue-set state.
-    // Pre-sizing spares the memo a dozen rehashes of an ever-growing table; the cap keeps the
-    // up-front allocation modest when the bound explodes; past the cap the map grows the rest
-    // of the way as before.
     let states: usize = classes
         .iter()
         .map(|c| c.members.len() + 1)
         .product::<usize>()
-        .saturating_mul(SET_STATES)
+        .saturating_mul(MAXALIGN as usize)
         .min(1 << 17);
+    // An all-fixed block walks singleton states only, where deterministic and worst-case pads
+    // coincide, so either lexicographic mode reproduces the plain padding minimum.
+    let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst, states);
+    order[..fixed_len].copy_from_slice(&refined);
+}
+
+/// Exact lexicographic minimization over whole orders.
+fn lex_min_order(classes: &[PaddingClass], total: usize, mode: LexMode, states: usize) -> Vec<usize> {
+    run_dp(classes, total, mode, states)
+}
+
+/// The two lexicographic objectives the policy needs. Both components are additive per
+/// (class, residue-set state), and adding a common prefix cost preserves lexicographic order,
+/// so Bellman optimality holds for the packed scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexMode {
+    /// (deterministic padding, worst-case padding): the certainty pole.
+    CertaintyFirst,
+    /// (worst-case padding, deterministic padding): the minimax pole.
+    WorstCaseFirst,
+}
+
+/// Pack the lexicographic pair into one additive scalar. Each component is at most
+/// 24 columns × 7 bytes = 168, far under the 512 radix.
+const LEX_RADIX: u64 = 512;
+
+fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode, states: usize) -> Vec<usize> {
     let mut dp = Dp {
-        classes: &classes,
-        memo: std::collections::HashMap::with_capacity_and_hasher(states, PackedKeyHasherBuilder),
+        classes,
+        mode,
+        memo: std::collections::HashMap::with_capacity_and_hasher(states.min(1 << 17), PackedKeyHasherBuilder),
     };
     let mut counts: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
     let mut remaining = total;
@@ -420,15 +546,15 @@ fn refine_order(kinds: &[ColumnKind], order: &mut [usize]) {
         classes.iter().map(|c| c.members.iter().copied().collect()).collect();
     let mut refined = Vec::with_capacity(total);
     while remaining > 0 {
-        let target = dp.min_expected_eighths(&mut counts, remaining, set);
+        let target = dp.min_lex(&mut counts, remaining, set);
         for class_index in 0..classes.len() {
             if counts[class_index] == 0 {
                 continue;
             }
             let key = classes[class_index].key;
-            let step = key.expected_pad_eighths(set);
+            let step = key.lex_cost(set, mode);
             counts[class_index] -= 1;
-            let rest = dp.min_expected_eighths(&mut counts, remaining - 1, key.next_set(set));
+            let rest = dp.min_lex(&mut counts, remaining - 1, key.next_set(set));
             if step + rest == target {
                 refined.push(queues[class_index].pop_front().expect("count tracked"));
                 set = key.next_set(set);
@@ -438,13 +564,13 @@ fn refine_order(kinds: &[ColumnKind], order: &mut [usize]) {
             counts[class_index] += 1;
         }
     }
-    order.copy_from_slice(&refined);
+    refined
 }
 
 /// Group `order` into its padding-equivalence classes, heuristic order preserved (first
-/// appearance) so the search's tie-breaking keeps the familiar shape. Every varlena falls into
-/// one class: proven short or not, its expected pad is 0 and it widens the set to full, so the
-/// walk cannot tell them apart (their relative order stays the heuristic's).
+/// appearance) so the search's tie-breaking keeps the familiar shape. Varlenas that never pad
+/// in any storage form (typmod-proven short, or char-aligned) form one class; the others are
+/// classed by alignment, which decides their worst-case long-form pad.
 fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
     let mut classes: Vec<PaddingClass> = Vec::new();
     for &index in order {
@@ -453,7 +579,13 @@ fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
                 align: align.bytes(),
                 len_mod: len % MAXALIGN,
             },
-            ColumnKind::Varlena { .. } => ClassKey::Varlena,
+            ColumnKind::Varlena { align, proven_short } => {
+                if proven_short || align == Align::Char {
+                    ClassKey::PadlessVarlena
+                } else {
+                    ClassKey::Varlena { align: align.bytes() }
+                }
+            }
         };
         match classes.iter_mut().find(|c| c.key == key) {
             Some(class) => class.members.push(index),
@@ -471,27 +603,44 @@ struct PaddingClass {
     members: Vec<usize>,
 }
 
-/// What the walk sees of a column class: its expected-pad cost from a residue-set state and the
-/// state it leaves behind.
+/// What the walk sees of a column class: its cost from a residue-set state and the state it
+/// leaves behind.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClassKey {
-    Fixed { align: u64, len_mod: u64 },
-    Varlena,
+    Fixed {
+        align: u64,
+        len_mod: u64,
+    },
+    /// Long-form-capable varlena: pads up to `align - 1` in the long form, 0 otherwise.
+    Varlena {
+        align: u64,
+    },
+    /// Proven-short or char-aligned varlena: pads 0 in every storage form.
+    PadlessVarlena,
 }
 
 impl ClassKey {
-    fn expected_pad_eighths(self, set: Residues) -> u64 {
-        match self {
-            Self::Fixed { align, .. } => set.pad_to(align).expected_eighths,
-            // Scored at the short/TOAST form, which never aligns (module doc, assumption 1).
-            Self::Varlena => 0,
+    /// (deterministic, worst-case) pad in bytes from `set`, packed per `mode`.
+    fn lex_cost(self, set: Residues, mode: LexMode) -> u64 {
+        let (det, max) = match self {
+            Self::Fixed { align, .. } => {
+                let range = set.pad_to(align);
+                (range.exact().unwrap_or(0), range.max)
+            }
+            // The varlena's own pad is certain only when even the long form pads zero.
+            Self::Varlena { align } => (0, set.pad_to(align).max),
+            Self::PadlessVarlena => (0, 0),
+        };
+        match mode {
+            LexMode::CertaintyFirst => det * LEX_RADIX + max,
+            LexMode::WorstCaseFirst => max * LEX_RADIX + det,
         }
     }
 
     fn next_set(self, set: Residues) -> Residues {
         match self {
             Self::Fixed { align, len_mod } => set.aligned(align).shifted(len_mod),
-            Self::Varlena => Residues::FULL,
+            Self::Varlena { .. } | Self::PadlessVarlena => Residues::FULL,
         }
     }
 }
@@ -507,11 +656,11 @@ fn set_state_index(set: Residues) -> u64 {
     match mask.count_ones() {
         1 => tz,
         2 => {
-            debug_assert_eq!(mask, (1 << tz) | (1 << (tz + 4)), "not a coset of 4Z");
+            debug_assert!(tz < 4 && mask == (1 << tz) | (1 << (tz + 4)), "not a coset of 4Z");
             8 + tz
         }
         4 => {
-            debug_assert_eq!(mask, 0b0101_0101 << tz, "not a coset of 2Z");
+            debug_assert!(tz < 2 && mask == 0b0101_0101 << tz, "not a coset of 2Z");
             12 + tz
         }
         _ => {
@@ -530,20 +679,21 @@ fn pad_pow2(offset: u64, align: u64) -> u64 {
 
 struct Dp<'a> {
     classes: &'a [PaddingClass],
-    memo: std::collections::HashMap<u64, u64, PackedKeyHasherBuilder>,
+    mode: LexMode,
+    memo: std::collections::HashMap<u128, u64, PackedKeyHasherBuilder>,
 }
 
 impl Dp<'_> {
     /// `remaining` is the sum of `counts`, carried so the all-placed base case is O(1). The
-    /// state fits one u64 — ≤ 12 classes (cap above) of ≤ 24 columns each (5 bits) plus the
-    /// residue-set state (4 bits) — so the memo never hashes heap data.
-    fn min_expected_eighths(&mut self, counts: &mut [u8], remaining: usize, set: Residues) -> u64 {
+    /// state packs into one u128: up to 24 classes of 5 bits each plus the residue-set state
+    /// (4 bits) — the memo never hashes heap data.
+    fn min_lex(&mut self, counts: &mut [u8], remaining: usize, set: Residues) -> u64 {
         if remaining == 0 {
             return 0;
         }
         let key = counts
             .iter()
-            .fold(set_state_index(set), |k, &c| (k << 5) | u64::from(c));
+            .fold(u128::from(set_state_index(set)), |k, &c| (k << 5) | u128::from(c));
         if let Some(&cached) = self.memo.get(&key) {
             return cached;
         }
@@ -553,9 +703,9 @@ impl Dp<'_> {
                 continue;
             }
             let class = self.classes[class_index].key;
-            let step = class.expected_pad_eighths(set);
+            let step = class.lex_cost(set, self.mode);
             counts[class_index] -= 1;
-            let total = step + self.min_expected_eighths(counts, remaining - 1, class.next_set(set));
+            let total = step + self.min_lex(counts, remaining - 1, class.next_set(set));
             counts[class_index] += 1;
             best = best.min(total);
         }
@@ -586,14 +736,15 @@ impl std::hash::Hasher for PackedKeyHasher {
     }
 
     fn write(&mut self, _bytes: &[u8]) {
-        unreachable!("only u64 keys are hashed");
+        unreachable!("only u128 keys are hashed");
     }
 
-    fn write_u64(&mut self, n: u64) {
-        // Fibonacci multiplier, then fold the well-mixed high half down: the table indexes by
-        // the low hash bits, and a bare multiply leaves keys that differ only in high fields
-        // (the offset residue, early class counts) colliding into one bucket.
-        let h = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    fn write_u128(&mut self, n: u128) {
+        // Fibonacci multiplier per half, then fold: the table indexes by the low hash bits, and
+        // a bare multiply leaves keys that differ only in high fields colliding into one bucket.
+        let lo = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let hi = ((n >> 64) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        let h = lo ^ hi.rotate_left(32);
         self.0 = h ^ (h >> 32);
     }
 }
@@ -614,16 +765,17 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 }
 
 /// How solid the reported numbers are. `Exact`: only fixed-width columns — padding and footprint
-/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — padding is an
-/// expected value with a min/max range, under the module doc's two stated assumptions
-/// (varlena pads scored at the short/TOAST form, offset residues uniform).
+/// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — the min/max range
+/// bounds every storage form, expected values are display-only model figures, and gating rests
+/// on deterministic and dominance-proven padding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
     /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
-    /// At least one varlena: padding is reported as expected values with bounds — expected
-    /// values assume short-form/TOAST varlena storage and uniform offset residues.
+    /// At least one varlena: bounds hold for every storage form, expected values are
+    /// display-only figures under the module doc's stated assumptions, and the gate uses
+    /// deterministic and dominance-proven padding only.
     Estimate,
     /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
     /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`

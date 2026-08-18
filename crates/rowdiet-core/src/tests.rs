@@ -1,3 +1,4 @@
+use crate::report::SavingRange;
 use crate::*;
 
 fn src(name: &str, sql: &str) -> SqlSource {
@@ -33,15 +34,18 @@ fn end_to_end_migration_series() {
     // full residue set on top of the 7 certain bytes.
     assert_eq!(t.current.expected_padding, 10.5);
     assert_eq!((t.current.padding_min, t.current.padding_max), (7, 14));
-    // In the suggested order note lands at offset 21: its pad is 0 short-form and 3 long-form,
-    // expected 0, so nothing deterministic remains.
+    // The suggestion hands note the aligned slot at offset 20 (pads zero in every storage
+    // form) and parks the boolean behind it: only meta's long-form pad can remain.
     assert_eq!(t.suggested.padding, 0);
-    assert_eq!(t.suggested.expected_padding, 0.0);
-    assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 6));
-    assert_eq!(t.avoidable_bytes_per_row, 10.5);
+    assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 3));
+    // Dominance-proven: 7 B of certain padding removed, saving 4-14 B/row in every realization.
+    assert_eq!(t.avoidable_bytes_per_row, 14.0);
+    assert_eq!(t.avoidable_deterministic, 7);
+    assert_eq!(t.avoidable_dominance, 7);
+    assert_eq!(t.dominance_saving, Some(SavingRange { min: 4, max: 14 }));
     assert_eq!(
         t.suggested_order,
-        vec!["id", "created_at", "status", "flag", "note", "meta"]
+        vec!["id", "created_at", "status", "note", "flag", "meta"]
     );
     assert_eq!(t.altered_in.len(), 1);
     assert!(t.any_nullable);
@@ -1204,34 +1208,58 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert_eq!(empty.tables[0].tier, layout::Tier::Exact);
 }
 
-/// The storage-form audit cases, each verified against pageinspect on PostgreSQL 16: expected
-/// values score varlenas at their short/TOAST form (measured unaligned on disk for payloads of
-/// 126 bytes or less and for external pointers), and only genuinely expected waste is reported.
-mod storage_form_scoring {
+/// The decision-policy cases, each verified against pageinspect on PostgreSQL 16 (the
+/// measured numbers live in the xtask measure fixtures): the gate and the recommendation rest
+/// on deterministic pads and dominance only, and workload-dependent pairs surface as a
+/// frontier instead of a finding in either direction.
+mod decision_policy {
     use super::src;
+    use crate::layout::SearchScope;
+    use crate::report::{BandWinner, SavingRange};
     use crate::{Config, analyze_sources};
 
     #[test]
     fn short_form_varlena_alignment_is_not_charged() {
         // (int2, text) measures flat 0 padding on disk; the long-form pin used to print a
-        // certain 2 B/row here through the unhedged branch.
+        // certain 2 B/row here through the unhedged branch. The swap trades bands, so it is
+        // frontier material and never a finding.
         let a = analyze_sources(
             &[src("V1__t.sql", "CREATE TABLE t (n int2 NOT NULL, t text NOT NULL);")],
             &Config::default(),
         );
         let t = &a.tables[0];
         assert_eq!(t.current.padding, 0);
-        assert_eq!(t.current.expected_padding, 0.0);
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 2));
         assert_eq!(t.avoidable_bytes_per_row, 0.0);
         assert_eq!(t.columns[1].pad_before, None, "the pad depends on the storage form");
         assert_eq!(t.columns[1].offset, None);
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["t", "n"]);
+        assert_eq!((frontier.alternative_worst, frontier.current_worst), (1, 2));
     }
 
     #[test]
-    fn fixed_column_behind_a_varlena_is_a_real_finding() {
-        // (text, macaddr) measures a 1.5 B/row mean; (macaddr, text) measures flat 0. The old
-        // objective scored the swap at 2.0 and the safety guard hid the win.
+    fn stranded_fixed_column_is_a_dominance_finding() {
+        // (text, int4) is dominated by (int4, text): the swap is never worse in any storage
+        // form or payload length and saves up to 3 B/row. This is the rung-1 gate case.
+        let a = analyze_sources(
+            &[src("V1__t.sql", "CREATE TABLE t (t text NOT NULL, n int4 NOT NULL);")],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 3.0);
+        assert_eq!(t.avoidable_deterministic, 0);
+        assert_eq!(t.avoidable_dominance, 3);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 3 }));
+        assert_eq!(t.suggested_order, vec!["n", "t"]);
+        assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn workload_dependent_swap_is_a_frontier_and_never_gates() {
+        // (text, macaddr) vs (macaddr, text): short payloads favor macaddr-first (measured
+        // flat 0 vs a 1.5 B/row mean), long payloads with friendly residues favor text-first.
+        // Neither dominates, so neither order gates and both see the boundary.
         let a = analyze_sources(
             &[src(
                 "V1__t.sql",
@@ -1240,40 +1268,29 @@ mod storage_form_scoring {
             &Config::default(),
         );
         let t = &a.tables[0];
-        assert_eq!(t.current.expected_padding, 1.5);
-        assert_eq!(t.avoidable_bytes_per_row, 1.5);
-        assert_eq!(t.suggested_order, vec!["m", "t"]);
-        let small = analyze_sources(
-            &[src("V1__s.sql", "CREATE TABLE s (t text NOT NULL, n int2 NOT NULL);")],
-            &Config::default(),
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested_order, vec!["t", "m"], "no rewrite advice without dominance");
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["m", "t"]);
+        assert!(frontier.decided);
+        let short_band = frontier.bands.iter().find(|b| b.long_form.is_empty()).unwrap();
+        assert_eq!(
+            short_band.winner,
+            BandWinner::Alternative,
+            "short payloads favor macaddr-first"
         );
-        assert_eq!(small.tables[0].avoidable_bytes_per_row, 0.5);
-        assert_eq!(small.tables[0].suggested_order, vec!["n", "t"]);
+        let long_band = frontier.bands.iter().find(|b| b.long_form == ["t"]).unwrap();
+        assert_eq!(
+            long_band.winner,
+            BandWinner::Mixed,
+            "long payloads flip with the residue"
+        );
     }
 
     #[test]
-    fn d_aligned_varlena_orders_tie_at_zero_expected() {
-        // (int4, polygon, text) and (int4, text, polygon) both measure flat 0 on disk; the old
-        // model scored them 5.5 vs 3.5 and preferred the former.
-        let a = analyze_sources(
-            &[src(
-                "V1__t.sql",
-                "CREATE TABLE a (n int4 NOT NULL, p polygon NOT NULL, t text NOT NULL);
-                 CREATE TABLE b (n int4 NOT NULL, t text NOT NULL, p polygon NOT NULL);",
-            )],
-            &Config::default(),
-        );
-        for t in &a.tables {
-            assert_eq!(t.current.expected_padding, 0.0, "{}", t.name);
-            assert_eq!(t.avoidable_bytes_per_row, 0.0, "{}", t.name);
-        }
-    }
-
-    #[test]
-    fn stranded_bigint_is_the_full_expected_finding() {
-        // (text, boolean, bigint): suggested (bigint, boolean, text) measures flat 0 and the
-        // current order strands the bigint behind the text (measured avoidable ~3.5, which the
-        // old exact objective reported as 0 and the long-form objective as 0.5).
+    fn aligned_slot_and_char_tail_dominate() {
+        // (text, boolean, bigint): the winning order hands the text the aligned slot behind
+        // the bigint and parks the boolean last, reaching zero padding in every realization.
         let a = analyze_sources(
             &[src(
                 "V1__t.sql",
@@ -1282,26 +1299,182 @@ mod storage_form_scoring {
             &Config::default(),
         );
         let t = &a.tables[0];
-        assert_eq!(t.current.expected_padding, 3.5);
-        assert_eq!(t.avoidable_bytes_per_row, 3.5);
-        assert_eq!(t.suggested_order, vec!["x", "b", "t"]);
-        assert_eq!(t.suggested.expected_padding, 0.0);
+        assert_eq!(t.avoidable_bytes_per_row, 7.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 7 }));
+        assert_eq!(t.suggested_order, vec!["x", "t", "b"]);
+        assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 0));
     }
 
     #[test]
-    fn beyond_the_search_caps_the_guard_keeps_the_better_current_order() {
-        // 25 columns exceed the exact search's cap, and the heuristic sort (both timetz
-        // adjacent) is worse than the hand-packed current order: the guard must fall back
-        // instead of suggesting a worse layout.
-        let uuids: String = (0..22).map(|i| format!(", u{i} uuid NOT NULL")).collect();
-        let sql = format!("CREATE TABLE g (a timetz NOT NULL, b int4 NOT NULL, c timetz NOT NULL{uuids});");
-        let a = analyze_sources(&[src("V1__g.sql", &sql)], &Config::default());
+    fn d_aligned_array_first_is_kept_and_the_swap_is_not_recommended() {
+        // (float8[], int4) measures flat 0 for whole-float8 payloads; the old model demanded
+        // (int4, float8[]), which measures flat 4. Neither dominates; current order stays.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE a (arr float8[] NOT NULL, n int4 NOT NULL);
+                 CREATE TABLE b (n int4 NOT NULL, arr float8[] NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let keep = &a.tables[0];
+        assert_eq!(keep.avoidable_bytes_per_row, 0.0);
+        assert!(keep.frontier.is_none(), "array-first is already the minimax pole");
+        let swapped = &a.tables[1];
+        assert_eq!(
+            swapped.avoidable_bytes_per_row, 0.0,
+            "the 4-flat band is the reader's call"
+        );
+        let frontier = swapped.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["arr", "n"]);
+        assert_eq!((frontier.alternative_worst, frontier.current_worst), (3, 4));
+    }
+
+    #[test]
+    fn certainty_trade_is_reported_and_never_recommended() {
+        // (timetz, timetz, text): interposing the text trades a certain 4 for 0..=7, which
+        // measures 3 B/row worse on 4-byte-wide texts. The trade renders as a frontier with
+        // the current order kept.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t1 timetz NOT NULL, t2 timetz NOT NULL, v text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested_order, vec!["t1", "t2", "v"]);
+        assert_eq!(t.current.padding, 4);
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["t1", "v", "t2"]);
+        assert_eq!(frontier.alternative_deterministic, 0);
+        assert_eq!(frontier.alternative_worst, 7);
+    }
+
+    #[test]
+    fn issue_10_band_pair_reports_the_boundary_instead_of_identical_silence() {
+        // (int8, text, float8[]) vs (int8, float8[], text): which varlena receives the aligned
+        // slot is workload knowledge (issue #10's W1/W2). The text-first order shows the
+        // frontier with per-form bands; the array-first order is the minimax pole and passes.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE band_b (k int8 NOT NULL, txt text NOT NULL, arr float8[] NOT NULL);
+                 CREATE TABLE band_a (k int8 NOT NULL, arr float8[] NOT NULL, txt text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let text_first = &a.tables[0];
+        assert_eq!(text_first.avoidable_bytes_per_row, 0.0);
+        let frontier = text_first.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["k", "arr", "txt"]);
+        let arr_long = frontier.bands.iter().find(|b| b.long_form == ["arr"]).unwrap();
+        assert_eq!(
+            arr_long.winner,
+            BandWinner::Alternative,
+            "long arrays want the aligned slot"
+        );
+        let txt_long = frontier.bands.iter().find(|b| b.long_form == ["txt"]).unwrap();
+        assert_eq!(txt_long.winner, BandWinner::Current, "long texts already own it");
+        let array_first = &a.tables[1];
+        assert_eq!(array_first.avoidable_bytes_per_row, 0.0);
+    }
+
+    #[test]
+    fn capped_search_still_gates_deterministic_waste() {
+        // The 25-column false negative: past the whole-order budget the fixed prefix is still
+        // searched exactly, the suffix-preserving repack dominates, and the gate fires at the
+        // full 24 B/row (both prior PRs' review blocker).
+        let mut cols: Vec<String> = Vec::new();
+        for i in 0..4 {
+            cols.push(format!("tz{i} timetz NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("m{i} macaddr NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("b{i} bigint NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("i{i} integer NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("s{i} smallint NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("f{i} boolean NOT NULL"));
+        }
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE cliff25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__c.sql", &sql)], &Config::default());
         let t = &a.tables[0];
         assert_eq!(t.natts, 25);
-        assert_eq!(t.current.padding, 0);
-        assert_eq!(t.avoidable_bytes_per_row, 0.0);
-        assert_eq!(t.suggested, t.current);
-        assert_eq!(t.suggested_order[..3], ["a", "b", "c"], "{:?}", t.suggested_order);
+        assert_eq!(t.current.padding, 24);
+        assert_eq!(t.avoidable_bytes_per_row, 24.0);
+        assert_eq!(t.avoidable_deterministic, 24);
+        assert_eq!(t.search_scope, SearchScope::FixedPrefix, "the cap must be labeled");
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 24, max: 24 }));
+    }
+
+    #[test]
+    fn wide_fixed_table_keeps_the_base_refinement_past_the_budget() {
+        // 21 bigints push the state space over the whole-order budget; the block search still
+        // repacks the two timetz around the smallint and dominance still proves the win.
+        let mut cols: Vec<String> = (0..21).map(|i| format!("b{i} bigint NOT NULL")).collect();
+        cols.push("t1 timetz NOT NULL".into());
+        cols.push("t2 timetz NOT NULL".into());
+        cols.push("s smallint NOT NULL".into());
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE wide25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__w.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 4);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.avoidable_deterministic, 2);
+        assert_eq!(t.avoidable_dominance, 2);
+        assert_eq!(t.search_scope, SearchScope::FixedPrefix);
+    }
+
+    #[test]
+    fn many_class_table_keeps_the_fixed_prefix_win() {
+        // 10 distinct fixed padding classes (via assume-type) plus a text: the whole-order
+        // search is over budget, and the reviews' false negative was a silent clean checkmark
+        // on this shape. The fixed-prefix search must still surface the repack and gate it.
+        let mut config = Config::default();
+        for (name, spec) in [
+            ("w3c", "fixed:3:c"),
+            ("w5c", "fixed:5:c"),
+            ("w3s", "fixed:3:s"),
+            ("w5i", "fixed:5:i"),
+        ] {
+            let (key, kind) = crate::catalog::parse_assume_spec(&format!("{name}={spec}")).unwrap();
+            config.assume.insert(key, kind);
+        }
+        let types = [
+            "boolean", "smallint", "integer", "bigint", "timetz", "macaddr", "w3c", "w5c", "w3s", "w5i",
+        ];
+        let mut cols: Vec<String> = Vec::new();
+        for (i, ty) in types.iter().enumerate() {
+            cols.push(format!("c{i}a {ty} NOT NULL"));
+            cols.push(format!("c{i}b {ty} NOT NULL"));
+        }
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE cls ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__cls.sql", &sql)], &config);
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 21);
+        assert_eq!(t.search_scope, SearchScope::FixedPrefix, "over the whole-order budget");
+        assert!(
+            t.current.padding > 0,
+            "the as-written order pads: {}",
+            t.current.padding
+        );
+        assert!(
+            t.avoidable_deterministic > 0,
+            "a capped search must not print a silent clean verdict over deterministic waste: {t:#?}"
+        );
+        assert!(t.avoidable_bytes_per_row > 0.0);
     }
 }
 
@@ -1318,18 +1491,21 @@ mod varlena_residue_uncertainty {
         a text NOT NULL, b text NOT NULL, c text NOT NULL, d text NOT NULL, e text NOT NULL);";
 
     #[test]
-    fn interleaved_reports_expected_avoidable_and_surfaces_the_reorder() {
-        // Expected 5.0 = tag 1.5 (behind the first text) + score 3.5 (behind five texts);
-        // pageinspect on independently varying payloads measures a 4.54 B/row mean.
+    fn interleaved_reports_dominance_avoidable_and_surfaces_the_reorder() {
+        // Grouping dominates interleaving here: never worse in any storage-form/payload
+        // realization, and up to 11 B/row better. The display expectation stays 5.0
+        // (pageinspect on independently varying short payloads measures a 4.5-5.1 B/row mean).
         let analysis = analyze_sources(&[src("V1__i.sql", INTERLEAVED)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.current.padding, 0, "no pad in this order is certain");
         assert_eq!(t.current.expected_padding, 5.0);
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 19));
-        assert_eq!(t.suggested.expected_padding, 0.0);
         assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 12));
-        assert_eq!(t.avoidable_bytes_per_row, 5.0);
+        assert_eq!(t.avoidable_bytes_per_row, 11.0);
+        assert_eq!(t.avoidable_deterministic, 0);
+        assert_eq!(t.avoidable_dominance, 11);
+        assert_eq!(t.dominance_saving, Some(crate::report::SavingRange { min: 0, max: 11 }));
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
     }
 
@@ -1346,5 +1522,7 @@ mod varlena_residue_uncertainty {
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 12));
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+        assert!(t.frontier.is_none(), "the control table is its own minimax pole");
+        assert!(t.dominance_evaluated);
     }
 }

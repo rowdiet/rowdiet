@@ -2,10 +2,13 @@
 //!
 //! Reporting contract: for fixed-width-only tables everything is byte-exact —
 //! the headline is the MAXALIGN-rounded footprint delta, and a reorder that does not cross an
-//! 8-byte rung reports zero avoidable bytes. Tables with varlena columns get expected-value
-//! numbers with a data-dependent min/max range, under the layout module doc's two stated
-//! assumptions (varlena pads scored at the short/TOAST form, offset residues uniform), labeled
-//! as estimates and never claimed as guaranteed savings.
+//! 8-byte rung reports zero avoidable bytes. Tables with varlena columns follow the decision
+//! policy (docs/design.md): the gate and the reorder recommendation rest only on
+//! realization-independent facts — deterministic pads and dominance (never worse in any
+//! storage-form/payload realization, verified by [`crate::dominance`]) — while genuinely
+//! workload-dependent choices are reported as a frontier with the decision boundary and never
+//! gate. Expected values stay as display fields under the layout module doc's stated model
+//! assumptions and decide nothing.
 
 use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, Tier, Walk};
@@ -88,11 +91,35 @@ pub struct TableReport {
     /// Column names (display spelling) in suggested order; the original order when nothing is
     /// avoidable.
     pub suggested_order: Vec<String>,
-    /// The headline number gates compare: footprint delta (exact tier) or expected-padding
-    /// delta (estimate tier) between current and suggested order — fractional when the delta
-    /// rides on data-dependent pads. 0 = reordering gains nothing, or the table is incomplete
-    /// (unknown tier), where no waste can be claimed.
+    /// The headline number gates compare: the sum of [`avoidable_deterministic`] and
+    /// [`avoidable_dominance`] (for the exact tier, the MAXALIGN-rounded footprint delta).
+    /// 0 = no dominating reorder was found, or the table is incomplete (unknown tier), where
+    /// no waste can be claimed. Frontier findings never enter this number.
+    ///
+    /// [`avoidable_deterministic`]: Self::avoidable_deterministic
+    /// [`avoidable_dominance`]: Self::avoidable_dominance
     pub avoidable_bytes_per_row: f64,
+    /// Waste in exactly-known pads the recommended reorder removes, bytes/row: current minus
+    /// suggested deterministic padding (exact tier: the footprint delta). Gates.
+    pub avoidable_deterministic: u64,
+    /// Further worst-case waste the recommended reorder removes beyond the deterministic part,
+    /// bytes/row — nonzero only when the suggestion dominates the current order (never worse
+    /// in any realization). Gates.
+    pub avoidable_dominance: u64,
+    /// Guaranteed-to-maximum saving of the recommended reorder over every realization,
+    /// bytes/row; present exactly when the suggestion dominates the current order.
+    pub dominance_saving: Option<SavingRange>,
+    /// How much of the order space the suggestion search proved; anything short of complete is
+    /// labeled in the rendered output.
+    pub search_scope: layout::SearchScope,
+    /// False when a candidate comparison was out of the dominance engine's budget (varlena
+    /// sequences differ and too many varlenas to enumerate): findings may be missed, and the
+    /// output says so instead of printing a clean verdict.
+    pub dominance_evaluated: bool,
+    /// A workload-dependent alternative order for the reader to weigh: present when no
+    /// candidate dominates but one is strictly better somewhere (or by worst case). Reported,
+    /// never gated.
+    pub frontier: Option<Frontier>,
     /// Type spellings that resolved by assumption, sorted and deduplicated — the table's
     /// numbers are only as good as those assumptions.
     pub assumed_types: Vec<String>,
@@ -154,6 +181,203 @@ pub struct OrderStats {
     pub rows_per_page: Option<u64>,
 }
 
+/// A dominance-proven saving: the reorder saves at least `min` and at most `max` bytes/row,
+/// in every realization of storage forms and payload lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct SavingRange {
+    /// Guaranteed saving, bytes/row (0 means some realization already packs the current order).
+    pub min: u64,
+    /// Largest attainable saving, bytes/row.
+    pub max: u64,
+}
+
+/// A workload-dependent order choice the tool cannot make: the alternative wins some
+/// realizations, the current order wins others (or the pair was undecidable). The bands carry
+/// the decision boundary; the reader supplies the workload knowledge.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Frontier {
+    /// The alternative order (display column names).
+    pub order: Vec<String>,
+    /// Current order's worst-case padding, bytes/row.
+    pub current_worst: u64,
+    /// Alternative order's worst-case padding, bytes/row.
+    pub alternative_worst: u64,
+    /// Current order's deterministic padding, bytes/row.
+    pub current_deterministic: u64,
+    /// Alternative order's deterministic padding, bytes/row.
+    pub alternative_deterministic: u64,
+    /// False when the pair was out of the dominance engine's budget: the worst cases above
+    /// still hold, but no per-band winners could be computed.
+    pub decided: bool,
+    /// The decision boundary, one entry per storage-form combination (empty when undecided).
+    pub bands: Vec<FrontierBand>,
+}
+
+/// One storage-form band of a frontier: who wins while exactly the named columns store the
+/// in-line long form.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct FrontierBand {
+    /// Columns (display names) stored long-form in this band; every other varlena is short or
+    /// TOAST.
+    pub long_form: Vec<String>,
+    /// Who wins the band.
+    pub winner: BandWinner,
+    /// Smallest `current - alternative` padding difference in the band, bytes/row.
+    pub min_saving: i64,
+    /// Largest `current - alternative` padding difference in the band, bytes/row.
+    pub max_saving: i64,
+}
+
+/// Band verdicts: positive savings favor the alternative order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
+pub enum BandWinner {
+    /// The alternative order is never worse in the band and better somewhere in it.
+    Alternative,
+    /// The current order is never worse in the band and better somewhere in it.
+    Current,
+    /// Identical padding across the band.
+    Tie,
+    /// The winner flips with payload lengths (mod 8) inside the band.
+    Mixed,
+}
+
+/// What the decision policy concluded for one estimate-tier table.
+struct Decision {
+    order: Vec<usize>,
+    avoidable_deterministic: u64,
+    avoidable_dominance: u64,
+    dominance_saving: Option<SavingRange>,
+    dominance_evaluated: bool,
+    frontier_order: Option<Vec<usize>>,
+}
+
+/// The estimate-tier decision policy (docs/design.md): gather the search poles, keep only a
+/// candidate that dominates the current order (never worse in any realization), and surface
+/// the best non-dominating candidate as a frontier instead of a recommendation.
+fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) -> Decision {
+    let n = kinds.len();
+    let identity: Vec<usize> = (0..n).collect();
+    let mut candidates: Vec<&Vec<usize>> = Vec::new();
+    for candidate in [
+        search.minimax_pole.as_ref(),
+        search.certainty_pole.as_ref(),
+        Some(&search.heuristic),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if candidate != &identity && !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    let mut dominance_evaluated = true;
+    let mut dominating: Vec<(&Vec<usize>, crate::dominance::DiffBounds, Walk)> = Vec::new();
+    let mut frontier_pick: Option<(&Vec<usize>, Walk)> = None;
+    for candidate in candidates {
+        let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
+        let cand_walk = layout::walk(&ordered);
+        match crate::dominance::compare(kinds, &identity, candidate) {
+            Some(diff) if diff.b_dominates() => dominating.push((candidate, diff, cand_walk)),
+            Some(diff) => {
+                // Frontier material: strictly better somewhere, and better on a
+                // realization-free summary (worst case, or certain padding at equal worst).
+                let better_summary = cand_walk.padding_max() < current_walk.padding_max()
+                    || (cand_walk.padding_max() == current_walk.padding_max()
+                        && cand_walk.padding < current_walk.padding);
+                if diff.max > 0 && better_summary && frontier_pick.is_none() {
+                    frontier_pick = Some((candidate, cand_walk));
+                }
+            }
+            None => dominance_evaluated = false,
+        }
+    }
+    if let Some((order, diff, cand_walk)) = dominating
+        .into_iter()
+        .min_by_key(|(_, _, w)| (w.padding_max(), w.padding, w.expected_padding_eighths()))
+    {
+        let det = current_walk.padding.saturating_sub(cand_walk.padding);
+        let dominance = (diff.max as u64).saturating_sub(det);
+        return Decision {
+            order: order.clone(),
+            avoidable_deterministic: det,
+            avoidable_dominance: dominance,
+            dominance_saving: Some(SavingRange {
+                min: diff.min as u64,
+                max: diff.max as u64,
+            }),
+            dominance_evaluated: true,
+            frontier_order: None,
+        };
+    }
+    // The certainty pole earns a frontier line even at a higher worst case: it removes certain
+    // padding the current order pays in full (the reader may know the payloads are friendly).
+    if frontier_pick.is_none()
+        && let Some(candidate) = search.certainty_pole.as_ref().filter(|c| *c != &identity)
+    {
+        let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
+        let cand_walk = layout::walk(&ordered);
+        let wins_somewhere = crate::dominance::compare(kinds, &identity, candidate).map(|diff| diff.max > 0);
+        if cand_walk.padding < current_walk.padding && wins_somewhere.unwrap_or(false) {
+            frontier_pick = Some((candidate, cand_walk));
+        }
+    }
+    Decision {
+        order: identity,
+        avoidable_deterministic: 0,
+        avoidable_dominance: 0,
+        dominance_saving: None,
+        dominance_evaluated,
+        frontier_order: frontier_pick.map(|(order, _)| order.clone()),
+    }
+}
+
+fn frontier_report(
+    kinds: &[ColumnKind],
+    columns: &[crate::fold::FoldedColumn],
+    current_walk: &Walk,
+    alternative: &[usize],
+) -> Frontier {
+    let identity: Vec<usize> = (0..kinds.len()).collect();
+    let ordered: Vec<ColumnKind> = alternative.iter().map(|&i| kinds[i]).collect();
+    let alt_walk = layout::walk(&ordered);
+    let bands = crate::dominance::bands(kinds, &identity, alternative);
+    let decided = bands.is_some();
+    let bands = bands
+        .unwrap_or_default()
+        .into_iter()
+        .map(|band| {
+            let winner = if band.diff.b_dominates() {
+                BandWinner::Alternative
+            } else if band.diff.a_dominates() {
+                BandWinner::Current
+            } else if band.diff.equal() {
+                BandWinner::Tie
+            } else {
+                BandWinner::Mixed
+            };
+            FrontierBand {
+                long_form: band.long_form.iter().map(|&i| columns[i].display.clone()).collect(),
+                winner,
+                min_saving: band.diff.min,
+                max_saving: band.diff.max,
+            }
+        })
+        .collect();
+    Frontier {
+        order: alternative.iter().map(|&i| columns[i].display.clone()).collect(),
+        current_worst: current_walk.padding_max(),
+        alternative_worst: alt_walk.padding_max(),
+        current_deterministic: current_walk.padding,
+        alternative_deterministic: alt_walk.padding,
+        decided,
+        bands,
+    }
+}
+
 pub(crate) fn build(table: FoldedTable) -> TableReport {
     let kinds: Vec<ColumnKind> = table.columns.iter().map(|c| c.kind).collect();
     // An incomplete table's columns are not the whole table, so no footprint can be claimed —
@@ -173,40 +397,60 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         layout::bare_thoff()
     };
     let current_walk = layout::walk(&kinds);
-    let mut order = layout::suggested_order(&kinds);
-    let ordered_kinds: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
-    let mut suggested_walk = layout::walk(&ordered_kinds);
-    if suggested_walk.expected_padding_eighths() > current_walk.expected_padding_eighths() {
-        order = (0..kinds.len()).collect();
-        suggested_walk = current_walk.clone();
-    }
+    let search = layout::search(&kinds);
+    let identity: Vec<usize> = (0..kinds.len()).collect();
     let current = stats(tier, &current_walk, t_hoff);
+    let decision = match tier {
+        // Exact tier: everything is deterministic, so the fixed-first refined order is itself
+        // dominance-proven and the footprint delta is the whole story (computed below).
+        Tier::Exact => Decision {
+            order: search.heuristic.clone(),
+            avoidable_deterministic: 0,
+            avoidable_dominance: 0,
+            dominance_saving: None,
+            dominance_evaluated: true,
+            frontier_order: None,
+        },
+        Tier::Estimate => decide(&kinds, &search, &current_walk),
+        // Columns unknown: no avoidable waste can be claimed, and the incomplete verdict
+        // carries the "not analyzed" signal.
+        Tier::Unknown => Decision {
+            order: identity.clone(),
+            avoidable_deterministic: 0,
+            avoidable_dominance: 0,
+            dominance_saving: None,
+            dominance_evaluated: true,
+            frontier_order: None,
+        },
+    };
+    let ordered_kinds: Vec<ColumnKind> = decision.order.iter().map(|&i| kinds[i]).collect();
+    let suggested_walk = layout::walk(&ordered_kinds);
     let suggested = stats(tier, &suggested_walk, t_hoff);
-    // Integer eighths of a byte until the very end: the zero check carries no float error.
-    let avoidable_eighths = match tier {
-        Tier::Exact => {
+    // Exact-tier avoidable is the footprint delta; a reorder that does not cross an 8-byte
+    // rung reports zero even when raw padding drops.
+    let (avoidable_deterministic, avoidable_dominance) = match tier {
+        Tier::Exact => (
             current
                 .footprint
                 .unwrap_or(0)
-                .saturating_sub(suggested.footprint.unwrap_or(0))
-                * 8
-        }
-        // Expected-padding delta under the stated model (see the layout module doc).
-        Tier::Estimate => current_walk
-            .expected_padding_eighths()
-            .saturating_sub(suggested_walk.expected_padding_eighths()),
-        // Columns unknown: no avoidable waste can be claimed, and the incomplete verdict
-        // carries the "not analyzed" signal.
-        Tier::Unknown => 0,
+                .saturating_sub(suggested.footprint.unwrap_or(0)),
+            0,
+        ),
+        Tier::Estimate | Tier::Unknown => (decision.avoidable_deterministic, decision.avoidable_dominance),
     };
-    let avoidable = avoidable_eighths as f64 / 8.0;
+    let avoidable_units = avoidable_deterministic + avoidable_dominance;
+    let avoidable = avoidable_units as f64;
     // With nothing avoidable the suggestion IS the current order; the stats must say the same
     // thing, or the JSON contradicts itself (suggested.padding 0 beside the original order).
-    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable_eighths == 0 {
-        ((0..kinds.len()).collect(), current.clone())
+    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable_units == 0 {
+        (identity, current.clone())
     } else {
-        (order, suggested)
+        (decision.order, suggested)
     };
+    let frontier = decision
+        .frontier_order
+        .as_ref()
+        .map(|alternative| frontier_report(&kinds, &table.columns, &current_walk, alternative));
     let suggested_order = final_order.iter().map(|&i| table.columns[i].display.clone()).collect();
     let columns = table
         .columns
@@ -247,6 +491,16 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         suggested,
         suggested_order,
         avoidable_bytes_per_row: avoidable,
+        avoidable_deterministic,
+        avoidable_dominance,
+        dominance_saving: if avoidable_units == 0 {
+            None
+        } else {
+            decision.dominance_saving
+        },
+        search_scope: search.scope,
+        dominance_evaluated: decision.dominance_evaluated,
+        frontier,
         assumed_types,
         dropped_columns: table.dropped_count,
         layout_signature,

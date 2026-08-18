@@ -91,11 +91,10 @@ fn version_order_folds_alters_after_create() {
 }
 
 #[test]
-fn interleaved_varlenas_report_data_dependent_waste() {
-    // The issue-1 repro: same column multiset, opposite orders. Interleaving must surface the
-    // reorder with a fractional expected saving; grouping must pass clean with an expectation
-    // matching its measured zero padding. Behavior is asserted on the JSON, and the text output
-    // only for the pieces prose edits must not lose (the stated assumptions, the order line).
+fn interleaved_varlenas_report_dominance_avoidable_waste() {
+    // The issue-1 repro: same column multiset, opposite orders. Grouping dominates
+    // interleaving (never worse in any storage-form/payload realization), so the reorder is a
+    // gated finding; the control table passes clean with the expectation as display only.
     let out = bin()
         .arg(fixtures("varlena"))
         .args(["--format", "json"])
@@ -110,9 +109,13 @@ fn interleaved_varlenas_report_data_dependent_waste() {
     assert_eq!(interleaved["current"]["expected_padding"], 5.0);
     assert_eq!(interleaved["current"]["padding_min"], 0);
     assert_eq!(interleaved["current"]["padding_max"], 19);
-    assert_eq!(interleaved["suggested"]["expected_padding"], 0.0);
     assert_eq!(interleaved["suggested"]["padding_max"], 12);
-    assert_eq!(interleaved["avoidable_bytes_per_row"], 5.0);
+    assert_eq!(interleaved["avoidable_bytes_per_row"], 11.0);
+    assert_eq!(interleaved["avoidable_deterministic"], 0);
+    assert_eq!(interleaved["avoidable_dominance"], 11);
+    assert_eq!(interleaved["dominance_saving"]["min"], 0);
+    assert_eq!(interleaved["dominance_saving"]["max"], 11);
+    assert_eq!(interleaved["search_scope"], "complete");
     let order: Vec<&str> = interleaved["suggested_order"]
         .as_array()
         .unwrap()
@@ -120,21 +123,23 @@ fn interleaved_varlenas_report_data_dependent_waste() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert_eq!(order, ["score", "seen", "tag", "a", "b", "c", "d", "e"]);
-    // The control table measures flat zero padding on disk; the expectation must agree and
-    // only the long-form bound may exceed it.
+    // The control table measures flat zero padding on disk; it passes with no finding and no
+    // frontier, and the long-form bound stays visible as the range.
     let grouped = &tables[1];
     assert_eq!(grouped["name"], "grouped");
     assert_eq!(grouped["current"]["expected_padding"], 0.0);
     assert_eq!(grouped["current"]["padding_max"], 12);
     assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
+    assert!(grouped["frontier"].is_null());
+    assert_eq!(grouped["dominance_evaluated"], true);
     // Columns at data-dependent offsets claim no point placement.
     assert!(interleaved["columns"][6]["offset"].is_null(), "{interleaved}");
     assert!(interleaved["columns"][6]["pad_before"].is_null(), "{interleaved}");
-    assert!(value["estimate_assumptions"].as_str().unwrap().contains("assume"));
+    assert!(value["estimate_assumptions"].as_str().unwrap().contains("display-only"));
 }
 
 #[test]
-fn varlena_text_output_states_the_assumptions_and_gates_fractionally() {
+fn varlena_text_output_states_the_policy_and_gates_fractionally() {
     let text = bin().arg(fixtures("varlena")).output().unwrap();
     assert!(text.status.success());
     let stdout = String::from_utf8_lossy(&text.stdout);
@@ -144,23 +149,71 @@ fn varlena_text_output_states_the_assumptions_and_gates_fractionally() {
         stdout.contains("order    : score, seen, tag, a, b, c, d, e"),
         "{stdout}"
     );
-    assert!(stdout.contains("expected padding"), "{stdout}");
+    assert!(stdout.contains("dominance-proven"), "{stdout}");
+    assert!(stdout.contains("no dominating reorder found"), "{stdout}");
     assert!(
-        stdout.contains("expected values assume short-form varlenas and uniform offsets"),
-        "the assumptions must be stated where the numbers are shown: {stdout}"
+        stdout.contains("display-only"),
+        "the policy must be stated where the numbers are shown: {stdout}"
     );
     let gated = bin()
         .arg(fixtures("varlena"))
         .args(["--fail-over", "0"])
         .output()
         .unwrap();
-    assert_eq!(gated.status.code(), Some(1), "5.0 B/row expected must trip a zero gate");
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "11 B/row dominance-proven must trip a zero gate"
+    );
     let fractional = bin()
         .arg(fixtures("varlena"))
-        .args(["--fail-over", "4.5"])
+        .args(["--fail-over", "10.5"])
         .output()
         .unwrap();
     assert_eq!(fractional.status.code(), Some(1), "fail-over accepts fractions");
+}
+
+#[test]
+fn frontier_is_reported_and_never_gated() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-frontier-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__band.sql"),
+        "CREATE TABLE band_b (k int8 NOT NULL, txt text NOT NULL, arr float8[] NOT NULL);",
+    )
+    .unwrap();
+    let gated = bin().arg(&dir).args(["--fail-over", "0"]).output().unwrap();
+    assert_eq!(gated.status.code(), Some(0), "frontier findings never gate");
+    let stdout = String::from_utf8_lossy(&gated.stdout);
+    assert!(stdout.contains("frontier :"), "{stdout}");
+    assert!(stdout.contains("workload-dependent, not gated"), "{stdout}");
+    assert!(stdout.contains("wins when"), "{stdout}");
+    let json_out = bin().arg(&dir).args(["--format", "json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    let frontier = &value["analysis"]["tables"][0]["frontier"];
+    assert!(frontier["decided"].as_bool().unwrap(), "{frontier}");
+    assert!(!frontier["bands"].as_array().unwrap().is_empty(), "{frontier}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_finite_fail_over_is_rejected() {
+    // f64::from_str accepts nan and inf, and `avoidable > nan` is always false: without a
+    // validator these silently disable the gate (exit 0 with no message).
+    for bad in ["nan", "inf", "1e400", "-1"] {
+        let out = bin()
+            .arg(fixtures("wasteful"))
+            .args(["--fail-over", bad])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--fail-over {bad} must be rejected");
+    }
+    let ok = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--fail-over", "0.5"])
+        .output()
+        .unwrap();
+    assert_eq!(ok.status.code(), Some(1), "a fractional threshold still gates");
 }
 
 #[test]

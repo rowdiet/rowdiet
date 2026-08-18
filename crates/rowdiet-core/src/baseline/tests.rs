@@ -307,33 +307,33 @@ fn verdict_display_matches_serde_tag() {
     }
 }
 
-mod fractional_avoidable {
+mod fractional_allowances {
     use super::*;
 
-    /// Fixed columns interleaved among varlenas: avoidable is a fractional expected value
-    /// (tag expects 1.5 B behind the first text, score 3.5 B behind the rest; grouping fixed
-    /// columns first expects zero).
+    /// Fixed columns interleaved among varlenas: grouping them first dominates (never worse in
+    /// any realization) and can save up to 10 B/row, which is the gated number.
     const VARLENA_WASTE: &str =
         "CREATE TABLE t (a text NOT NULL, tag int4 NOT NULL, b text NOT NULL, score float8 NOT NULL);";
 
     #[test]
-    fn fractional_avoidable_gates_against_fail_over() {
+    fn dominance_avoidable_gates_against_fractional_fail_over() {
         let a = analysis(VARLENA_WASTE);
-        assert_eq!(a.tables[0].avoidable_bytes_per_row, 5.0);
+        assert_eq!(a.tables[0].avoidable_bytes_per_row, 10.0);
+        assert_eq!(a.tables[0].avoidable_dominance, 10);
         let strict = evaluate(&a, Some(0.0), false, None);
         assert!(strict.exceeded);
-        assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 5.0 });
-        let lenient = evaluate(&a, Some(5.0), false, None);
+        assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 10.0 });
+        let lenient = evaluate(&a, Some(10.0), false, None);
         assert!(!lenient.exceeded);
-        let fractional_gate = evaluate(&a, Some(4.5), false, None);
+        let fractional_gate = evaluate(&a, Some(9.5), false, None);
         assert!(fractional_gate.exceeded, "fail-over accepts fractions");
     }
 
     #[test]
-    fn acceptance_stores_the_exact_fraction() {
+    fn acceptance_stores_the_exact_value() {
         let a = analysis(VARLENA_WASTE);
         let base = build_from(&a, 0.0, "test");
-        assert_eq!(base.tables["t"].bytes, 5.0, "stored exactly, no rounding");
+        assert_eq!(base.tables["t"].bytes, 10.0, "stored exactly, no rounding");
         let outcome = evaluate(&a, None, false, Some(&base));
         assert!(!outcome.exceeded);
         assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
@@ -341,18 +341,18 @@ mod fractional_avoidable {
 
     #[test]
     fn any_exceedance_of_an_exact_entry_is_a_regression() {
-        // The sub-byte window a ceiled entry used to open: an entry accepted at 4.5 must fail
+        // The sub-byte window a ceiled entry used to open: a fractional allowance must fail
         // the moment the table reports more, not only past the next whole byte.
         let a = analysis(VARLENA_WASTE);
         let sig = a.tables[0].layout_signature.as_str();
-        let base = baseline(0.0, &[("t", 4.5, sig)]);
+        let base = baseline(0.0, &[("t", 9.5, sig)]);
         let outcome = evaluate(&a, None, false, Some(&base));
         assert!(outcome.exceeded);
         assert_eq!(
             outcome.verdicts["t"],
             TableVerdict::Regression {
-                avoidable: 5.0,
-                allowed: 4.5
+                avoidable: 10.0,
+                allowed: 9.5
             }
         );
     }
@@ -361,13 +361,13 @@ mod fractional_avoidable {
     fn genuinely_tighter_fraction_still_ratchets() {
         let a = analysis(VARLENA_WASTE);
         let sig = a.tables[0].layout_signature.as_str();
-        let base = baseline(0.0, &[("t", 5.5, sig)]);
+        let base = baseline(0.0, &[("t", 10.5, sig)]);
         let outcome = evaluate(&a, None, false, Some(&base));
         assert_eq!(
             outcome.verdicts["t"],
             TableVerdict::RatchetOpportunity {
-                avoidable: 5.0,
-                allowed: 5.5
+                avoidable: 10.0,
+                allowed: 10.5
             }
         );
     }
@@ -375,12 +375,12 @@ mod fractional_avoidable {
     #[cfg(feature = "serde")]
     #[test]
     fn whole_byte_legacy_entries_keep_working() {
-        // Files written before fractional entries hold integers; 5.0 under a legacy 6 passes
-        // and surfaces the tighter value as a ratchet opportunity.
+        // Files written before fractional entries hold integers; 10.0 under a legacy 11
+        // passes and surfaces the tighter value as a ratchet opportunity.
         let a = analysis(VARLENA_WASTE);
         let sig = a.tables[0].layout_signature.as_str();
         let base: Baseline = serde_json::from_str(&format!(
-            "{{\"rowdiet\":\"old\",\"fail_over\":0,\"tables\":{{\"t\":{{\"bytes\":6,\"layout\":\"{sig}\"}}}}}}"
+            "{{\"rowdiet\":\"old\",\"fail_over\":0,\"tables\":{{\"t\":{{\"bytes\":11,\"layout\":\"{sig}\"}}}}}}"
         ))
         .unwrap();
         let outcome = evaluate(&a, None, false, Some(&base));
@@ -388,8 +388,8 @@ mod fractional_avoidable {
         assert_eq!(
             outcome.verdicts["t"],
             TableVerdict::RatchetOpportunity {
-                avoidable: 5.0,
-                allowed: 6.0
+                avoidable: 10.0,
+                allowed: 11.0
             }
         );
     }
