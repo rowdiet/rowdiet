@@ -5,8 +5,11 @@
 //! (they are unknowable from DDL), but they do move every later column's offset: from the first
 //! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
 //! later pad is reported as a min/max/expected range over that set (residues taken as uniformly
-//! likely, by assumption). Pads placed while the offset is exactly
-//! known stay exact, so all-fixed tables keep byte-exact numbers.
+//! likely, by assumption). A varlena's own pad is storage-form-dependent: PostgreSQL stores
+//! payloads of 126 bytes or less with a 1-byte header and no alignment, and TOAST pointers are
+//! unaligned too, so expected values assume that common short form and carry the inline long
+//! form's alignment cost (payload 127 bytes and up) in the pad's max bound. Pads placed while
+//! the offset is exactly known stay exact, so all-fixed tables keep byte-exact numbers.
 
 /// The 64-bit PostgreSQL MAXALIGN: tuple headers, data starts, and footprints all round to
 /// 8-byte boundaries.
@@ -54,7 +57,8 @@ pub enum ColumnKind {
         align: Align,
     },
     /// Variable-length type. Its payload length is unknowable from DDL, so every column placed
-    /// after one sits at a data-dependent offset.
+    /// after one sits at a data-dependent offset, and its own pad depends on the storage form:
+    /// short (payload ≤ 126 B) and TOAST pointers store unaligned, the inline long form aligns.
     Varlena {
         /// Alignment of the long form; the short form never aligns.
         align: Align,
@@ -97,9 +101,11 @@ pub fn maxalign(n: u64) -> u64 {
     n + pad(n, MAXALIGN)
 }
 
-/// One pad's bounds and expectation. When the column sits at an exactly known offset (or every
-/// possible offset pads the same), `min == max` and the pad is that one value; otherwise the
-/// numbers range over the possible offset residues mod MAXALIGN.
+/// One pad's bounds and expectation. When every possible placement pads the same, `min == max`
+/// and the pad is that one value; otherwise the numbers range over the possibilities — the
+/// offset residues mod MAXALIGN for a fixed column, the storage forms for a varlena — and
+/// `expected_eighths` is the model's expectation under the module doc's assumptions (uniform
+/// residues; short-form varlena storage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PadRange {
     /// Smallest possible pad, bytes.
@@ -156,14 +162,15 @@ impl Residues {
         u64::from(self.0.count_ones())
     }
 
-    /// Pad statistics for aligning to `align` from any residue in the set.
+    /// Pad statistics for a fixed column aligning to `align` from any residue in the set.
     fn pad_to(self, align: u64) -> PadRange {
+        debug_assert!(self.0 != 0, "empty residue set");
         let mut min = u64::MAX;
         let mut max = 0u64;
         let mut sum = 0u64;
         for residue in 0..MAXALIGN {
             if self.contains(residue) {
-                let p = pad(residue, align);
+                let p = pad_pow2(residue, align);
                 min = min.min(p);
                 max = max.max(p);
                 sum += p;
@@ -178,13 +185,32 @@ impl Residues {
         }
     }
 
+    /// Pad statistics for a varlena that is long-form when stored: min 0 and expected 0 (the
+    /// short form and TOAST pointers store unaligned, and expected values assume that common
+    /// case), max the worst long-form alignment pad over the set. `min == max` therefore means
+    /// the pad is 0 under every storage form and every residue in the set.
+    fn varlena_pad(self, align: u64) -> PadRange {
+        debug_assert!(self.0 != 0, "empty residue set");
+        let mut max = 0u64;
+        for residue in 0..MAXALIGN {
+            if self.contains(residue) {
+                max = max.max(pad_pow2(residue, align));
+            }
+        }
+        PadRange {
+            min: 0,
+            max,
+            expected_eighths: 0,
+        }
+    }
+
     /// The set after aligning to `align`: each residue moves to its next `align` boundary.
     /// Aligning to 8 collapses any set to `{0}`; aligning the full set to 4 leaves `{0, 4}`.
     fn aligned(self, align: u64) -> Self {
         let mut mask = 0u8;
         for residue in 0..MAXALIGN {
             if self.contains(residue) {
-                mask |= 1u8 << ((residue + pad(residue, align)) % MAXALIGN);
+                mask |= 1u8 << ((residue + pad_pow2(residue, align)) % MAXALIGN);
             }
         }
         Self(mask)
@@ -202,7 +228,9 @@ pub struct ColumnWalk {
     /// Padding inserted immediately before this column.
     pub pad_before: PadRange,
     /// The column's data start, bytes from the beginning of the data area (t_hoff not
-    /// included) — known only until the first varlena, whose payload moves every later offset.
+    /// included). Known while the placement is certain: every offset after the first varlena is
+    /// payload-dependent, and a varlena's own start is storage-form-dependent unless its long
+    /// form would pad zero anyway.
     pub offset: Option<u64>,
 }
 
@@ -267,7 +295,7 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
             ColumnKind::Varlena {
                 align,
                 proven_short: false,
-            } => residues.pad_to(align.bytes()),
+            } => residues.varlena_pad(align.bytes()),
         };
         match pad_before.exact() {
             Some(p) => padding += p,
@@ -279,8 +307,9 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
         }
         columns.push(ColumnWalk {
             pad_before,
-            // While `end` is known the residue set is a singleton, so `min` is the pad.
-            offset: end.map(|e| e + pad_before.min),
+            // The start is known only while the running end is known and the pad is certain
+            // (a varlena's own pad is storage-form-dependent even at a known offset).
+            offset: end.and_then(|e| pad_before.exact().map(|p| e + p)),
         });
         match kind {
             ColumnKind::Fixed { len, align } => {
@@ -335,6 +364,12 @@ pub fn null_thoff(natts: usize) -> u64 {
 /// Suggested column order: fixed before varlena; alignment descending; within a fixed alignment
 /// group regular sizes before irregulars; varlenas alignment-descending with typmod-proven-short
 /// ones last (they never align); stable by original position everywhere else.
+///
+/// Fixed columns stay ahead of the varlenas by policy even where an interleave scores lower in
+/// expectation (two irregulars with a varlena between them): a deterministic pad is hard
+/// information, an expected pad rides on the module doc's assumptions. Among fixed-first orders
+/// this is the expected-padding optimum: varlena self-pads expect zero at every block-end
+/// residue, so the tail adds the same expectation to every arrangement of the block.
 pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..kinds.len()).collect();
     order.sort_by_key(|&i| sort_key(&kinds[i], i));
@@ -520,14 +555,16 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
 
 /// How solid the reported numbers are. `Exact`: only fixed-width columns — padding and footprint
 /// are byte-exact and order-guaranteed. `Estimate`: at least one varlena — columns after it sit
-/// at data-dependent offsets, so padding is an expected value with a min/max range.
+/// at data-dependent offsets, so padding is an expected value with a min/max range, under the
+/// module doc's assumptions (short-form varlena storage; uniform offset residues).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub enum Tier {
     /// Only fixed-width columns: byte-exact, order-guaranteed.
     Exact,
     /// At least one varlena: columns after it sit at data-dependent offsets — padding is
-    /// reported as expected values with bounds.
+    /// reported as expected values with bounds (expectations assume short-form varlena storage
+    /// and uniform offset residues).
     Estimate,
     /// The table's columns are not fully known (an unexpanded LIKE/INHERITS/typed table): no
     /// footprint is claimed. Assigned when the table is incomplete, never inferred from `kinds`

@@ -16,27 +16,30 @@ use std::collections::BTreeMap;
 
 /// In-memory form of a baseline file (JSON on disk): the default gate plus per-table accepted
 /// debt. Built by [`build_from`], maintained by [`accept_tables`], consumed by [`evaluate`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Baseline {
     /// Version of rowdiet that wrote the file (informational).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rowdiet: String,
     /// Default gate for tables without an entry — i.e. for every table added after baselining.
-    pub fail_over: u64,
+    /// Fractional values are allowed (avoidable bytes can be fractional); whole-number files
+    /// from older versions load unchanged.
+    pub fail_over: f64,
     /// Accepted-debt entries, keyed by the fold key ([`TableReport::name`]). The maintenance
     /// ops record only tables over `fail_over` — within it, no allowance is needed.
     pub tables: BTreeMap<String, BaselineEntry>,
 }
 
 /// One table's accepted allowance, pinned to the layout it was accepted for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BaselineEntry {
-    /// Accepted avoidable bytes/row, in force while `layout` still describes the table. Whole
-    /// bytes: a fractional expected value rounds up on acceptance (an allowance is an upper
-    /// bound, so up is the conservative direction).
-    pub bytes: u64,
+    /// Accepted avoidable bytes/row, in force while `layout` still describes the table. Stored
+    /// exactly, fractions included, so any excess over the accepted value is a regression
+    /// (whole-number entries from older files keep working and can be ratcheted to the exact
+    /// value).
+    pub bytes: f64,
     /// The table's [`crate::report::layout_signature`] at acceptance time.
     pub layout: String,
 }
@@ -67,7 +70,7 @@ pub enum TableVerdict {
         /// Current avoidable bytes/row.
         avoidable: f64,
         /// The baselined allowance in force.
-        allowed: u64,
+        allowed: f64,
     },
     /// Columns were appended (old signature is a prefix of the current one) and the appended
     /// columns themselves pushed avoidable past the still-active allowance. Actionable while the
@@ -76,7 +79,7 @@ pub enum TableVerdict {
         /// Current avoidable bytes/row.
         avoidable: f64,
         /// The baselined allowance in force.
-        allowed: u64,
+        allowed: f64,
     },
     /// The layout changed in a non-append way, expiring the allowance, and the table does not
     /// meet `fail_over`. Re-accept deliberately or fix the layout in the rewriting migration.
@@ -89,7 +92,7 @@ pub enum TableVerdict {
         /// Current avoidable bytes/row.
         avoidable: f64,
         /// The baselined allowance the table now beats.
-        allowed: u64,
+        allowed: f64,
     },
 }
 
@@ -168,7 +171,7 @@ impl GateOutcome {
 /// skips should be zero, so strict is cheap).
 pub fn evaluate(
     analysis: &Analysis,
-    fail_over: Option<u64>,
+    fail_over: Option<f64>,
     fail_on_degraded: bool,
     baseline: Option<&Baseline>,
 ) -> GateOutcome {
@@ -222,7 +225,7 @@ pub fn evaluate(
 fn table_verdict(
     table: &TableReport,
     entry: Option<&BaselineEntry>,
-    default_limit: Option<u64>,
+    default_limit: Option<f64>,
 ) -> (TableVerdict, bool) {
     // A table nobody could fully model has no avoidable-bytes judgment to make — it is not a
     // pass (the false negative this guards against) and not a violation. `--fail-on-degraded`
@@ -231,7 +234,7 @@ fn table_verdict(
         return (TableVerdict::Incomplete, false);
     }
     let avoidable = table.avoidable_bytes_per_row;
-    let over_limit = |limit: Option<u64>| limit.is_some_and(|l| avoidable > l as f64);
+    let over_limit = |limit: Option<f64>| limit.is_some_and(|l| avoidable > l);
     let Some(entry) = entry else {
         let verdict = if over_limit(default_limit) {
             TableVerdict::NewViolation { avoidable }
@@ -242,13 +245,9 @@ fn table_verdict(
     };
     let allowed = entry.bytes;
     let verdict = match relation(&entry.layout, &table.layout_signature) {
-        SignatureRelation::Match if avoidable > allowed as f64 => TableVerdict::Regression { avoidable, allowed },
-        SignatureRelation::Grown if avoidable > allowed as f64 => {
-            TableVerdict::GrownSinceBaseline { avoidable, allowed }
-        }
-        // Ratchet on the value an acceptance would store: a fractional avoidable under a
-        // ceiling-stored allowance is already as tight as an entry can record it.
-        SignatureRelation::Match | SignatureRelation::Grown if ceil_bytes(avoidable) < allowed => {
+        SignatureRelation::Match if avoidable > allowed => TableVerdict::Regression { avoidable, allowed },
+        SignatureRelation::Grown if avoidable > allowed => TableVerdict::GrownSinceBaseline { avoidable, allowed },
+        SignatureRelation::Match | SignatureRelation::Grown if avoidable < allowed => {
             TableVerdict::RatchetOpportunity { avoidable, allowed }
         }
         SignatureRelation::Match | SignatureRelation::Grown => TableVerdict::Pass,
@@ -256,11 +255,6 @@ fn table_verdict(
         SignatureRelation::Different => return (TableVerdict::Pass, true),
     };
     (verdict, false)
-}
-
-/// A fractional avoidable value rounded up to the whole bytes a baseline entry stores.
-pub fn ceil_bytes(avoidable: f64) -> u64 {
-    avoidable.ceil() as u64
 }
 
 enum SignatureRelation {
@@ -287,15 +281,15 @@ fn relation(baselined: &str, current: &str) -> SignatureRelation {
 
 /// Rewrite-from-scratch baselining: entries for every non-ignored table still over `fail_over`,
 /// at current bytes and signature. Orphans and expired entries vanish by construction.
-pub fn build_from(analysis: &Analysis, fail_over: u64, version: &str) -> Baseline {
+pub fn build_from(analysis: &Analysis, fail_over: f64, version: &str) -> Baseline {
     let tables = analysis
         .gated_tables()
-        .filter(|t| t.avoidable_bytes_per_row > fail_over as f64)
+        .filter(|t| t.avoidable_bytes_per_row > fail_over)
         .map(|t| {
             (
                 t.name.clone(),
                 BaselineEntry {
-                    bytes: ceil_bytes(t.avoidable_bytes_per_row),
+                    bytes: t.avoidable_bytes_per_row,
                     layout: t.layout_signature.clone(),
                 },
             )
@@ -325,11 +319,11 @@ pub fn accept_tables(baseline: &mut Baseline, analysis: &Analysis, names: &[Stri
             .ok_or_else(|| format!("cannot accept `{name}`: no such table in the analyzed DDL (or it is ignored)"))?;
         // Entries are stored under the canonical fold key regardless of which spelling the
         // caller used to name the table — an entry keyed by display would never match a gate.
-        if table.avoidable_bytes_per_row > baseline.fail_over as f64 {
+        if table.avoidable_bytes_per_row > baseline.fail_over {
             baseline.tables.insert(
                 table.name.clone(),
                 BaselineEntry {
-                    bytes: ceil_bytes(table.avoidable_bytes_per_row),
+                    bytes: table.avoidable_bytes_per_row,
                     layout: table.layout_signature.clone(),
                 },
             );

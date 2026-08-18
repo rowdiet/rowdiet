@@ -293,7 +293,7 @@ fn bench_gate(c: &mut Criterion) {
             (
                 t.name.clone(),
                 BaselineEntry {
-                    bytes: baseline::ceil_bytes(t.avoidable_bytes_per_row),
+                    bytes: t.avoidable_bytes_per_row,
                     layout: t.layout_signature.clone(),
                 },
             )
@@ -301,11 +301,11 @@ fn bench_gate(c: &mut Criterion) {
         .collect();
     let base = Baseline {
         rowdiet: "bench".into(),
-        fail_over: 0,
+        fail_over: 0.0,
         tables: entries,
     };
     c.bench_function("gate/evaluate_500", |b| {
-        b.iter(|| baseline::evaluate(black_box(&analysis), Some(0), true, Some(&base)));
+        b.iter(|| baseline::evaluate(black_box(&analysis), Some(0.0), true, Some(&base)));
     });
 }
 

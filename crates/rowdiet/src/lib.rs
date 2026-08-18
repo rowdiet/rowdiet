@@ -25,9 +25,9 @@ struct Cli {
     paths: Vec<String>,
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
-    /// Exit 1 if any table's avoidable bytes/row exceed this threshold
+    /// Exit 1 if any table's avoidable bytes/row exceed this threshold (fractions allowed, e.g. 0.5)
     #[arg(long, value_name = "BYTES")]
-    fail_over: Option<u64>,
+    fail_over: Option<f64>,
     /// Print a reordered CREATE TABLE for each table with avoidable waste
     #[arg(long)]
     suggest: bool,

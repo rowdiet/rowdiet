@@ -137,6 +137,7 @@ pub struct OrderStats {
     pub padding: u64,
     /// Expected total padding, bytes per row: `padding` plus the expected values of the
     /// data-dependent pads (equals `padding` when there are none; fractional otherwise).
+    /// Expectations assume short-form varlena storage and uniform offset residues.
     pub expected_padding: f64,
     /// Smallest possible total padding, bytes per row (equals `padding` when nothing is
     /// data-dependent).
@@ -172,31 +173,37 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     let mut order = layout::suggested_order(&kinds);
     let ordered_kinds: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
     let mut suggested_walk = layout::walk(&ordered_kinds);
+    // The suggestion and the score share one objective (expected padding in exact eighths);
+    // when the fixed-first policy scores above an already-interleaved current order, keep the
+    // current order rather than recommend a regression.
     if suggested_walk.expected_padding_eighths() > current_walk.expected_padding_eighths() {
         order = (0..kinds.len()).collect();
         suggested_walk = current_walk.clone();
     }
     let current = stats(tier, &current_walk, t_hoff);
     let suggested = stats(tier, &suggested_walk, t_hoff);
-    let avoidable = match tier {
-        Tier::Exact => current
-            .footprint
-            .unwrap_or(0)
-            .saturating_sub(suggested.footprint.unwrap_or(0)) as f64,
-        // Expected-padding delta, in exact eighths of a byte.
-        Tier::Estimate => {
-            current_walk
-                .expected_padding_eighths()
-                .saturating_sub(suggested_walk.expected_padding_eighths()) as f64
-                / 8.0
+    // Exact integer eighths throughout: the f64 conversion happens once, at the end, so no
+    // comparison in the pipeline ever tests floats for equality.
+    let avoidable_eighths = match tier {
+        Tier::Exact => {
+            current
+                .footprint
+                .unwrap_or(0)
+                .saturating_sub(suggested.footprint.unwrap_or(0))
+                * 8
         }
+        // Expected-padding delta.
+        Tier::Estimate => current_walk
+            .expected_padding_eighths()
+            .saturating_sub(suggested_walk.expected_padding_eighths()),
         // Columns unknown: no avoidable waste can be claimed. The incomplete verdict, not a
         // fabricated byte count, carries the "not analyzed" signal.
-        Tier::Unknown => 0.0,
+        Tier::Unknown => 0,
     };
+    let avoidable = avoidable_eighths as f64 / 8.0;
     // With nothing avoidable the suggestion IS the current order; the stats must say the same
     // thing, or the JSON contradicts itself (suggested.padding 0 beside the original order).
-    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable == 0.0 {
+    let (final_order, suggested): (Vec<usize>, OrderStats) = if avoidable_eighths == 0 {
         ((0..kinds.len()).collect(), current.clone())
     } else {
         (order, suggested)

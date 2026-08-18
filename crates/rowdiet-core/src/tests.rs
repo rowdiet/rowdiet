@@ -33,9 +33,10 @@ fn end_to_end_migration_series() {
     // full residue set on top of the 7 certain bytes.
     assert_eq!(t.current.expected_padding, 10.5);
     assert_eq!((t.current.padding_min, t.current.padding_max), (7, 14));
-    assert_eq!(t.suggested.padding, 3);
-    assert_eq!(t.suggested.expected_padding, 4.5);
-    assert_eq!(t.avoidable_bytes_per_row, 6.0);
+    assert_eq!(t.suggested.padding, 0);
+    assert_eq!(t.suggested.expected_padding, 0.0);
+    assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 6));
+    assert_eq!(t.avoidable_bytes_per_row, 10.5);
     assert_eq!(
         t.suggested_order,
         vec!["id", "created_at", "status", "flag", "note", "meta"]
@@ -911,11 +912,11 @@ mod audit_fixes_gate {
     fn degradation_is_surfaced_and_optionally_gating() {
         let sql = "CREATE TABLE ok (a bigint NOT NULL);\nALTER TABLE ok ADD COLUMN x @@@ bad;";
         let analysis = analyze_sources(&[src("V1__b.sql", sql)], &Config::default());
-        let lenient = baseline::evaluate(&analysis, Some(0), false, None);
+        let lenient = baseline::evaluate(&analysis, Some(0.0), false, None);
         assert!(lenient.skipped_statements > 0);
         assert!(lenient.incomplete_tables > 0);
         assert!(!lenient.exceeded, "{lenient:#?}");
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert!(strict.exceeded);
     }
 }
@@ -980,7 +981,7 @@ mod postaudit_pins {
             &[src("V1__c.sql", "CREATE TABLE ok (a bigint NOT NULL);")],
             &Config::default(),
         );
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert_eq!(strict.skipped_statements, 0);
         assert_eq!(strict.incomplete_tables, 0);
         assert!(!strict.exceeded, "{strict:#?}");
@@ -992,7 +993,7 @@ mod postaudit_pins {
         let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
         let mut base = baseline::Baseline {
             rowdiet: "test".into(),
-            fail_over: 0,
+            fail_over: 0.0,
             tables: std::collections::BTreeMap::new(),
         };
         baseline::accept_tables(&mut base, &analysis, &["MyTable".into()]).unwrap();
@@ -1176,11 +1177,11 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert_eq!(c.tier, layout::Tier::Unknown);
     assert_eq!(c.current.footprint, None);
     assert_eq!(c.avoidable_bytes_per_row, 0.0);
-    let outcome = baseline::evaluate(&a, Some(0), false, None);
+    let outcome = baseline::evaluate(&a, Some(0.0), false, None);
     assert_eq!(outcome.verdicts["c"], baseline::TableVerdict::Incomplete);
     assert!(!outcome.exceeded, "incomplete alone does not fail the gate");
     assert!(
-        baseline::evaluate(&a, Some(0), true, None).exceeded,
+        baseline::evaluate(&a, Some(0.0), true, None).exceeded,
         "but --fail-on-degraded escalates it"
     );
     // INHERITS of an unknown parent is the same class — the unknown/incomplete path must be
@@ -1192,7 +1193,7 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert!(inh.tables[0].incomplete);
     assert_eq!(inh.tables[0].tier, layout::Tier::Unknown);
     assert_eq!(
-        baseline::evaluate(&inh, Some(0), false, None).verdicts["k"],
+        baseline::evaluate(&inh, Some(0.0), false, None).verdicts["k"],
         baseline::TableVerdict::Incomplete
     );
     // A genuinely empty but complete table stays exact — the fix keys on incompleteness, not natts.
@@ -1219,12 +1220,26 @@ mod varlena_residue_uncertainty {
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.current.padding, 0, "no pad in this order is certain");
-        assert_eq!(t.current.expected_padding, 9.5);
+        assert_eq!(t.current.expected_padding, 5.0);
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 19));
-        assert_eq!(t.suggested.expected_padding, 6.0);
+        assert_eq!(t.suggested.expected_padding, 0.0);
         assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 12));
-        assert_eq!(t.avoidable_bytes_per_row, 3.5);
+        assert_eq!(t.avoidable_bytes_per_row, 5.0);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn guard_keeps_an_interleaved_order_the_model_prefers() {
+        // Two irregulars around a varlena score E 3.5; the fixed-first suggestion scores a
+        // deterministic 4. The guard keeps the as-written order and claims nothing avoidable,
+        // exercising the fallback on the shipped objective.
+        let sql = "CREATE TABLE t (t1 timetz NOT NULL, v text NOT NULL, t2 timetz NOT NULL);";
+        let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.current.expected_padding, 3.5);
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested, t.current);
+        assert_eq!(t.suggested_order, vec!["t1", "v", "t2"]);
     }
 
     #[test]
@@ -1233,7 +1248,8 @@ mod varlena_residue_uncertainty {
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.avoidable_bytes_per_row, 0.0);
-        assert_eq!(t.current.expected_padding, 6.0);
+        assert_eq!(t.current.expected_padding, 0.0);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 12));
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
     }

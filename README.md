@@ -13,11 +13,11 @@ WebAssembly, with draggable byte rulers; nothing leaves the page.
 
 ```
 $ rowdiet migrations/ --rows 10000000 --suggest
-■ account (V1__init.sql:1) — 6 columns — estimate — columns placed at data-dependent offsets
+■ account (V1__init.sql:1) — 6 columns — estimate — assumes short-form varlenas, uniform offset residues
   current  : 14.5 B/row expected padding (13 B deterministic, range 13–16, data-dependent)
-  suggested: 1 B padding/row → 13.5 B/row avoidable
+  suggested: 0.0 B/row expected padding (0 B deterministic, range 0–1, data-dependent) → 14.5 B/row avoidable
   order    : id, balance, flags, kind, active, note
-  × 10000000 rows ≈ 135.0 MB
+  × 10000000 rows ≈ 145.0 MB
   -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):
   CREATE TABLE account (
       id BIGINT NOT NULL,
@@ -159,14 +159,18 @@ rowdiet therefore reports per table:
   reports **0 avoidable bytes** by design (raw padding is still shown).
 - **estimate tier** (any varlena): every column after a varlena sits at a data-dependent offset,
   so its padding is reported as an expected value with a min/max range (offset residues mod 8
-  taken as uniformly likely). Pads placed before the first varlena
-  stay exact. `varchar(n≤31)` is upgraded to *proven short, unaligned* (typmod bounds the
-  payload under the short-varlena limit) — that pins the header form while the payload length
-  still varies, so later columns keep data-dependent offsets.
+  taken as uniformly likely). A varlena's own pad is storage-form-dependent: expected values
+  assume the short form (payload ≤ 126 B) and TOAST pointers, both stored unaligned — the
+  measured common case — and the inline long form's alignment cost is carried in the max bound.
+  Pads placed before the first varlena stay exact. `varchar(n≤31)` is upgraded to *proven
+  short, unaligned* (typmod bounds the payload under the short-varlena limit) — that pins the
+  header form while the payload length still varies, so later columns keep data-dependent
+  offsets.
 
 The suggested order is: fixed columns before varlena, alignment descending, irregular-size types
 (`timetz`, `macaddr`) at the end of their group, varlenas alignment-descending with proven-short
-ones last. For all-regular schemas this provably yields zero padding under any NULL mask.
+ones last. For all-regular schemas this provably yields zero deterministic and expected padding
+under any NULL mask; long-form varlena values can add the alignment bytes shown in the range.
 
 Non-obvious type facts it models: `uuid` is char-aligned (16 B, never pads);
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is

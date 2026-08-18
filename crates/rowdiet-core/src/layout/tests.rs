@@ -324,7 +324,11 @@ fn four_aligned_column_narrows_to_two_residues() {
 
 #[test]
 fn interleaved_vs_grouped_kind_sequences() {
-    // The issue-1 repro at the kind level: same multiset, opposite orders.
+    // The issue-1 repro at the kind level: same multiset, opposite orders. Interleaving strands
+    // the int4 (E 1.5) and the first float8 (E 3.5) at data-dependent offsets; grouping places
+    // every fixed column at an exact offset. Varlena self-pads expect 0 (short-form assumption)
+    // and carry the long form in the max. Measured tuples (PG 16, independently varying
+    // payload widths): grouped is flat 0, interleaved averages ≈ 4.5.
     let interleaved = walk(&[
         varlena(Align::Int),
         fixed(4, Align::Int),
@@ -345,10 +349,56 @@ fn interleaved_vs_grouped_kind_sequences() {
         varlena(Align::Int),
         varlena(Align::Int),
     ]);
-    assert_eq!(interleaved.expected_padding(), 9.5);
+    assert_eq!(interleaved.expected_padding(), 5.0);
     assert_eq!((interleaved.padding_min(), interleaved.padding_max()), (0, 19));
-    assert_eq!(grouped.expected_padding(), 6.0);
+    assert_eq!(grouped.expected_padding(), 0.0);
     assert_eq!((grouped.padding_min(), grouped.padding_max()), (0, 12));
+}
+
+#[test]
+fn varlena_self_pad_is_storage_form_dependent() {
+    // At an unaligned offset the varlena pads 0 when short-form and up to the long-form pad
+    // otherwise: a range with expected 0, never a certain long-form charge.
+    let w = walk(&[fixed(2, Align::Short), varlena(Align::Int)]);
+    assert_eq!(
+        w.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 2,
+            expected_eighths: 0
+        }
+    );
+    assert_eq!(w.columns[1].offset, None, "the start depends on the storage form");
+    assert_eq!(w.padding, 0);
+    assert_eq!(w.expected_padding(), 0.0);
+    // At an offset the long form would not pad either, the varlena's pad and start are certain.
+    let aligned = walk(&[fixed(8, Align::Double), varlena(Align::Int)]);
+    assert_eq!(aligned.columns[1].pad_before, PadRange::certain(0));
+    assert_eq!(aligned.columns[1].offset, Some(8));
+    // A d-aligned varlena behind another varlena: range 0..=7, expected still 0.
+    let d_tail = walk(&[varlena(Align::Int), varlena(Align::Double)]);
+    assert_eq!(
+        d_tail.columns[1].pad_before,
+        PadRange {
+            min: 0,
+            max: 7,
+            expected_eighths: 0
+        }
+    );
+}
+
+#[test]
+fn fixed_columns_stay_ahead_of_varlenas_even_when_an_interleave_scores_lower() {
+    // Two irregulars with no filler pad 4 deterministically; interposing the varlena scores
+    // E 3.5 under the uniform-residue assumption. The suggestion still keeps fixed columns
+    // first: a certain 4 is hard information, an expected 3.5 rides on assumptions, and the
+    // report-level guard keeps an already-interleaved current order rather than worsen it.
+    let kinds = [fixed(12, Align::Double), fixed(12, Align::Double), varlena(Align::Int)];
+    assert_eq!(suggested_order(&kinds), vec![0, 1, 2]);
+    let fixed_first = walk(&[kinds[0], kinds[1], kinds[2]]);
+    let interleaved = walk(&[kinds[0], kinds[2], kinds[1]]);
+    assert_eq!(fixed_first.expected_padding(), 4.0);
+    assert_eq!(interleaved.expected_padding(), 3.5);
 }
 
 #[test]
@@ -490,5 +540,175 @@ fn tier_display_matches_serde() {
     for tier in [Tier::Exact, Tier::Estimate, Tier::Unknown] {
         let json = serde_json::to_value(tier).unwrap();
         assert_eq!(json.as_str().unwrap(), tier.to_string(), "{tier:?}");
+    }
+}
+
+/// Property: the suggestion minimizes the shipped objective (expected padding in eighths) over
+/// every permutation, for regular fixed kinds mixed with varlenas. This is the test that pins
+/// scoring and suggesting to one objective — under a model that charges varlenas an aligned
+/// long-form pad it fails immediately (varlena order starts to matter and alignment-descending
+/// picks wrongly).
+mod expected_minimality_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn brute_force_min_expected_eighths(kinds: &[ColumnKind]) -> u64 {
+        fn go(kinds: &[ColumnKind], current: &mut Vec<ColumnKind>, used: &mut Vec<bool>, best: &mut u64) {
+            if current.len() == kinds.len() {
+                *best = (*best).min(walk(current).expected_padding_eighths());
+                return;
+            }
+            for i in 0..kinds.len() {
+                if !used[i] {
+                    used[i] = true;
+                    current.push(kinds[i]);
+                    go(kinds, current, used, best);
+                    current.pop();
+                    used[i] = false;
+                }
+            }
+        }
+        let mut best = u64::MAX;
+        go(kinds, &mut Vec::new(), &mut vec![false; kinds.len()], &mut best);
+        best
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn suggested_order_is_minimal_on_random_mixed_multisets(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 16, align: Align::Char }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                ],
+                3..=6
+            )
+        ) {
+            let order = suggested_order(&kinds);
+            let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+            prop_assert_eq!(
+                walk(&ordered).expected_padding_eighths(),
+                brute_force_min_expected_eighths(&kinds),
+                "kinds: {:?}, order: {:?}",
+                kinds,
+                order
+            );
+        }
+    }
+}
+
+/// Property: every residue set the walk can reach is a coset of a subgroup of Z/8 (equal gaps,
+/// size dividing 8), which is what makes the mean pad in eighths exact. `pad_to` is called on
+/// each state so its divide-exactly debug assertion runs over the whole sample.
+mod residue_coset_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn is_coset(set: Residues) -> bool {
+        let members: Vec<u64> = (0..MAXALIGN).filter(|&r| set.contains(r)).collect();
+        let n = members.len() as u64;
+        if !MAXALIGN.is_multiple_of(n) {
+            return false;
+        }
+        let stride = MAXALIGN / n;
+        members.windows(2).all(|w| w[1] - w[0] == stride)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn walk_reachable_sets_are_cosets(
+            start_full in proptest::bool::ANY,
+            ops in proptest::collection::vec((0u8..=3, 0u64..16), 0..12)
+        ) {
+            let mut set = if start_full { Residues::FULL } else { Residues::START };
+            for (align_pow, shift) in ops {
+                set = set.aligned(1 << align_pow).shifted(shift);
+                prop_assert!(is_coset(set), "set {:#010b}", set.0);
+                for align in [1, 2, 4, 8] {
+                    let stat = set.pad_to(align);
+                    prop_assert!(stat.min <= stat.max);
+                    prop_assert!(stat.expected_eighths >= stat.min * MAXALIGN);
+                    prop_assert!(stat.expected_eighths <= stat.max * MAXALIGN);
+                }
+            }
+        }
+    }
+}
+
+/// Property: a concrete layout under PostgreSQL's real storage rules always lands inside the
+/// walk's [padding_min, padding_max]. The simulator is the ground truth the audit measured with
+/// pageinspect: short form (payload ≤ 126 B) and proven-short store unaligned with a 1-byte
+/// header, the inline long form aligns and takes a 4-byte header.
+mod simulation_bounds_property {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn simulate_padding(kinds: &[ColumnKind], payloads: &[u64]) -> u64 {
+        let mut payloads = payloads.iter();
+        let mut off = 0u64;
+        let mut padding = 0u64;
+        for kind in kinds {
+            match kind {
+                ColumnKind::Fixed { len, align } => {
+                    let p = pad(off, align.bytes());
+                    padding += p;
+                    off += p + len;
+                }
+                ColumnKind::Varlena { align, proven_short } => {
+                    let raw = *payloads.next().expect("one payload per varlena");
+                    let payload = if *proven_short { raw % 32 } else { raw };
+                    if !proven_short && payload > 126 {
+                        let p = pad(off, align.bytes());
+                        padding += p;
+                        off += p + 4 + payload;
+                    } else {
+                        off += 1 + payload;
+                    }
+                }
+            }
+        }
+        padding
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        #[test]
+        fn simulated_layouts_stay_within_the_walk_bounds(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                ],
+                1..=8
+            ),
+            payloads in proptest::collection::vec(0u64..=200, 8)
+        ) {
+            let w = walk(&kinds);
+            let simulated = simulate_padding(&kinds, &payloads);
+            prop_assert!(
+                simulated >= w.padding_min() && simulated <= w.padding_max(),
+                "simulated {} outside [{}, {}] for {:?} with payloads {:?}",
+                simulated,
+                w.padding_min(),
+                w.padding_max(),
+                kinds,
+                payloads
+            );
+        }
     }
 }

@@ -35,7 +35,7 @@ struct Input {
     #[serde(default)]
     assume: Vec<String>,
     #[serde(default)]
-    fail_over: Option<u64>,
+    fail_over: Option<f64>,
     #[serde(default)]
     baseline: Option<Baseline>,
     #[serde(default)]
