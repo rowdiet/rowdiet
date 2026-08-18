@@ -93,31 +93,59 @@ fn version_order_folds_alters_after_create() {
 #[test]
 fn interleaved_varlenas_report_data_dependent_waste() {
     // The issue-1 repro: same column multiset, opposite orders. Interleaving must surface the
-    // reorder with a fractional expected saving; grouping must pass clean.
-    let out = bin().arg(fixtures("varlena")).output().unwrap();
+    // reorder with the fractional expected saving; grouping must report nothing avoidable.
+    // Numbers are asserted on the JSON so renderer copy stays free to change.
+    let out = bin()
+        .arg(fixtures("varlena"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let inter = &v["analysis"]["tables"][0];
+    assert_eq!(inter["name"], "interleaved");
+    assert_eq!(inter["tier"], "estimate");
+    assert_eq!(inter["current"]["expected_padding"], 5.0);
+    assert_eq!(inter["current"]["padding_min"], 0);
+    assert_eq!(inter["current"]["padding_max"], 19);
+    assert_eq!(inter["suggested"]["expected_padding"], 0.0);
+    assert_eq!(inter["avoidable_bytes_per_row"], 5.0);
+    assert_eq!(
+        inter["suggested_order"],
+        serde_json::json!(["score", "seen", "tag", "a", "b", "c", "d", "e"])
+    );
+    let grouped = &v["analysis"]["tables"][1];
+    assert_eq!(grouped["name"], "grouped");
+    assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
+    assert_eq!(grouped["current"]["expected_padding"], 0.0);
+    assert_eq!(grouped["current"]["padding_max"], 12);
+    let text = bin().arg(fixtures("varlena")).output().unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
     assert!(stdout.contains("■ interleaved"), "{stdout}");
-    assert!(
-        stdout.contains("current  : 9.5 B/row expected padding (0 B deterministic, range 0–19, data-dependent)"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("→ 3.5 B/row avoidable"), "{stdout}");
-    assert!(
-        stdout.contains("order    : score, seen, tag, a, b, c, d, e"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("B/row avoidable"), "{stdout}");
     assert!(stdout.contains("✓ grouped"), "{stdout}");
-    assert!(
-        stdout.contains("6.0 B/row expected padding (0 B deterministic, range 0–12, data-dependent)"),
-        "{stdout}"
-    );
     let gated = bin()
         .arg(fixtures("varlena"))
         .args(["--fail-over", "0"])
         .output()
         .unwrap();
-    assert_eq!(gated.status.code(), Some(1), "3.5 B/row expected must trip a zero gate");
+    assert_eq!(gated.status.code(), Some(1), "5.0 B/row expected must trip a zero gate");
+    let fractional = bin()
+        .arg(fixtures("varlena"))
+        .args(["--fail-over", "4.5"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fractional.status.code(),
+        Some(1),
+        "fractional fail-over thresholds gate"
+    );
+    let at_limit = bin()
+        .arg(fixtures("varlena"))
+        .args(["--fail-over", "5"])
+        .output()
+        .unwrap();
+    assert_eq!(at_limit.status.code(), Some(0));
 }
 
 #[test]

@@ -18,14 +18,14 @@ fn sample() -> Analysis {
     )
 }
 
-fn gate(analysis: &Analysis, fail_over: Option<u64>) -> GateOutcome {
+fn gate(analysis: &Analysis, fail_over: Option<f64>) -> GateOutcome {
     baseline::evaluate(analysis, fail_over, false, None)
 }
 
-fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome {
+fn baselined(analysis: &Analysis, entries: &[(&str, f64, &str)]) -> GateOutcome {
     let base = Baseline {
         rowdiet: "test".into(),
-        fail_over: 0,
+        fail_over: 0.0,
         tables: entries
             .iter()
             .map(|(name, bytes, layout)| {
@@ -45,7 +45,7 @@ fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome 
 #[test]
 fn text_report_mentions_the_essentials() {
     let analysis = sample();
-    let rendered = text(&analysis, Some(1_000_000), true, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, Some(1_000_000), true, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("account"));
     assert!(rendered.contains("V1__init.sql:1"));
     assert!(rendered.contains("B/row avoidable"));
@@ -58,7 +58,7 @@ fn text_report_mentions_the_essentials() {
 #[test]
 fn optimal_table_is_a_checkmark_line() {
     let analysis = analyze("CREATE TABLE ok (id bigint NOT NULL, n integer NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("✓ ok"));
     assert!(rendered.contains("optimal: zero padding"));
     assert!(!rendered.contains("FAIL:"));
@@ -67,7 +67,7 @@ fn optimal_table_is_a_checkmark_line() {
 #[test]
 fn empty_modeled_tables_are_not_called_optimal() {
     let analysis = analyze("CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("◌ c"), "{rendered}");
     assert!(rendered.contains("not analyzable"), "{rendered}");
     assert!(!rendered.contains("✓ c"), "{rendered}");
@@ -88,18 +88,23 @@ fn partition_children_with_known_parent_render_real_analysis() {
 fn baseline_verdicts_in_text_output() {
     let analysis = sample();
     let sig = &analysis.tables[0].layout_signature;
-    let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4, sig)]));
+    let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4.0, sig)]));
     assert!(
         regressed.contains("✗ regression: 8.0 B/row exceeds the baselined allowance of 4"),
         "{regressed}"
     );
     assert!(regressed.contains("FAIL: 1 regression(s) vs baseline"), "{regressed}");
-    let modified = text(&analysis, None, false, &baselined(&analysis, &[("account", 8, "f16c")]));
+    let modified = text(
+        &analysis,
+        None,
+        false,
+        &baselined(&analysis, &[("account", 8.0, "f16c")]),
+    );
     assert!(modified.contains("✗ modified since baseline"), "{modified}");
     assert!(modified.contains("--accept account"), "{modified}");
-    let ratchet = text(&analysis, None, false, &baselined(&analysis, &[("account", 12, sig)]));
+    let ratchet = text(&analysis, None, false, &baselined(&analysis, &[("account", 12.0, sig)]));
     assert!(
-        ratchet.contains("↓ ratchet: allowance 12 can tighten to 8"),
+        ratchet.contains("↓ ratchet: allowance 12 can tighten to 8.0"),
         "{ratchet}"
     );
     assert!(!ratchet.contains("FAIL"), "{ratchet}");
@@ -107,7 +112,7 @@ fn baseline_verdicts_in_text_output() {
         &analysis,
         None,
         false,
-        &baselined(&analysis, &[("account", 8, sig), ("ghost", 1, "vi")]),
+        &baselined(&analysis, &[("account", 8.0, sig), ("ghost", 1.0, "vi")]),
     );
     assert!(
         orphanish.contains("orphaned entries (no matching table): ghost"),
@@ -122,7 +127,7 @@ fn grown_since_baseline_in_text_output() {
          ALTER TABLE t ADD COLUMN e boolean NOT NULL;
          ALTER TABLE t ADD COLUMN f bigint NOT NULL;",
     );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", 0, "f4i,f8d")]));
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", 0.0, "f4i,f8d")]));
     assert!(rendered.contains("✗ grown since baseline"), "{rendered}");
     assert!(
         rendered.contains("grown since baseline") && rendered.contains("FAIL:"),
@@ -133,12 +138,12 @@ fn grown_since_baseline_in_text_output() {
 #[test]
 fn github_annotations() {
     let analysis = sample();
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert!(rendered.starts_with("::error file=V1__init.sql,line=1,title=rowdiet::table account"));
     let warn = github(&analysis, &gate(&analysis, None));
     assert!(warn.starts_with("::warning "));
     let sig = &analysis.tables[0].layout_signature;
-    let regressed = github(&analysis, &baselined(&analysis, &[("account", 4, sig)]));
+    let regressed = github(&analysis, &baselined(&analysis, &[("account", 4.0, sig)]));
     assert!(
         regressed.starts_with("::error file=V1__init.sql,line=1,title=rowdiet regression::"),
         "{regressed}"
@@ -148,7 +153,7 @@ fn github_annotations() {
 #[test]
 fn json_shape() {
     let analysis = sample();
-    let rendered = json(&analysis, Some(0), &gate(&analysis, Some(0))).unwrap();
+    let rendered = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["gate_exceeded"], true);
     assert_eq!(value["gate"]["exceeded"], true);
@@ -185,7 +190,7 @@ fn github_escapes_properties_and_messages() {
         }],
         &Config::default(),
     );
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("file=V1__a%2Cb%3Ac.sql"), "{rendered}");
     assert!(rendered.contains("we%25ird"), "{rendered}");
     assert!(!rendered.contains("we%ird "), "{rendered}");
@@ -199,7 +204,7 @@ fn github_budget_truncates_loudly() {
         })
         .collect();
     let analysis = analyze(&sql);
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert_eq!(rendered.matches("::error ").count(), 10, "{rendered}");
     assert!(rendered.contains("3 annotation(s) suppressed"), "{rendered}");
     let under = github(&analysis, &gate(&analysis, None));
@@ -215,7 +220,7 @@ fn github_step_summary_carries_the_full_report() {
         })
         .collect();
     let analysis = analyze(&sql);
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0)));
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
     for i in 0..13 {
         assert!(
             summary.contains(&format!("| t{i:02} | 8.0 | exact | **new violation** |")),
@@ -228,7 +233,7 @@ fn github_step_summary_carries_the_full_report() {
     );
     let baselined_summary = github_step_summary(
         &analysis,
-        &baselined(&analysis, &[("t00", 4, &analysis.tables[0].layout_signature)]),
+        &baselined(&analysis, &[("t00", 4.0, &analysis.tables[0].layout_signature)]),
     );
     assert!(
         baselined_summary.contains("**regression** (allowed 4)"),

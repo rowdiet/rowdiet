@@ -42,10 +42,18 @@ later column aligns against — the total payload is order-invariant while its e
 downstream padding is order-dependent. The walk therefore carries the offset as a set of possible
 residues mod 8: exact until the first varlena, the full set after any varlena (a proven-short
 typmod bounds only the header form, payload byte length still varies), narrowed again by
-alignment (an 8-aligned
-column collapses any set back to a single residue). Each pad placed over a non-singleton set is
-reported as min/max/expected, with residues taken as uniformly likely — a stated assumption.
-Pads placed while the residue is exactly known stay exact.
+alignment (an 8-aligned column collapses any set back to a single residue). Each pad placed
+over a non-singleton set is reported as min/max/expected, with residues taken as uniformly
+likely — a stated assumption.
+
+A varlena's own pad depends on its storage form. PostgreSQL stores any payload of 126 bytes or
+less with a 1-byte header and no alignment at all, and TOAST pointers are unaligned too; only
+the inline long form (payload ≥ 127 B) aligns (`heap_compute_data_size` packs, and
+`att_align_datum` skips alignment for packed values). Expected values therefore assume the
+short form — the measured common case, verified with pageinspect — and the long form's
+alignment cost appears in the pad's max bound. Pads placed while the residue is exactly known
+stay exact, and a varlena whose long form would pad zero anyway (a 4-aligned residue for text,
+an 8-aligned one for `polygon`) is certain under every form.
 
 Tiers:
 
@@ -53,18 +61,24 @@ Tiers:
   (fixed-width values are never toasted/compressed). Headline = MAXALIGN-rounded footprint delta;
   `avoidable == 0` whenever the reorder doesn't cross an 8-byte rung, even if raw padding drops.
 - **Estimate** — any varlena present. Headline = expected-padding delta, labeled, possibly
-  fractional. Real rows differ (short-form/TOAST make varlena alignment data-dependent three
-  ways), so no guarantee is claimed.
+  fractional, under the two stated assumptions (short-form varlena storage; uniform offset
+  residues). Real payload-width distributions can sit anywhere in the reported min/max range,
+  so no guarantee is claimed.
 
 Why no middle tier: even for "fixed prefix + varlena tail preserved" the *total* delta is not
-byte-guaranteed — payload lengths shift downstream pads in both orders. There is a useful
-provable fact recorded here for a future refinement: with the tail sequence preserved, the
-realized recovery is **never negative** (induction over the walk: a running delta `D ≥ 0` before
-an item of alignment `a` becomes `D' = D + pad(x+D,a) − pad(x,a) ≥ 0`). So the current Estimate
-label is conservative, not wrong. A tempting third metric — "guaranteed padding computed over
-the fixed columns alone" — is deliberately absent: it only describes the *clustered* layout,
-while in an interleaved table a fixed column's real offset rides on the preceding varlena's
-actual length, so presenting that number as guaranteed for the as-written order would overclaim.
+byte-guaranteed — payload lengths shift downstream pads in both orders, so realized outcomes
+ride on the stated assumptions. Two structural guards hold instead: the reported total always
+lies inside the min/max range (property-tested against a storage-rule simulator), and the
+suggestion never scores worse than the as-written order under the model (the report falls back
+to the current order rather than recommend a regression). The certain component ships as
+`OrderStats.padding` and renders as "N B deterministic" — presented as one labeled component of
+the total, beside the expected value and the range, never as a guarantee of the whole row.
+Deterministic pads also outrank expected ones in the suggestion: the suggested order keeps
+every fixed column ahead of the varlenas even where an interleave scores lower in expectation
+(two irregulars with a varlena between them), because a certain pad is hard information and an
+expected pad rides on assumptions. Among fixed-first orders the block search's optimum is the
+global optimum: varlena self-pads expect zero at every block-end residue, so the tail adds the
+same expectation to every block arrangement.
 
 Null bitmap: present per-row when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it never changes reorder

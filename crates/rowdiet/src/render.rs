@@ -188,11 +188,9 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
             );
         }
         Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
-            // Entries store whole bytes, so accepting would write the ceiling.
             let _ = writeln!(
                 out,
-                "  ↓ ratchet: allowance {allowed} can tighten to {} — --accept {}",
-                rowdiet_core::baseline::ceil_bytes(avoidable),
+                "  ↓ ratchet: allowance {allowed} can tighten to {avoidable:.1} — --accept {}",
                 t.name
             );
         }
@@ -258,7 +256,7 @@ fn maybe_quote(ident: &str) -> String {
 fn tier_label(tier: Tier) -> &'static str {
     match tier {
         Tier::Exact => "exact — fixed-width only",
-        Tier::Estimate => "estimate — columns placed at data-dependent offsets",
+        Tier::Estimate => "estimate — assumes short-form varlenas, uniform offset residues",
         Tier::Unknown => "unknown — columns not fully known",
     }
 }
@@ -499,7 +497,7 @@ fn markdown_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-pub fn json(analysis: &Analysis, fail_over: Option<u64>, gate: &GateOutcome) -> Result<String, String> {
+pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> Result<String, String> {
     let value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "fail_over": fail_over,
