@@ -91,6 +91,36 @@ fn version_order_folds_alters_after_create() {
 }
 
 #[test]
+fn interleaved_varlenas_report_data_dependent_waste() {
+    // The issue-1 repro: same column multiset, opposite orders. Interleaving must surface the
+    // reorder with a fractional expected saving; grouping must pass clean.
+    let out = bin().arg(fixtures("varlena")).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("■ interleaved"), "{stdout}");
+    assert!(
+        stdout.contains("current  : 9.5 B/row expected padding (0 B deterministic, range 0–19, data-dependent)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("→ 3.5 B/row avoidable"), "{stdout}");
+    assert!(
+        stdout.contains("order    : score, seen, tag, a, b, c, d, e"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("✓ grouped"), "{stdout}");
+    assert!(
+        stdout.contains("6.0 B/row expected padding (0 B deterministic, range 0–12, data-dependent)"),
+        "{stdout}"
+    );
+    let gated = bin()
+        .arg(fixtures("varlena"))
+        .args(["--fail-over", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(gated.status.code(), Some(1), "3.5 B/row expected must trip a zero gate");
+}
+
+#[test]
 fn missing_path_is_an_error() {
     let out = bin().arg("no/such/path.sql").output().unwrap();
     assert_eq!(out.status.code(), Some(2));

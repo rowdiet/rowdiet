@@ -13,11 +13,11 @@ WebAssembly, with draggable byte rulers; nothing leaves the page.
 
 ```
 $ rowdiet migrations/ --rows 10000000 --suggest
-■ account (V1__init.sql:1) — 6 columns — estimate — long-form varlena scenario
-  current  : 13 B padding/row (long-form scenario)
-  suggested: 1 B padding/row (long-form scenario) → 12 B/row avoidable
+■ account (V1__init.sql:1) — 6 columns — estimate — columns placed at data-dependent offsets
+  current  : 14.5 B/row expected padding (13 B deterministic, range 13–16, data-dependent)
+  suggested: 1 B padding/row → 13.5 B/row avoidable
   order    : id, balance, flags, kind, active, note
-  × 10000000 rows ≈ 120.0 MB
+  × 10000000 rows ≈ 135.0 MB
   -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):
   CREATE TABLE account (
       id BIGINT NOT NULL,
@@ -157,9 +157,12 @@ rowdiet therefore reports per table:
 - **exact tier** (only fixed-width columns): the headline is the **MAXALIGN-rounded footprint
   delta** and rows-per-8kB-page. A reorder that removes padding but doesn't cross an 8-byte rung
   reports **0 avoidable bytes** by design (raw padding is still shown).
-- **estimate tier** (any varlena): numbers describe the all-non-NULL, long-form scenario and are
-  labeled as such — never guaranteed savings. `varchar(n≤31)` is upgraded to *proven short,
-  unaligned* (typmod bounds the payload under the short-varlena limit).
+- **estimate tier** (any varlena): every column after a varlena sits at a data-dependent offset,
+  so its padding is reported as an expected value with a min/max range (offset residues mod 8
+  taken as uniformly likely) — never guaranteed savings. Pads placed before the first varlena
+  stay exact. `varchar(n≤31)` is upgraded to *proven short, unaligned* (typmod bounds the
+  payload under the short-varlena limit) — that fixes the header, not the payload length, so it
+  does not restore offset certainty for later columns.
 
 The suggested order is: fixed columns before varlena, alignment descending, irregular-size types
 (`timetz`, `macaddr`) at the end of their group, varlenas alignment-descending with proven-short

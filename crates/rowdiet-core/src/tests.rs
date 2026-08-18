@@ -29,8 +29,13 @@ fn end_to_end_migration_series() {
     assert_eq!(t.natts, 6);
     assert_eq!(t.tier, Tier::Estimate);
     assert_eq!(t.current.padding, 7);
+    // note precedes created_at, so created_at's 8-byte pad is data-dependent: E 3.5 over the
+    // full residue set on top of the 7 certain bytes.
+    assert_eq!(t.current.expected_padding, 10.5);
+    assert_eq!((t.current.padding_min, t.current.padding_max), (7, 14));
     assert_eq!(t.suggested.padding, 3);
-    assert_eq!(t.avoidable_bytes_per_row, 4);
+    assert_eq!(t.suggested.expected_padding, 4.5);
+    assert_eq!(t.avoidable_bytes_per_row, 6.0);
     assert_eq!(
         t.suggested_order,
         vec!["id", "created_at", "status", "flag", "note", "meta"]
@@ -135,7 +140,7 @@ fn exact_tier_footprint_and_rows_per_page() {
     assert_eq!(t.tier, Tier::Exact);
     assert_eq!(t.current.footprint, Some(56));
     assert_eq!(t.suggested.footprint, Some(48));
-    assert_eq!(t.avoidable_bytes_per_row, 8);
+    assert_eq!(t.avoidable_bytes_per_row, 8.0);
     assert_eq!(t.current.rows_per_page, Some(136));
     assert_eq!(t.suggested.rows_per_page, Some(157));
     assert!(!t.any_nullable);
@@ -147,7 +152,7 @@ fn rung_not_crossed_reports_zero_avoidable() {
     let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
     let t = &analysis.tables[0];
     assert_eq!(t.current.padding, 7);
-    assert_eq!(t.avoidable_bytes_per_row, 0);
+    assert_eq!(t.avoidable_bytes_per_row, 0.0);
     assert_eq!(t.suggested_order, vec!["flag", "a", "b"]);
 }
 
@@ -182,7 +187,7 @@ fn pgvector_columns_resolve_verified() {
     assert!(t.assumed_types.is_empty());
     assert!(analysis.notes.is_empty());
     assert_eq!(t.tier, Tier::Estimate);
-    assert_eq!(t.avoidable_bytes_per_row, 0);
+    assert_eq!(t.avoidable_bytes_per_row, 0.0);
 }
 
 #[test]
@@ -191,7 +196,7 @@ fn serial_primary_key_table_already_optimal() {
     let analysis = analyze_sources(&[src("V1__s.sql", sql)], &Config::default());
     let t = &analysis.tables[0];
     assert_eq!(t.tier, Tier::Exact);
-    assert_eq!(t.avoidable_bytes_per_row, 0);
+    assert_eq!(t.avoidable_bytes_per_row, 0.0);
     assert!(!t.any_nullable);
 }
 
@@ -768,7 +773,7 @@ mod audit_fixes {
         let sql = "CREATE TABLE t (flag boolean NOT NULL, a bigint NOT NULL, b timestamptz NOT NULL);";
         let analysis = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
         let t = &analysis.tables[0];
-        assert_eq!(t.avoidable_bytes_per_row, 0);
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
         assert_eq!(t.suggested, t.current);
     }
 
@@ -861,7 +866,7 @@ mod audit_fixes_model {
         assert_eq!(t.dropped_columns, 1);
         assert_eq!(t.current.footprint, Some(72));
         assert_eq!(t.current.rows_per_page, Some(107));
-        assert_eq!(t.avoidable_bytes_per_row, 0);
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
     }
 
     #[test]
@@ -883,7 +888,7 @@ mod audit_fixes_model {
         let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.dropped_columns, 1);
-        assert_eq!(t.avoidable_bytes_per_row, 8);
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
     }
 
     #[test]
@@ -1134,9 +1139,9 @@ fn analysis_accessors_mirror_the_gate_filter() {
     let gated: Vec<&str> = analysis.gated_tables().map(|t| t.name.as_str()).collect();
     assert_eq!(gated, ["w"], "the ignored table must be outside the gate filter");
     assert_eq!(analysis.worst_avoidable(), analysis.tables[0].avoidable_bytes_per_row);
-    assert!(analysis.worst_avoidable() > 0);
+    assert!(analysis.worst_avoidable() > 0.0);
     let empty = analyze_sources(&[], &Config::default());
-    assert_eq!(empty.worst_avoidable(), 0);
+    assert_eq!(empty.worst_avoidable(), 0.0);
 }
 
 #[test]
@@ -1157,7 +1162,7 @@ fn like_expands_from_a_known_same_run_source() {
     assert_eq!(cp.natts, 4);
     assert_eq!(cp.layout_signature, s.layout_signature);
     assert_eq!(cp.avoidable_bytes_per_row, s.avoidable_bytes_per_row);
-    assert_eq!(cp.avoidable_bytes_per_row, 8);
+    assert_eq!(cp.avoidable_bytes_per_row, 8.0);
     assert!(a.notes.is_empty(), "{:#?}", a.notes);
 }
 
@@ -1170,7 +1175,7 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert!(c.incomplete);
     assert_eq!(c.tier, layout::Tier::Unknown);
     assert_eq!(c.current.footprint, None);
-    assert_eq!(c.avoidable_bytes_per_row, 0);
+    assert_eq!(c.avoidable_bytes_per_row, 0.0);
     let outcome = baseline::evaluate(&a, Some(0), false, None);
     assert_eq!(outcome.verdicts["c"], baseline::TableVerdict::Incomplete);
     assert!(!outcome.exceeded, "incomplete alone does not fail the gate");
@@ -1194,4 +1199,42 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     let empty = analyze_sources(&[src("V2.sql", "CREATE TABLE e ();")], &Config::default());
     assert!(!empty.tables[0].incomplete);
     assert_eq!(empty.tables[0].tier, layout::Tier::Exact);
+}
+
+/// The issue-1 repro: identical column multisets, opposite orders. Interleaving fixed columns
+/// among varlenas strands them at data-dependent offsets; grouping places every fixed column
+/// while the offset is still exact.
+mod varlena_residue_uncertainty {
+    use super::src;
+    use crate::{Config, Tier, analyze_sources};
+
+    const INTERLEAVED: &str = "CREATE TABLE interleaved (a text NOT NULL, tag int4 NOT NULL, b text NOT NULL, \
+        c text NOT NULL, d text NOT NULL, e text NOT NULL, score float8 NOT NULL, seen timestamp NOT NULL);";
+    const GROUPED: &str = "CREATE TABLE grouped (score float8 NOT NULL, seen timestamp NOT NULL, tag int4 NOT NULL, \
+        a text NOT NULL, b text NOT NULL, c text NOT NULL, d text NOT NULL, e text NOT NULL);";
+
+    #[test]
+    fn interleaved_reports_expected_avoidable_and_surfaces_the_reorder() {
+        let analysis = analyze_sources(&[src("V1__i.sql", INTERLEAVED)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.tier, Tier::Estimate);
+        assert_eq!(t.current.padding, 0, "no pad in this order is certain");
+        assert_eq!(t.current.expected_padding, 9.5);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 19));
+        assert_eq!(t.suggested.expected_padding, 6.0);
+        assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 12));
+        assert_eq!(t.avoidable_bytes_per_row, 3.5);
+        assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn grouped_reports_zero_avoidable() {
+        let analysis = analyze_sources(&[src("V1__g.sql", GROUPED)], &Config::default());
+        let t = &analysis.tables[0];
+        assert_eq!(t.tier, Tier::Estimate);
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.current.expected_padding, 6.0);
+        assert_eq!(t.suggested, t.current);
+        assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+    }
 }

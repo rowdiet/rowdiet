@@ -53,7 +53,7 @@ fn no_gate_without_fail_over_or_baseline() {
 fn fail_over_alone_flags_new_violation() {
     let outcome = evaluate(&analysis(WASTEFUL), Some(0), false, None);
     assert!(outcome.exceeded);
-    assert_eq!(outcome.verdicts["t"], TableVerdict::NewViolation { avoidable: 8 });
+    assert_eq!(outcome.verdicts["t"], TableVerdict::NewViolation { avoidable: 8.0 });
     let lenient = evaluate(&analysis(WASTEFUL), Some(8), false, None);
     assert!(!lenient.exceeded);
 }
@@ -76,7 +76,7 @@ fn tightened_allowance_flags_regression() {
     assert_eq!(
         outcome.verdicts["t"],
         TableVerdict::Regression {
-            avoidable: 8,
+            avoidable: 8.0,
             allowed: 4
         }
     );
@@ -90,7 +90,7 @@ fn improvement_is_a_ratchet_opportunity_not_auto_tightened() {
     assert_eq!(
         outcome.verdicts["t"],
         TableVerdict::RatchetOpportunity {
-            avoidable: 8,
+            avoidable: 8.0,
             allowed: 12
         }
     );
@@ -124,7 +124,7 @@ fn wasteful_append_flags_grown_not_modified() {
     assert_eq!(
         outcome.verdicts["t"],
         TableVerdict::GrownSinceBaseline {
-            avoidable: 16,
+            avoidable: 16.0,
             allowed: 8
         }
     );
@@ -137,7 +137,7 @@ fn non_append_change_expires_the_allowance() {
     assert!(outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
-        TableVerdict::ModifiedSinceBaseline { avoidable: 8 }
+        TableVerdict::ModifiedSinceBaseline { avoidable: 8.0 }
     );
     assert!(outcome.expired.is_empty());
 }
@@ -158,7 +158,7 @@ fn explicit_fail_over_overrides_the_files() {
     assert!(!evaluate(&analysis(WASTEFUL), None, false, Some(&base)).exceeded);
     let strict = evaluate(&analysis(WASTEFUL), Some(0), false, Some(&base));
     assert!(strict.exceeded);
-    assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 8 });
+    assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 8.0 });
 }
 
 #[test]
@@ -286,23 +286,68 @@ fn verdict_display_matches_serde_tag() {
     let all = [
         TableVerdict::Pass,
         TableVerdict::Incomplete,
-        TableVerdict::NewViolation { avoidable: 1 },
+        TableVerdict::NewViolation { avoidable: 1.0 },
         TableVerdict::Regression {
-            avoidable: 2,
+            avoidable: 2.0,
             allowed: 1,
         },
         TableVerdict::GrownSinceBaseline {
-            avoidable: 2,
+            avoidable: 2.0,
             allowed: 1,
         },
-        TableVerdict::ModifiedSinceBaseline { avoidable: 2 },
+        TableVerdict::ModifiedSinceBaseline { avoidable: 2.0 },
         TableVerdict::RatchetOpportunity {
-            avoidable: 1,
+            avoidable: 1.0,
             allowed: 2,
         },
     ];
     for verdict in all {
         let json = serde_json::to_value(verdict).unwrap();
         assert_eq!(json["verdict"].as_str().unwrap(), verdict.to_string(), "{verdict:?}");
+    }
+}
+
+mod fractional_avoidable {
+    use super::*;
+
+    /// Fixed columns interleaved among varlenas: avoidable is a fractional expected value.
+    const VARLENA_WASTE: &str =
+        "CREATE TABLE t (a text NOT NULL, tag int4 NOT NULL, b text NOT NULL, score float8 NOT NULL);";
+
+    #[test]
+    fn fractional_avoidable_gates_against_fail_over() {
+        let a = analysis(VARLENA_WASTE);
+        assert_eq!(a.tables[0].avoidable_bytes_per_row, 3.5);
+        let strict = evaluate(&a, Some(0), false, None);
+        assert!(strict.exceeded);
+        assert_eq!(strict.verdicts["t"], TableVerdict::NewViolation { avoidable: 3.5 });
+        let lenient = evaluate(&a, Some(4), false, None);
+        assert!(!lenient.exceeded);
+    }
+
+    #[test]
+    fn acceptance_stores_the_ceiling_and_does_not_nag_to_ratchet() {
+        let a = analysis(VARLENA_WASTE);
+        let base = build_from(&a, 0, "test");
+        assert_eq!(base.tables["t"].bytes, 4, "3.5 rounds up on acceptance");
+        let outcome = evaluate(&a, None, false, Some(&base));
+        assert!(!outcome.exceeded);
+        // 3.5 under an allowance of 4 is as tight as an entry can record: Pass, not a ratchet.
+        assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
+    }
+
+    #[test]
+    fn genuinely_tighter_fraction_still_ratchets() {
+        let a = analysis(VARLENA_WASTE);
+        let sig = a.tables[0].layout_signature.as_str();
+        let base = baseline(0, &[("t", 6, sig)]);
+        let outcome = evaluate(&a, None, false, Some(&base));
+        assert_eq!(
+            outcome.verdicts["t"],
+            TableVerdict::RatchetOpportunity {
+                avoidable: 3.5,
+                allowed: 6
+            }
+        );
     }
 }
