@@ -166,6 +166,13 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     if let Some(n) = rows {
         // A dominance finding is a range; extrapolating only its maximum would overstate it.
         match t.dominance_saving {
+            Some(saving) if saving.min == 0 && saving.max > 0 => {
+                let _ = writeln!(
+                    out,
+                    "  × {n} rows ≈ up to {}",
+                    human_bytes(saving.max as f64 * n as f64)
+                );
+            }
             Some(saving) if saving.min != saving.max => {
                 let _ = writeln!(
                     out,
@@ -441,11 +448,11 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             _ => "rowdiet",
         };
         let saving = match t.dominance_saving {
-            Some(range) => format!("saves {}-{} B/row in every realization; ", range.min, range.max),
+            Some(range) => format!("; saves {}-{} B/row in every realization", range.min, range.max),
             None => String::new(),
         };
         let message = format!(
-            "table {}: {:.1} B/row avoidable ({saving}{}{}) — suggested order: {}",
+            "table {}: {:.1} B/row avoidable{saving}; {}{} — suggested order: {}",
             t.name,
             t.avoidable_bytes_per_row,
             tier_label(t.tier),
