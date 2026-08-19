@@ -177,11 +177,13 @@ The suggested order starts from: fixed columns before varlena, alignment descend
 irregular-size types (`timetz`, `macaddr`) at the end of their group, varlenas
 alignment-descending with proven-short ones last. For all-regular schemas this yields zero
 padding in every realization under any NULL mask. When the heuristic still pads, an exact
-search minimizes deterministic padding and the worst-case bound (within caps it names in the
-output when they bind), and the result is recommended only when it dominates the order you
-wrote. The search can beat plain fixed-first packing: `(text, boolean, bigint)` reorders to
-`(bigint, text, boolean)`, where the text sits on its alignment boundary in every storage form
-and the boolean never pads, reaching zero padding in every realization.
+search minimizes deterministic padding and the worst-case bound (within budgets it names in
+the output when they bind), and a reorder is recommended only when it dominates the order you
+wrote — verified by a sweep of every distinct column-class arrangement on tables small enough
+to sweep, so a clean verdict there means no dominating reorder exists at all. The search can
+beat plain fixed-first packing: `(text, boolean, bigint)` reorders to `(bigint, text, boolean)`,
+where the text sits on its alignment boundary in every storage form and the boolean never pads,
+reaching zero padding in every realization.
 
 Non-obvious type facts it models: `uuid` is char-aligned (16 B, never pads);
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is

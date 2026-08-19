@@ -132,8 +132,11 @@ Three rungs, in order:
 
 Gate rule: `avoidable_deterministic` (waste in exactly-known pads the recommended reorder
 removes) plus `avoidable_dominance` (further worst-case waste the dominating reorder removes).
-Frontier bands never gate. "No dominating reorder found" is printed only for what was actually
-searched, and a capped search says so in the same line.
+The sum always equals the engine's proven maximum saving, so the headline can never exceed
+what some realization attains; the guaranteed minimum travels beside it (`dominance_saving`).
+Frontier bands never gate. "No dominating reorder exists" is printed only after an exhaustive
+sweep; a budgeted search says "found" plus its budget note, and a capped order search is
+labeled on clean lines and finding lines alike.
 
 **The dominance engine** (`dominance.rs`) computes exact bounds of `pad(A) − pad(B)` over all
 realizations. Padding depends on a realization only through each varlena's (form, payload mod
@@ -144,24 +147,49 @@ pair is reported as undecided — `dominance_evaluated: false`, never a guess. F
 each varlena's form (up to 6 long-capable varlenas, else the frontier prints without band
 detail) and reuse the same engines.
 
+**The dominance sweep** is what makes the clean verdict a proof. Two orders with the same
+sequence of padding classes pad identically in every realization, so the distinct class
+sequences (`layout::order_space`) are a dominance-complete candidate space: if any reorder
+dominates the current order, some member does. The sweep tests every member against the
+current order (up to 5,040 sequences and a comparison-work budget), pruning candidates that
+fail a necessary condition for free (dominance implies <= on the worst case, the best case,
+and the uniform mean). A completed sweep reports `dominance_search: exhaustive` and the clean
+line reads "no dominating reorder exists"; anything trimmed reports `budgeted` and says so.
+Scalar-objective poles alone were measured to miss 11-19% of dominating reorders on 4-5 column
+varlena schemas, which is why the sweep exists. Past the sequence cap the policy falls back to
+the search poles plus the dominance-safe repack of the current order's own fixed prefix.
+
 **The search** (`layout::search`) emits three candidate poles: the fixed-first heuristic
 (fixed-prefix refined), the lexicographic (deterministic, worst-case) minimum — the certainty
 pole, free to hide fixed columns behind varlenas — and the (worst-case, deterministic) minimum,
 the minimax pole. Both lexicographic pairs are additive per (class, residue-set state), so the
-memoized DP over class counts × the 15 cosets of Z/8 minimizes them exactly; a property test
-pins both poles against brute-force permutation search with irregulars and varlenas in the
-pool. The whole-order search runs within 24 columns and a state budget (`Π(count+1) × 15 <=
-2^20`, worst measured cost about 180 ms); past either cap it degrades to the base fixed-prefix
-block search (3..=24 fixed columns, 12 fixed classes — the pre-existing worst case), and past
+DP over class counts × the 15 cosets of Z/8 minimizes them exactly; a property test pins both
+poles against brute-force permutation search with irregulars and varlenas in the pool. The DP's
+memo is a dense mixed-radix vector of exactly the state-space bound (8 bytes per state, no
+hashing), and the whole-order search runs whenever that bound fits the state budget
+(`Π(count+1) × 15 <= 2^20`, 8 MB of memo at most, worst measured cost about 180 ms); there is
+no column-count cap, because the budget already bounds cost and a redundant cap was measured to
+flip a 7 B/row finding to a silent pass at exactly 25 columns. Past the budget the search
+degrades to the base fixed-prefix block search (3..=24 fixed columns, 12 fixed classes; its
+own bound tops out near 8M states, about 64 MB of memo and under a second, measured), and past
 that to the plain sort. The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and
-labeled in the text output, because a capped search claiming nothing was avoidable is the worst
-defect this tool can have: the fixed-prefix fallback is exactly what keeps a 25-column table
-with 24 B/row of deterministic waste gating (a measured false negative of an earlier revision).
+labeled on both clean and finding lines, because a capped search claiming nothing was avoidable
+is the worst defect this tool can have.
 
 The certainty pole exists for the frontier: `(timetz, timetz, text)` pays a certain 4 B/row,
 and interposing the text trades that for a data-dependent 0..=7 — measured 3 B/row worse on
 4-byte texts, 3 B/row better on 2-byte texts. The policy never recommends that trade; it prints
 it with both worst cases and the bands.
+
+Two scope notes on the frontier itself. First (deviation five): a pole earns a frontier line
+only when it also improves a realization-free summary (worst case, or deterministic padding);
+an incomparable pole that is worse on both summaries is suppressed as noise, so one spelling of
+an incomparable pair can render a frontier while the reverse spelling renders none. Second, the
+band verdicts are computed over a superset of the realizations some types can take: an array of
+fixed-width elements or a blank-padded `char(n)` reaches only a subset of payload residues, so
+a band the model calls payload-length dependent can be deterministic for such a column. The
+direction is safe (a superset can only weaken a claim, never fabricate a dominance win); the
+cost is precision.
 
 ## Suggested order
 
