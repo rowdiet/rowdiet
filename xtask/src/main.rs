@@ -245,6 +245,18 @@ fn fixtures() -> Vec<Fixture> {
         // (bigint, text, macaddr), only the exhaustive sweep does; property (b) then verifies
         // the reorder on disk.
         plain("miss", vec![col("t", "text"), col("k", "bigint"), col("m", "macaddr")]),
+        // The varlena-identity regression: the dominating (m1, t2, t1, m2) swaps the two texts
+        // relative to the written order, so a class-collapsed candidate space never proposes
+        // it; property (b) verifies the reorder on disk.
+        plain(
+            "tmtm",
+            vec![
+                col("t1", "text"),
+                col("m1", "macaddr"),
+                col("t2", "text"),
+                col("m2", "macaddr"),
+            ],
+        ),
         // TOAST: 4 kB EXTERNAL payloads store an 18-byte unaligned pointer; the pinned residue
         // sits inside the reported range and the dominating reorder must still measure better.
         Fixture {
@@ -607,7 +619,9 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
 }
 
 /// Measure each declared frontier band under a workload that stores exactly its `long_form`
-/// columns long and every other varlena short, and assert the declared winner.
+/// columns long and every other varlena short, and assert the declared winner. Mixed bands are
+/// held to their own claim: the winner must actually flip across text-width residues inside
+/// the band, so a definite winner mislabeled as mixed fails the run.
 #[allow(clippy::too_many_arguments)]
 fn verify_bands(
     pg: &Pg,
@@ -626,10 +640,6 @@ fn verify_bands(
             break;
         }
         let winner = band["winner"].as_str().expect("winner");
-        if winner == "mixed" {
-            // Any relation is legal inside a mixed band; nothing to hold the label to.
-            continue;
-        }
         let long_form: Vec<&str> = band["long_form"]
             .as_array()
             .expect("long_form")
@@ -646,6 +656,30 @@ fn verify_bands(
                 (c.name, generator)
             })
             .collect();
+        let described = format!("band [{}]", long_form.join(", "));
+        let band_label = if long_form.is_empty() {
+            "all short".to_string()
+        } else {
+            long_form.join("+")
+        };
+        if winner == "mixed" {
+            let min_saving = band["min_saving"].as_i64().expect("min_saving");
+            let max_saving = band["max_saving"].as_i64().expect("max_saving");
+            verify_mixed_band(
+                pg,
+                fixture,
+                current,
+                alt_cols,
+                cur_table,
+                alt_table,
+                &long_form,
+                &band_label,
+                (min_saving, max_saving),
+                failures,
+            );
+            checked += 1;
+            continue;
+        }
         let mut band_means = [0.0f64; 2];
         for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
             let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
@@ -657,15 +691,9 @@ fn verify_bands(
             band_means[index] = measure_table(pg, table, columns, None).mean;
         }
         let [cur_mean, alt_mean] = band_means;
-        let described = format!("band [{}]", long_form.join(", "));
         println!(
-            "| {} | band | {} -> {winner} | - | cur {cur_mean:.3} vs alt {alt_mean:.3} | 1200 |",
+            "| {} | band | {band_label} -> {winner} | - | cur {cur_mean:.3} vs alt {alt_mean:.3} | 1200 |",
             fixture.name,
-            if long_form.is_empty() {
-                "all short".to_string()
-            } else {
-                long_form.join("+")
-            },
         );
         let holds = match winner {
             "alternative" => alt_mean <= cur_mean + 0.05,
@@ -743,6 +771,102 @@ fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)], toast_column: O
         mean: fields[1].parse().expect("mean"),
         min: fields[2].parse().expect("min"),
         max: fields[3].parse().expect("max"),
+    }
+}
+
+/// A mixed band claims the winner flips with payload lengths mod 8 inside the band. First hold
+/// the label to its own bounds: mixed requires both signs to be attainable, so a band whose
+/// reported min/max saving proves a definite winner is mislabeled and fails outright (this is
+/// what kills a mutation that forces every winner to mixed). Then sweep the text-width residue
+/// (long texts 128+r bytes, short texts r bytes) and demand both measured signs; a band that
+/// never flips fails unless a residue-pinned varlena (an array, whose realizable payloads reach
+/// only a subset of the model's residues, the documented superset imprecision) explains it.
+#[allow(clippy::too_many_arguments)]
+fn verify_mixed_band(
+    pg: &Pg,
+    fixture: &Fixture,
+    current: &[(&str, &str)],
+    alt_cols: &[(&str, &str)],
+    cur_table: &str,
+    alt_table: &str,
+    long_form: &[&str],
+    band_label: &str,
+    bounds: (i64, i64),
+    failures: &mut Vec<String>,
+) {
+    let (min_saving, max_saving) = bounds;
+    if !(min_saving < 0 && max_saving > 0) {
+        failures.push(format!(
+            "{}: band [{band_label}] declared mixed but its own bounds [{min_saving},{max_saving}] prove a definite winner",
+            fixture.name
+        ));
+        return;
+    }
+    let has_text = fixture.columns.iter().any(|c| c.sql_type == "text");
+    if !has_text {
+        println!(
+            "| {} | band | {band_label} -> mixed | - | no text column to sweep, skipped | - |",
+            fixture.name
+        );
+        return;
+    }
+    let mut current_wins = false;
+    let mut alternative_wins = false;
+    for residue in 0..8u64 {
+        let overrides: Vec<(&str, String)> = fixture
+            .columns
+            .iter()
+            .filter(|c| matches!(c.sql_type, "text" | "float8[]"))
+            .map(|c| {
+                let generator = if c.sql_type == "text" {
+                    let width = if long_form.contains(&c.name) {
+                        128 + residue
+                    } else {
+                        residue
+                    };
+                    format!("repeat('x', {width})")
+                } else if long_form.contains(&c.name) {
+                    type_spec(c.sql_type, c.name).2
+                } else {
+                    type_spec(c.sql_type, c.name).1
+                };
+                (c.name, generator)
+            })
+            .collect();
+        let mut band_means = [0.0f64; 2];
+        for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
+            let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
+            pg.query(&format!("TRUNCATE {table};\n{insert}")).expect("band insert");
+            band_means[index] = measure_table(pg, table, columns, None).mean;
+        }
+        let [cur_mean, alt_mean] = band_means;
+        if alt_mean < cur_mean - 0.05 {
+            alternative_wins = true;
+        }
+        if cur_mean < alt_mean - 0.05 {
+            current_wins = true;
+        }
+        if current_wins && alternative_wins {
+            break;
+        }
+    }
+    println!(
+        "| {} | band | {band_label} -> mixed | - | flips: cur-wins {current_wins}, alt-wins {alternative_wins} | 1200 |",
+        fixture.name
+    );
+    if !(current_wins && alternative_wins) {
+        let residue_pinned = fixture.columns.iter().any(|c| c.sql_type == "float8[]");
+        if residue_pinned {
+            println!(
+                "| {} | band | {band_label} | - | non-flip explained by a residue-pinned array (superset model) | - |",
+                fixture.name
+            );
+        } else {
+            failures.push(format!(
+                "{}: band [{band_label}] declared mixed but a residue sweep never flips the winner (cur-wins {current_wins}, alt-wins {alternative_wins})",
+                fixture.name
+            ));
+        }
     }
 }
 
