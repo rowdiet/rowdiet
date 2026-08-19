@@ -143,21 +143,32 @@ realizations. Padding depends on a realization only through each varlena's (form
 8), so: when both orders keep the varlenas in the same relative sequence, a joint walk over the
 pair of offset residues (64 states, extremes merged per state) is exact at any column count;
 otherwise exhaustive enumeration runs within a budget (about 2M assignments), and past it the
-pair is reported as undecided — `dominance_evaluated: false`, never a guess. Frontier bands fix
+pair is reported as undecided (`dominance_search: budgeted`), never a guess. Frontier bands fix
 each varlena's form (up to 6 long-capable varlenas, else the frontier prints without band
 detail) and reuse the same engines.
 
-**The dominance sweep** is what makes the clean verdict a proof. Two orders with the same
-sequence of padding classes pad identically in every realization, so the distinct class
-sequences (`layout::order_space`) are a dominance-complete candidate space: if any reorder
-dominates the current order, some member does. The sweep tests every member against the
-current order (up to 5,040 sequences and a comparison-work budget), pruning candidates that
-fail a necessary condition for free (dominance implies <= on the worst case, the best case,
-and the uniform mean). A completed sweep reports `dominance_search: exhaustive` and the clean
-line reads "no dominating reorder exists"; anything trimmed reports `budgeted` and says so.
-Scalar-objective poles alone were measured to miss 11-19% of dominating reorders on 4-5 column
-varlena schemas, which is why the sweep exists. Past the sequence cap the policy falls back to
-the search poles plus the dominance-safe repack of the current order's own fixed prefix.
+**The dominance sweep** is what makes the clean verdict a proof. Fixed columns of one padding
+class are pointwise interchangeable (they carry no realization variable, and their pads depend
+only on (alignment, len mod 8) and the offset residue), so one representative arrangement
+stands for all of them. Varlenas get no such collapse: a realization assigns each varlena
+column its own payload, so swapping two same-class varlena columns changes padding pointwise —
+in `(t1, m1, t2, m2)` the order `(m1, t2, t1, m2)` dominates while its class-sequence twin
+`(m1, t1, t2, m2)` measures 4 B/row worse at t1 = 132 B. `layout::order_space` therefore
+collapses fixed classes only and keeps every varlena an individual, which makes it
+pointwise-complete: if any reorder dominates the current order, some member attains identical
+padding in every realization. The sweep tests every member against the current order (up to
+5,040 sequences and a comparison-work budget), pruning candidates that fail a necessary
+condition for free (dominance implies <= on the worst case, the best case, and the mean over
+any sub-distribution, of which the display expectation is one — that prune makes the display
+model correctness-bearing, noted in code). A completed sweep reports
+`dominance_search: exhaustive` and the clean line reads "no dominating reorder exists", a
+universal claim the completeness argument above licenses; anything trimmed reports `budgeted`
+and says "found" instead. Scalar-objective poles alone were measured to miss 11-19% of
+dominating reorders on 4-5 column varlena schemas, which is why the sweep exists. Coverage is
+honest but narrow: the exhaustive label reaches tables whose candidate space fits the cap,
+roughly up to seven distinct column identities (a quarter of realistic schemas, none wider
+than about eleven columns); everything else falls back to the search poles plus the
+dominance-safe repack of the current order's own fixed prefix, labeled `budgeted`.
 
 **The search** (`layout::search`) emits three candidate poles: the fixed-first heuristic
 (fixed-prefix refined), the lexicographic (deterministic, worst-case) minimum — the certainty

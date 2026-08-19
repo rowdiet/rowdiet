@@ -179,8 +179,9 @@ alignment-descending with proven-short ones last. For all-regular schemas this y
 padding in every realization under any NULL mask. When the heuristic still pads, an exact
 search minimizes deterministic padding and the worst-case bound (within budgets it names in
 the output when they bind), and a reorder is recommended only when it dominates the order you
-wrote — verified by a sweep of every distinct column-class arrangement on tables small enough
-to sweep, so a clean verdict there means no dominating reorder exists at all. The search can
+wrote. On tables small enough to sweep (roughly up to seven distinct column identities; wider
+tables fall back to a budgeted candidate search and the output says so), the verdict is
+exhaustive: a clean table there provably has no dominating reorder. The search can
 beat plain fixed-first packing: `(text, boolean, bigint)` reorders to `(bigint, text, boolean)`,
 where the text sits on its alignment boundary in every storage form and the boolean never pads,
 reaching zero padding in every realization.
