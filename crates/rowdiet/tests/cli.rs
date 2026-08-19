@@ -131,7 +131,10 @@ fn interleaved_varlenas_report_dominance_avoidable_waste() {
     assert_eq!(grouped["current"]["padding_max"], 12);
     assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
     assert!(grouped["frontier"].is_null());
-    assert_eq!(grouped["dominance_search"], "exhaustive");
+    assert_eq!(
+        grouped["dominance_search"], "budgeted",
+        "five distinct texts are past the sweep budget"
+    );
     // Columns at data-dependent offsets claim no point placement.
     assert!(interleaved["columns"][6]["offset"].is_null(), "{interleaved}");
     assert!(interleaved["columns"][6]["pad_before"].is_null(), "{interleaved}");
@@ -150,7 +153,10 @@ fn varlena_text_output_states_the_policy_and_gates_fractionally() {
         "{stdout}"
     );
     assert!(stdout.contains("dominance-proven"), "{stdout}");
-    assert!(stdout.contains("no dominating reorder exists"), "{stdout}");
+    assert!(
+        stdout.contains("no dominating reorder found (dominance search budgeted)"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("display-only"),
         "the policy must be stated where the numbers are shown: {stdout}"
@@ -185,6 +191,10 @@ fn frontier_is_reported_and_never_gated() {
     let gated = bin().arg(&dir).args(["--fail-over", "0"]).output().unwrap();
     assert_eq!(gated.status.code(), Some(0), "frontier findings never gate");
     let stdout = String::from_utf8_lossy(&gated.stdout);
+    assert!(
+        stdout.contains("no dominating reorder exists"),
+        "a completed sweep may state nonexistence: {stdout}"
+    );
     assert!(stdout.contains("frontier :"), "{stdout}");
     assert!(stdout.contains("workload-dependent, not gated"), "{stdout}");
     assert!(stdout.contains("wins when"), "{stdout}");

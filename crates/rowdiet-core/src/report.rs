@@ -294,7 +294,11 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
             let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
             let cand_walk = layout::walk(&ordered);
             // Dominance implies pointwise <=, so it implies <= on the max, the min, and the
-            // uniform mean: candidates failing any of these are proven non-dominating for free.
+            // mean over any sub-distribution of realizations. expected_padding_eighths is the
+            // exact mean over "every varlena short, payloads uniform mod 8" (pinned by the
+            // enumeration oracle test), so it is a sound prune; note this makes the display
+            // expectation correctness-bearing here, so its model cannot change independently.
+            // All three prunes were brute-force-checked: no dominating candidate fails any.
             if cand_walk.padding_max() > current_walk.padding_max()
                 || cand_walk.padding_min() > current_walk.padding_min()
                 || cand_walk.expected_padding_eighths() > current_walk.expected_padding_eighths()

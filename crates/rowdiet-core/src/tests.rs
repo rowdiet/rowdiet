@@ -1513,6 +1513,27 @@ mod decision_policy {
     }
 
     #[test]
+    fn same_class_varlena_identities_are_searched_individually() {
+        // (t1 text, m1 macaddr, t2 text, m2 macaddr): the dominating order (m1, t2, t1, m2)
+        // swaps the two texts relative to their written order, so a candidate space that
+        // collapses same-class varlenas never proposes it, while its class-sequence twin
+        // (m1, t1, t2, m2) measures 4 B/row worse than the current order at t1 = 132 B. The
+        // sweep must treat every varlena as its own individual.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE tmtm (t1 text NOT NULL, m1 macaddr NOT NULL, t2 text NOT NULL, m2 macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, vec!["m1", "t2", "t1", "m2"]);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 4 }));
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
+    }
+
+    #[test]
     fn many_class_table_keeps_the_fixed_prefix_win() {
         // 10 distinct fixed padding classes (via assume-type) plus a text: the whole-order
         // search is over budget, and the reviews' false negative was a silent clean checkmark
@@ -1551,6 +1572,101 @@ mod decision_policy {
             "a capped search must not print a silent clean verdict over deterministic waste: {t:#?}"
         );
         assert!(t.avoidable_bytes_per_row > 0.0);
+    }
+}
+
+/// The sweep's completeness, held to brute force: on every schema whose sweep reports
+/// exhaustive, a dominating reorder found by trying all permutations must also be found (and
+/// its best attainable saving matched) by the candidate space. The tmtm class (two same-class
+/// varlenas whose identities must swap) fails this test under the collapsed space.
+mod dominance_completeness_property {
+    use super::src;
+    use crate::layout::{self, ColumnKind};
+    use crate::report::DominanceScope;
+    use crate::{Config, analyze_sources, dominance};
+    use proptest::prelude::*;
+
+    fn best_dominating_saving(kinds: &[ColumnKind], orders: &[Vec<usize>]) -> i64 {
+        let identity: Vec<usize> = (0..kinds.len()).collect();
+        orders
+            .iter()
+            .filter_map(|candidate| dominance::compare(kinds, &identity, candidate))
+            .filter(|diff| diff.b_dominates())
+            .map(|diff| diff.max)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn all_permutations(n: usize) -> Vec<Vec<usize>> {
+        let mut out = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        let mut used = vec![false; n];
+        fn go(n: usize, current: &mut Vec<usize>, used: &mut Vec<bool>, out: &mut Vec<Vec<usize>>) {
+            if current.len() == n {
+                out.push(current.clone());
+                return;
+            }
+            for i in 0..n {
+                if !used[i] {
+                    used[i] = true;
+                    current.push(i);
+                    go(n, current, used, out);
+                    current.pop();
+                    used[i] = false;
+                }
+            }
+        }
+        go(n, &mut current, &mut used, &mut out);
+        out
+    }
+
+    const POOL: [(&str, &str); 7] = [
+        ("boolean", "f1c"),
+        ("smallint", "f2s"),
+        ("integer", "f4i"),
+        ("bigint", "f8d"),
+        ("macaddr", "f6i"),
+        ("text", "vi"),
+        ("float8[]", "vd"),
+    ];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn exhaustive_sweeps_match_brute_force_permutations(
+            picks in proptest::collection::vec(0usize..POOL.len(), 3..=5)
+                .prop_filter("at most 3 varlenas keeps brute-force comparisons enumerable", |picks| {
+                    picks.iter().filter(|&&k| POOL[k].1.starts_with('v')).count() <= 3
+                })
+        ) {
+            let cols: Vec<String> = picks
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| format!("c{i} {} NOT NULL", POOL[k].0))
+                .collect();
+            let sql = format!("CREATE TABLE p ({});", cols.join(", "));
+            let a = analyze_sources(&[src("V1__p.sql", &sql)], &Config::default());
+            let t = &a.tables[0];
+            let kinds: Vec<ColumnKind> = t.columns.iter().map(|c| c.kind).collect();
+            prop_assume!(kinds.iter().any(|k| !k.is_fixed()));
+            let brute = best_dominating_saving(&kinds, &all_permutations(kinds.len()));
+            let space = layout::order_space(&kinds, 5040).expect("small tables fit the cap");
+            let in_space = best_dominating_saving(&kinds, &space);
+            prop_assert_eq!(
+                in_space,
+                brute,
+                "the candidate space must attain the brute-force best saving: {}",
+                sql
+            );
+            if t.dominance_search == DominanceScope::Exhaustive {
+                prop_assert_eq!(
+                    brute > 0,
+                    t.avoidable_bytes_per_row > 0.0,
+                    "an exhaustive verdict must agree with brute force on whether a dominating reorder exists: {}",
+                    sql
+                );
+            }
+        }
     }
 }
 
@@ -1599,6 +1715,8 @@ mod varlena_residue_uncertainty {
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
         assert!(t.frontier.is_none(), "the control table is its own minimax pole");
-        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
+        // Five individually-distinct texts put the exhaustive sweep out of budget; the clean
+        // verdict must say so instead of claiming nonexistence.
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Budgeted);
     }
 }

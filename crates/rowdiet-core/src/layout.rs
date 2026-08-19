@@ -481,14 +481,43 @@ fn fixed_class_count(kinds: &[ColumnKind]) -> usize {
     keys.len()
 }
 
-/// Every distinct padding-class sequence over `kinds`, materialized as index orders
-/// (interchangeable columns keep their original relative order), or None when the space
-/// exceeds `cap`. Two orders with the same class sequence pad identically in every
-/// realization, so this space is dominance-complete: if any reorder dominates a given order,
-/// some member of this space does.
+/// A dominance-complete candidate space over `kinds`, or None when it exceeds `cap`.
+///
+/// Fixed columns of one padding class are pointwise interchangeable: they carry no realization
+/// variable, and their pads depend only on (alignment, len mod 8) and the offset residue, so
+/// swapping two of them changes no realization's padding and one representative arrangement
+/// (original relative order) stands for all. Varlenas get no such collapse: a realization
+/// assigns each varlena column its own payload, so swapping two same-class varlena columns
+/// permutes that assignment and changes padding pointwise (measured: in
+/// (t1, m1, t2, m2) the order (m1, t2, t1, m2) dominates while its class-sequence twin
+/// (m1, t1, t2, m2) can be 4 B/row worse). Every varlena is therefore its own singleton class
+/// here, which makes the space pointwise-complete: if any reorder dominates a given order,
+/// some member of this space attains identical padding in every realization.
 pub fn order_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> {
     let identity: Vec<usize> = (0..kinds.len()).collect();
-    let classes = padding_classes(kinds, &identity);
+    let mut classes: Vec<PaddingClass> = Vec::new();
+    for &index in &identity {
+        match kinds[index] {
+            ColumnKind::Fixed { len, align } => {
+                let key = ClassKey::Fixed {
+                    align: align.bytes(),
+                    len_mod: len % MAXALIGN,
+                };
+                match classes.iter_mut().find(|c| c.key == key) {
+                    Some(class) => class.members.push(index),
+                    None => classes.push(PaddingClass {
+                        key,
+                        members: vec![index],
+                    }),
+                }
+            }
+            // One class per varlena column: payload identity forbids the collapse.
+            ColumnKind::Varlena { align, .. } => classes.push(PaddingClass {
+                key: ClassKey::Varlena { align: align.bytes() },
+                members: vec![index],
+            }),
+        }
+    }
     let mut sequences: usize = 1;
     let mut remaining = kinds.len();
     for class in &classes {
