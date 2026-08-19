@@ -259,19 +259,34 @@ fn fixtures() -> Vec<Fixture> {
     // to the proven range.
     let mut m23 = Vec::new();
     for i in 0..6u32 {
-        m23.push(Column { name: Box::leak(format!("tz{i}").into_boxed_str()), sql_type: "timetz" });
+        m23.push(Column {
+            name: Box::leak(format!("tz{i}").into_boxed_str()),
+            sql_type: "timetz",
+        });
     }
     for i in 0..6u32 {
-        m23.push(Column { name: Box::leak(format!("mm{i}").into_boxed_str()), sql_type: "macaddr" });
+        m23.push(Column {
+            name: Box::leak(format!("mm{i}").into_boxed_str()),
+            sql_type: "macaddr",
+        });
     }
     for i in 0..5u32 {
-        m23.push(Column { name: Box::leak(format!("bb{i}").into_boxed_str()), sql_type: "bigint" });
+        m23.push(Column {
+            name: Box::leak(format!("bb{i}").into_boxed_str()),
+            sql_type: "bigint",
+        });
     }
     for i in 0..3u32 {
-        m23.push(Column { name: Box::leak(format!("ss{i}").into_boxed_str()), sql_type: "smallint" });
+        m23.push(Column {
+            name: Box::leak(format!("ss{i}").into_boxed_str()),
+            sql_type: "smallint",
+        });
     }
     for i in 0..3u32 {
-        m23.push(Column { name: Box::leak(format!("tt{i}").into_boxed_str()), sql_type: "text" });
+        m23.push(Column {
+            name: Box::leak(format!("tt{i}").into_boxed_str()),
+            sql_type: "text",
+        });
     }
     out.push(Fixture {
         name: "m23",
@@ -578,7 +593,16 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     // Property (c), band half: every declared band winner must hold on a workload derived from
     // that band's long_form set. Mislabeling a single band fails the run.
     if let (Some(alt_cols), true) = (&alt, table_report["frontier"].is_object()) {
-        verify_bands(pg, fixture, table_report, &current, alt_cols, &cur_table, &alt_table, failures);
+        verify_bands(
+            pg,
+            fixture,
+            table_report,
+            &current,
+            alt_cols,
+            &cur_table,
+            &alt_table,
+            failures,
+        );
     }
 }
 
@@ -625,8 +649,11 @@ fn verify_bands(
         let mut band_means = [0.0f64; 2];
         for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
             let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
-            pg.query(&format!("TRUNCATE {table};
-{insert}")).expect("band insert");
+            pg.query(&format!(
+                "TRUNCATE {table};
+{insert}"
+            ))
+            .expect("band insert");
             band_means[index] = measure_table(pg, table, columns, None).mean;
         }
         let [cur_mean, alt_mean] = band_means;
@@ -634,7 +661,11 @@ fn verify_bands(
         println!(
             "| {} | band | {} -> {winner} | - | cur {cur_mean:.3} vs alt {alt_mean:.3} | 1200 |",
             fixture.name,
-            if long_form.is_empty() { "all short".to_string() } else { long_form.join("+") },
+            if long_form.is_empty() {
+                "all short".to_string()
+            } else {
+                long_form.join("+")
+            },
         );
         let holds = match winner {
             "alternative" => alt_mean <= cur_mean + 0.05,
