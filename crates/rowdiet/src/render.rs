@@ -1,7 +1,7 @@
 //! Output renderers: human text, GitHub Actions annotations, JSON.
 
 use rowdiet_core::layout::SearchScope;
-use rowdiet_core::report::{BandWinner, Frontier};
+use rowdiet_core::report::{BandWinner, DominanceScope, Frontier};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -142,10 +142,11 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     }
     let _ = writeln!(
         out,
-        "■ {} ({loc}) — {} columns — {}",
+        "■ {} ({loc}) — {} columns — {}{}",
         t.display,
         t.natts,
-        tier_label(t.tier)
+        tier_label(t.tier),
+        scope_note(t)
     );
     let _ = writeln!(out, "  current  : {}", stats_line(&t.current));
     let basis = match t.dominance_saving {
@@ -163,11 +164,24 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     );
     let _ = writeln!(out, "  order    : {}", t.suggested_order.join(", "));
     if let Some(n) = rows {
-        let _ = writeln!(
-            out,
-            "  × {n} rows ≈ {}",
-            human_bytes(t.avoidable_bytes_per_row * n as f64)
-        );
+        // A dominance finding is a range; extrapolating only its maximum would overstate it.
+        match t.dominance_saving {
+            Some(saving) if saving.min != saving.max => {
+                let _ = writeln!(
+                    out,
+                    "  × {n} rows ≈ {} to {}",
+                    human_bytes(saving.min as f64 * n as f64),
+                    human_bytes(saving.max as f64 * n as f64)
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  × {n} rows ≈ {}",
+                    human_bytes(t.avoidable_bytes_per_row * n as f64)
+                );
+            }
+        }
     }
     render_flags(out, t);
     render_verdict(out, t, verdict);
@@ -210,12 +224,11 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
     }
 }
 
-/// The clean-table phrase: honest about what the search proved and what it could not check.
+/// The clean-table phrase: an exhaustive sweep proves absence, a budgeted one only reports it.
 fn verdict_phrase(t: &TableReport) -> &'static str {
-    if t.dominance_evaluated {
-        "no dominating reorder found"
-    } else {
-        "dominance not fully evaluated (too many varlenas)"
+    match t.dominance_search {
+        DominanceScope::Exhaustive => "no dominating reorder exists",
+        DominanceScope::Budgeted => "no dominating reorder found (dominance search budgeted)",
     }
 }
 
@@ -254,7 +267,12 @@ fn render_frontier(out: &mut String, t: &TableReport) {
         );
         return;
     }
+    let printable = frontier.bands.iter().filter(|b| b.winner != BandWinner::Tie).count();
+    let mut printed = 0usize;
     for band in &frontier.bands {
+        if printed >= FRONTIER_BAND_LINE_CAP {
+            break;
+        }
         let condition = match band.long_form.as_slice() {
             [] => "when every varlena stays short or TOAST".to_string(),
             [one] => format!("when {one} stores long form"),
@@ -277,10 +295,22 @@ fn render_frontier(out: &mut String, t: &TableReport) {
         };
         if let Some(line) = line {
             let _ = writeln!(out, "             {line}");
+            printed += 1;
         }
+    }
+    if printable > printed {
+        let _ = writeln!(
+            out,
+            "             ... {} further band(s) elided (all bands are in --format json)",
+            printable - printed
+        );
     }
     let _ = render_frontier_assumption_free(out, frontier);
 }
+
+/// Decision-boundary lines shown before the block elides into a summary: past this a band
+/// listing carries no decision the reader can hold in their head.
+const FRONTIER_BAND_LINE_CAP: usize = 6;
 
 /// Frontier bands carry no model assumption, but say so once to keep the block self-contained.
 fn render_frontier_assumption_free(out: &mut String, frontier: &Frontier) -> std::fmt::Result {
@@ -410,11 +440,16 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "rowdiet modified-since-baseline",
             _ => "rowdiet",
         };
+        let saving = match t.dominance_saving {
+            Some(range) => format!("saves {}-{} B/row in every realization; ", range.min, range.max),
+            None => String::new(),
+        };
         let message = format!(
-            "table {}: {:.1} B/row avoidable ({}) — suggested order: {}",
+            "table {}: {:.1} B/row avoidable ({saving}{}{}) — suggested order: {}",
             t.name,
             t.avoidable_bytes_per_row,
             tier_label(t.tier),
+            scope_note(t),
             t.suggested_order.join(", ")
         );
         budget.emit(
@@ -532,8 +567,11 @@ impl AnnotationBudget {
 pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## rowdiet\n");
-    let _ = writeln!(out, "| table | avoidable B/row | tier | verdict | origin |");
-    let _ = writeln!(out, "|---|---:|---|---|---|");
+    let _ = writeln!(
+        out,
+        "| table | avoidable B/row | saves B/row | scope | tier | verdict | origin |"
+    );
+    let _ = writeln!(out, "|---|---:|---|---|---|---|---|");
     for t in &analysis.tables {
         if t.ignored {
             continue;
@@ -554,9 +592,30 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
             Tier::Estimate => "estimate",
             Tier::Unknown => "unknown",
         };
+        let verdict = match &t.frontier {
+            Some(frontier) => format!(
+                "{verdict} (frontier: {} — worst {} vs {})",
+                markdown_cell(&frontier.order.join(", ")),
+                frontier.alternative_worst,
+                frontier.current_worst
+            ),
+            None => verdict,
+        };
+        let saving = match t.dominance_saving {
+            Some(range) => format!("{}-{}", range.min, range.max),
+            None => "-".to_string(),
+        };
+        let scope = match t.search_scope {
+            SearchScope::Complete => match t.dominance_search {
+                DominanceScope::Exhaustive => "complete",
+                DominanceScope::Budgeted => "complete (dominance budgeted)",
+            },
+            SearchScope::FixedPrefix => "capped: fixed prefix",
+            SearchScope::SortOnly => "capped: sort only",
+        };
         let _ = writeln!(
             out,
-            "| {} | {:.1} | {tier} | {verdict} | {}:{} |",
+            "| {} | {:.1} | {saving} | {scope} | {tier} | {verdict} | {}:{} |",
             markdown_cell(&t.display),
             t.avoidable_bytes_per_row,
             markdown_cell(&t.origin.source),
@@ -600,15 +659,18 @@ fn markdown_cell(s: &str) -> String {
 }
 
 pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> Result<String, String> {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "rowdiet": env!("CARGO_PKG_VERSION"),
         "fail_over": fail_over,
         "gate_exceeded": gate.exceeded,
-        // Estimate-tier numbers are meaningless without their model; state it in the payload.
-        "estimate_assumptions": ESTIMATE_LABEL,
         "gate": serde_json::to_value(gate).map_err(|e| e.to_string())?,
         "analysis": serde_json::to_value(analysis).map_err(|e| e.to_string())?,
     });
+    // Estimate-tier numbers are meaningless without their model; state it in the payload
+    // whenever such a table is present.
+    if analysis.tables.iter().any(|t| !t.ignored && t.tier == Tier::Estimate) {
+        value["estimate_assumptions"] = serde_json::Value::String(ESTIMATE_LABEL.to_string());
+    }
     serde_json::to_string_pretty(&value)
         .map(|s| s + "\n")
         .map_err(|e| e.to_string())

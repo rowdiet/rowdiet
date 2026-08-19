@@ -1383,9 +1383,9 @@ mod decision_policy {
 
     #[test]
     fn capped_search_still_gates_deterministic_waste() {
-        // The 25-column false negative: past the whole-order budget the fixed prefix is still
-        // searched exactly, the suffix-preserving repack dominates, and the gate fires at the
-        // full 24 B/row (both prior PRs' review blocker).
+        // The 25-column false negative: with the redundant column cap dropped, the whole-order
+        // search runs (its state space fits the budget), the repack dominates, and the gate
+        // fires at the full 24 B/row (both prior PRs' review blocker).
         let mut cols: Vec<String> = Vec::new();
         for i in 0..4 {
             cols.push(format!("tz{i} timetz NOT NULL"));
@@ -1413,14 +1413,15 @@ mod decision_policy {
         assert_eq!(t.current.padding, 24);
         assert_eq!(t.avoidable_bytes_per_row, 24.0);
         assert_eq!(t.avoidable_deterministic, 24);
-        assert_eq!(t.search_scope, SearchScope::FixedPrefix, "the cap must be labeled");
+        assert_eq!(t.search_scope, SearchScope::Complete);
         assert_eq!(t.dominance_saving, Some(SavingRange { min: 24, max: 24 }));
     }
 
     #[test]
-    fn wide_fixed_table_keeps_the_base_refinement_past_the_budget() {
-        // 21 bigints push the state space over the whole-order budget; the block search still
-        // repacks the two timetz around the smallint and dominance still proves the win.
+    fn wide_fixed_table_keeps_its_refinement_at_25_columns() {
+        // 25 columns, few classes: a column-count cap would skip the search here (a measured
+        // false negative of an earlier revision); the state budget admits it and the repack
+        // around the smallint is dominance-proven.
         let mut cols: Vec<String> = (0..21).map(|i| format!("b{i} bigint NOT NULL")).collect();
         cols.push("t1 timetz NOT NULL".into());
         cols.push("t2 timetz NOT NULL".into());
@@ -1433,7 +1434,82 @@ mod decision_policy {
         assert_eq!(t.avoidable_bytes_per_row, 4.0);
         assert_eq!(t.avoidable_deterministic, 2);
         assert_eq!(t.avoidable_dominance, 2);
-        assert_eq!(t.search_scope, SearchScope::FixedPrefix);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+    }
+
+    #[test]
+    fn dominating_reorder_outside_the_poles_is_found_by_the_sweep() {
+        // (text, bigint, macaddr): no scalar-objective pole proposes (bigint, text, macaddr),
+        // yet it dominates (measured 1.5 vs 3.5 short-heavy, 1.5 vs 3.5 long-heavy, 0 vs 0 on
+        // fixed 132-byte texts). The reviews clocked pole-only search missing 11-19% of
+        // dominating reorders on 4-5 column schemas; the exhaustive sweep closes the class.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, k bigint NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, vec!["k", "t", "m"]);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 4 }));
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn headline_never_exceeds_the_proven_maximum_saving() {
+        // 23 columns of irregulars and texts: the dominating repack removes 28 B of certain
+        // padding but pays new data-dependent pads, so only 24 B is attainable. The headline
+        // must equal the proven maximum instead of the raw certain-pad delta (a measured
+        // self-contradiction in an earlier revision: 28.0 next to "saves 8-24").
+        let mut cols: Vec<String> = Vec::new();
+        for i in 0..6 {
+            cols.push(format!("tz{i} timetz NOT NULL"));
+        }
+        for i in 0..6 {
+            cols.push(format!("m{i} macaddr NOT NULL"));
+        }
+        for i in 0..5 {
+            cols.push(format!("b{i} bigint NOT NULL"));
+        }
+        for i in 0..3 {
+            cols.push(format!("s{i} smallint NOT NULL"));
+        }
+        for i in 0..3 {
+            cols.push(format!("t{i} text NOT NULL"));
+        }
+        let sql = format!("CREATE TABLE m23 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__m23.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        let saving = t.dominance_saving.unwrap();
+        assert!(
+            t.avoidable_bytes_per_row <= saving.max as f64,
+            "headline {} exceeds the proven maximum {}",
+            t.avoidable_bytes_per_row,
+            saving.max
+        );
+        assert_eq!(t.avoidable_bytes_per_row, 24.0);
+        assert_eq!((saving.min, saving.max), (8, 24));
+        assert_eq!(t.avoidable_deterministic + t.avoidable_dominance, saving.max);
+    }
+
+    #[test]
+    fn one_extra_column_no_longer_flips_a_finding_to_a_pass() {
+        // 25 columns, tiny state space: a fixed column-count cap silently passed this table at
+        // exactly 25 columns while 24 gated 7.0 (a measured cliff); the budget-only cap keeps
+        // the finding.
+        let mut cols = vec!["t text NOT NULL".to_string(), "b boolean NOT NULL".to_string()];
+        for i in 0..23 {
+            cols.push(format!("x{i} bigint NOT NULL"));
+        }
+        let sql = format!("CREATE TABLE s25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__s25.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 25);
+        assert_eq!(t.avoidable_bytes_per_row, 7.0);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+        assert_eq!(t.suggested_order.last().map(String::as_str), Some("b"));
     }
 
     #[test]
@@ -1523,6 +1599,6 @@ mod varlena_residue_uncertainty {
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
         assert!(t.frontier.is_none(), "the control table is its own minimax pole");
-        assert!(t.dominance_evaluated);
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
     }
 }

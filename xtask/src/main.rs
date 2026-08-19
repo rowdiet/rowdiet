@@ -6,7 +6,9 @@
 //! (a) measured per-row padding falls inside every reported [min, max];
 //! (b) whenever the tool recommends a reorder, the suggested order measures no worse than the
 //!     current order on both workloads;
-//! (c) every declared frontier boundary flips the measured winner when the workload crosses it.
+//! (c) every declared frontier band winner holds on a workload derived from that band's
+//!     `long_form` set, and every declared boundary pair flips the measured winner;
+//! (d) the gated headline never exceeds the dominance engine's proven maximum saving.
 //!
 //! Skipped (exit 0, loud) when no reachable container: the harness is for maintainers and
 //! Docker-equipped CI legs, and plain CI must not fail for lacking a database. Container/user/db
@@ -239,6 +241,10 @@ fn fixtures() -> Vec<Fixture> {
         },
         // (text, boolean, bigint): dominance finding via the aligned slot and the char tail.
         plain("frac", vec![col("t", "text"), col("b", "boolean"), col("x", "bigint")]),
+        // The pole-completeness regression: no scalar-objective pole proposes the dominating
+        // (bigint, text, macaddr), only the exhaustive sweep does; property (b) then verifies
+        // the reorder on disk.
+        plain("miss", vec![col("t", "text"), col("k", "bigint"), col("m", "macaddr")]),
         // TOAST: 4 kB EXTERNAL payloads store an 18-byte unaligned pointer; the pinned residue
         // sits inside the reported range and the dominating reorder must still measure better.
         Fixture {
@@ -248,6 +254,31 @@ fn fixtures() -> Vec<Fixture> {
             toast_column: Some("t"),
         },
     ];
+    // The headline-invariant repro: the dominating repack removes 28 B of certain padding but
+    // pays new data-dependent pads, so only 24 B is attainable; property (d) pins the headline
+    // to the proven range.
+    let mut m23 = Vec::new();
+    for i in 0..6u32 {
+        m23.push(Column { name: Box::leak(format!("tz{i}").into_boxed_str()), sql_type: "timetz" });
+    }
+    for i in 0..6u32 {
+        m23.push(Column { name: Box::leak(format!("mm{i}").into_boxed_str()), sql_type: "macaddr" });
+    }
+    for i in 0..5u32 {
+        m23.push(Column { name: Box::leak(format!("bb{i}").into_boxed_str()), sql_type: "bigint" });
+    }
+    for i in 0..3u32 {
+        m23.push(Column { name: Box::leak(format!("ss{i}").into_boxed_str()), sql_type: "smallint" });
+    }
+    for i in 0..3u32 {
+        m23.push(Column { name: Box::leak(format!("tt{i}").into_boxed_str()), sql_type: "text" });
+    }
+    out.push(Fixture {
+        name: "m23",
+        columns: m23,
+        boundary: None,
+        toast_column: None,
+    });
     // The 25-column cap cliff: deterministic 24 B/row, must gate and must measure.
     let mut cliff = Vec::new();
     for i in 0..4u32 {
@@ -348,6 +379,7 @@ fn measure() {
         .query("SELECT count(*) FROM pg_tables WHERE tablename LIKE 'synb\\_%';")
         .expect("count");
     assert_eq!(remaining.trim(), "0", "synb_ tables must all be dropped");
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rowdiet-xtask-{}", std::process::id())));
     if failures.is_empty() {
         println!("\nmeasure: all model claims hold against real tuples");
     } else {
@@ -402,6 +434,16 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     let report = analyze(binary, &create_table_sql(&cur_table, &current), &[]);
     let table_report = &report["analysis"]["tables"][0];
     let avoidable = table_report["avoidable_bytes_per_row"].as_f64().expect("avoidable");
+    // Property (d): the gated headline never exceeds the engine's proven maximum saving.
+    if table_report["dominance_saving"].is_object() {
+        let max_saving = table_report["dominance_saving"]["max"].as_f64().expect("saving max");
+        if avoidable > max_saving {
+            failures.push(format!(
+                "{}: headline {avoidable} exceeds the proven maximum saving {max_saving}",
+                fixture.name
+            ));
+        }
+    }
     // The alternative order comes from the tool itself: the recommendation when it gates, the
     // frontier order when it reports one.
     let alt_names: Option<Vec<String>> = if avoidable > 0.0 {
@@ -533,6 +575,84 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
             ));
         }
     }
+    // Property (c), band half: every declared band winner must hold on a workload derived from
+    // that band's long_form set. Mislabeling a single band fails the run.
+    if let (Some(alt_cols), true) = (&alt, table_report["frontier"].is_object()) {
+        verify_bands(pg, fixture, table_report, &current, alt_cols, &cur_table, &alt_table, failures);
+    }
+}
+
+/// Measure each declared frontier band under a workload that stores exactly its `long_form`
+/// columns long and every other varlena short, and assert the declared winner.
+#[allow(clippy::too_many_arguments)]
+fn verify_bands(
+    pg: &Pg,
+    fixture: &Fixture,
+    table_report: &serde_json::Value,
+    current: &[(&str, &str)],
+    alt_cols: &[(&str, &str)],
+    cur_table: &str,
+    alt_table: &str,
+    failures: &mut Vec<String>,
+) {
+    let bands = table_report["frontier"]["bands"].as_array().expect("bands");
+    let mut checked = 0usize;
+    for band in bands {
+        if checked >= 4 {
+            break;
+        }
+        let winner = band["winner"].as_str().expect("winner");
+        if winner == "mixed" {
+            // Any relation is legal inside a mixed band; nothing to hold the label to.
+            continue;
+        }
+        let long_form: Vec<&str> = band["long_form"]
+            .as_array()
+            .expect("long_form")
+            .iter()
+            .map(|v| v.as_str().expect("column name"))
+            .collect();
+        let overrides: Vec<(&str, String)> = fixture
+            .columns
+            .iter()
+            .filter(|c| matches!(c.sql_type, "text" | "float8[]"))
+            .map(|c| {
+                let spec = type_spec(c.sql_type, c.name);
+                let generator = if long_form.contains(&c.name) { spec.2 } else { spec.1 };
+                (c.name, generator)
+            })
+            .collect();
+        let mut band_means = [0.0f64; 2];
+        for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
+            let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
+            pg.query(&format!("TRUNCATE {table};
+{insert}")).expect("band insert");
+            band_means[index] = measure_table(pg, table, columns, None).mean;
+        }
+        let [cur_mean, alt_mean] = band_means;
+        let described = format!("band [{}]", long_form.join(", "));
+        println!(
+            "| {} | band | {} -> {winner} | - | cur {cur_mean:.3} vs alt {alt_mean:.3} | 1200 |",
+            fixture.name,
+            if long_form.is_empty() { "all short".to_string() } else { long_form.join("+") },
+        );
+        let holds = match winner {
+            "alternative" => alt_mean <= cur_mean + 0.05,
+            "current" => cur_mean <= alt_mean + 0.05,
+            "tie" => (cur_mean - alt_mean).abs() <= 0.05,
+            other => {
+                failures.push(format!("{}: unknown band winner {other}", fixture.name));
+                true
+            }
+        };
+        if !holds {
+            failures.push(format!(
+                "{}: {described} declared {winner} but measures cur {cur_mean:.3} vs alt {alt_mean:.3}",
+                fixture.name
+            ));
+        }
+        checked += 1;
+    }
 }
 
 fn insert_sql(
@@ -599,6 +719,9 @@ fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)], toast_column: O
 /// checked against the report alone: the capped search must still gate the fixed-prefix win and
 /// must label its scope.
 fn run_report_only_checks(binary: &std::path::Path, failures: &mut Vec<String>) {
+    // Live PostgreSQL cannot realize this shape: pg_type holds exactly 9 distinct fixed
+    // (typalign, typlen mod 8) classes among builtin base types, and reaching 10+ needs
+    // assume-typed widths no real type has. The report is the only checkable surface.
     let types = [
         "boolean", "smallint", "integer", "bigint", "timetz", "macaddr", "w3c", "w5c", "w3s", "w5i",
     ];

@@ -408,9 +408,10 @@ pub struct Search {
     pub scope: SearchScope,
 }
 
-/// Whole-order state budget: Π(class count + 1) × 15 set states. Past it the exact search
-/// degrades to the fixed-prefix search, keeping worst-case wall time at the pre-existing
-/// fixed-block level instead of the multi-second corner a 12-class 24-column table reaches.
+/// Whole-order state budget: Π(class count + 1) × 15 set states, which is also the exact size
+/// of the dense memo the search allocates (8 bytes per state). Past it the exact search
+/// degrades to the fixed-prefix search. The budget is the only cost cap: a column-count cap
+/// would be redundant with it and was measured to cost a real finding at exactly 25 columns.
 const WHOLE_ORDER_STATE_BUDGET: usize = 1 << 20;
 
 /// Run the order search: the heuristic pole always, and the two exact lexicographic poles when
@@ -436,9 +437,9 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
         .map(|c| c.members.len() + 1)
         .try_fold(SET_STATES, usize::checked_mul)
         .unwrap_or(usize::MAX);
-    if kinds.len() <= 24 && states <= WHOLE_ORDER_STATE_BUDGET {
-        let certainty = lex_min_order(&classes, kinds.len(), LexMode::CertaintyFirst, states);
-        let minimax = lex_min_order(&classes, kinds.len(), LexMode::WorstCaseFirst, states);
+    if states <= WHOLE_ORDER_STATE_BUDGET {
+        let certainty = run_dp(&classes, kinds.len(), LexMode::CertaintyFirst);
+        let minimax = run_dp(&classes, kinds.len(), LexMode::WorstCaseFirst);
         // The heuristic pole keeps the fixed-prefix refinement so it stays a usable candidate.
         refine_fixed_block(kinds, &mut heuristic);
         return Search {
@@ -480,6 +481,77 @@ fn fixed_class_count(kinds: &[ColumnKind]) -> usize {
     keys.len()
 }
 
+/// Every distinct padding-class sequence over `kinds`, materialized as index orders
+/// (interchangeable columns keep their original relative order), or None when the space
+/// exceeds `cap`. Two orders with the same class sequence pad identically in every
+/// realization, so this space is dominance-complete: if any reorder dominates a given order,
+/// some member of this space does.
+pub fn order_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> {
+    let identity: Vec<usize> = (0..kinds.len()).collect();
+    let classes = padding_classes(kinds, &identity);
+    let mut sequences: usize = 1;
+    let mut remaining = kinds.len();
+    for class in &classes {
+        sequences = sequences.checked_mul(binomial(remaining, class.members.len(), cap)?)?;
+        if sequences > cap {
+            return None;
+        }
+        remaining -= class.members.len();
+    }
+    let mut queues: Vec<std::collections::VecDeque<usize>> =
+        classes.iter().map(|c| c.members.iter().copied().collect()).collect();
+    let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
+    let mut out = Vec::with_capacity(sequences);
+    let mut current = Vec::with_capacity(kinds.len());
+    generate_orders(&mut queues, &mut counts, kinds.len(), &mut current, &mut out);
+    Some(out)
+}
+
+/// C(n, k), or None past `cap` (the caller cannot use a larger space anyway).
+fn binomial(n: usize, k: usize, cap: usize) -> Option<usize> {
+    let mut result: usize = 1;
+    for i in 0..k.min(n - k) {
+        result = result.checked_mul(n - i)? / (i + 1);
+        if result > cap.saturating_mul(1 << 10) {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn generate_orders(
+    queues: &mut [std::collections::VecDeque<usize>],
+    counts: &mut [usize],
+    remaining: usize,
+    current: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if remaining == 0 {
+        out.push(current.clone());
+        return;
+    }
+    for class_index in 0..counts.len() {
+        if counts[class_index] == 0 {
+            continue;
+        }
+        counts[class_index] -= 1;
+        let column = queues[class_index].pop_front().expect("count tracked");
+        current.push(column);
+        generate_orders(queues, counts, remaining - 1, current, out);
+        current.pop();
+        queues[class_index].push_front(column);
+        counts[class_index] += 1;
+    }
+}
+
+/// Repack the leading fixed run of `order` to its deterministic minimum, leaving everything
+/// from the first varlena on untouched. With the suffix preserved, any prefix improvement
+/// dominates the original order (the never-negative-recovery induction), which makes this the
+/// decision policy's always-safe repair candidate.
+pub fn refine_leading_fixed(kinds: &[ColumnKind], order: &mut [usize]) {
+    refine_fixed_block(kinds, order);
+}
+
 /// Descending-alignment sorting leaves the fixed block zero-padding for most schemas, but with
 /// two or more irregulars (timetz, macaddr, …) it can keep padding an interposed smaller column
 /// would absorb. When the sorted fixed block still pads, find the exact minimum over the block:
@@ -501,21 +573,10 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     if classes.len() > 12 {
         return;
     }
-    let states: usize = classes
-        .iter()
-        .map(|c| c.members.len() + 1)
-        .product::<usize>()
-        .saturating_mul(MAXALIGN as usize)
-        .min(1 << 17);
     // An all-fixed block walks singleton states only, where deterministic and worst-case pads
     // coincide, so either lexicographic mode reproduces the plain padding minimum.
-    let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst, states);
+    let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst);
     order[..fixed_len].copy_from_slice(&refined);
-}
-
-/// Exact lexicographic minimization over whole orders.
-fn lex_min_order(classes: &[PaddingClass], total: usize, mode: LexMode, states: usize) -> Vec<usize> {
-    run_dp(classes, total, mode, states)
 }
 
 /// The two lexicographic objectives the policy needs. Both components are additive per
@@ -533,11 +594,21 @@ enum LexMode {
 /// 24 columns × 7 bytes = 168, far under the 512 radix.
 const LEX_RADIX: u64 = 512;
 
-fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode, states: usize) -> Vec<usize> {
+fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
+    // Mixed-radix strides over the class counts: every (counts, set state) combination maps to
+    // one dense memo slot, so the memo is a flat Vec of exactly the state-space bound (8 bytes
+    // per state) with no hashing and no rehash growth.
+    let mut strides = Vec::with_capacity(classes.len());
+    let mut bound = SET_STATES;
+    for class in classes {
+        strides.push(bound);
+        bound *= class.members.len() + 1;
+    }
     let mut dp = Dp {
         classes,
         mode,
-        memo: std::collections::HashMap::with_capacity_and_hasher(states.min(1 << 17), PackedKeyHasherBuilder),
+        strides,
+        memo: vec![u64::MAX; bound],
     };
     let mut counts: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
     let mut remaining = total;
@@ -680,22 +751,27 @@ fn pad_pow2(offset: u64, align: u64) -> u64 {
 struct Dp<'a> {
     classes: &'a [PaddingClass],
     mode: LexMode,
-    memo: std::collections::HashMap<u128, u64, PackedKeyHasherBuilder>,
+    /// Mixed-radix strides per class; slot = set_state_index + Σ counts[i] × strides[i].
+    strides: Vec<usize>,
+    /// Dense memo over every (counts, set state) combination; u64::MAX marks unvisited. Costs
+    /// stay far below the sentinel (at most columns × 7 bytes per lexicographic component).
+    memo: Vec<u64>,
 }
 
 impl Dp<'_> {
-    /// `remaining` is the sum of `counts`, carried so the all-placed base case is O(1). The
-    /// state packs into one u128: up to 24 classes of 5 bits each plus the residue-set state
-    /// (4 bits) — the memo never hashes heap data.
+    /// `remaining` is the sum of `counts`, carried so the all-placed base case is O(1).
     fn min_lex(&mut self, counts: &mut [u8], remaining: usize, set: Residues) -> u64 {
         if remaining == 0 {
             return 0;
         }
-        let key = counts
+        let slot = counts
             .iter()
-            .fold(u128::from(set_state_index(set)), |k, &c| (k << 5) | u128::from(c));
-        if let Some(&cached) = self.memo.get(&key) {
-            return cached;
+            .zip(&self.strides)
+            .fold(set_state_index(set) as usize, |acc, (&c, &stride)| {
+                acc + c as usize * stride
+            });
+        if self.memo[slot] != u64::MAX {
+            return self.memo[slot];
         }
         let mut best = u64::MAX;
         for class_index in 0..self.classes.len() {
@@ -709,43 +785,8 @@ impl Dp<'_> {
             counts[class_index] += 1;
             best = best.min(total);
         }
-        self.memo.insert(key, best);
+        self.memo[slot] = best;
         best
-    }
-}
-
-/// Multiply-shift hasher for the already-packed DP key — SipHash overhead is measurable at the
-/// memo's probe volume, and the key needs mixing only, not DoS resistance (it never hashes
-/// attacker-controlled data; the state space is capped).
-#[derive(Default)]
-struct PackedKeyHasherBuilder;
-
-impl std::hash::BuildHasher for PackedKeyHasherBuilder {
-    type Hasher = PackedKeyHasher;
-
-    fn build_hasher(&self) -> PackedKeyHasher {
-        PackedKeyHasher(0)
-    }
-}
-
-struct PackedKeyHasher(u64);
-
-impl std::hash::Hasher for PackedKeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {
-        unreachable!("only u128 keys are hashed");
-    }
-
-    fn write_u128(&mut self, n: u128) {
-        // Fibonacci multiplier per half, then fold: the table indexes by the low hash bits, and
-        // a bare multiply leaves keys that differ only in high fields colliding into one bucket.
-        let lo = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let hi = ((n >> 64) as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        let h = lo ^ hi.rotate_left(32);
-        self.0 = h ^ (h >> 32);
     }
 }
 

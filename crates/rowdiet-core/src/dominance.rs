@@ -69,6 +69,19 @@ const ENUMERATION_BUDGET: u64 = 1 << 21;
 /// frontier is reported without band detail.
 const BAND_LIMIT: usize = 6;
 
+/// Estimated work for [`compare`] in realization-walk units: near-free for a pair sharing its
+/// varlena sequence, the enumeration state count otherwise, and `u64::MAX` when [`compare`]
+/// would return None. Lets a caller ration a comparison budget before spending it.
+pub fn comparison_cost(kinds: &[ColumnKind], a: &[usize], b: &[usize]) -> u64 {
+    let va = varlena_sequence(kinds, a);
+    let vb = varlena_sequence(kinds, b);
+    if va == vb {
+        return (va.len() as u64).max(1) * 64;
+    }
+    let states = enumeration_states(kinds, &va, None);
+    if states <= ENUMERATION_BUDGET { states } else { u64::MAX }
+}
+
 /// Bounds of `pad(a) − pad(b)` over every realization, or None when the pair is out of budget
 /// (varlena sequences differ and the enumeration space is too large).
 pub fn compare(kinds: &[ColumnKind], a: &[usize], b: &[usize]) -> Option<DiffBounds> {

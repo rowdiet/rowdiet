@@ -223,7 +223,7 @@ fn github_step_summary_carries_the_full_report() {
     let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
     for i in 0..13 {
         assert!(
-            summary.contains(&format!("| t{i:02} | 8.0 | exact | **new violation** |")),
+            summary.contains(&format!("| t{i:02} | 8.0 | - | complete | exact | **new violation** |")),
             "{summary}"
         );
     }

@@ -112,10 +112,10 @@ pub struct TableReport {
     /// How much of the order space the suggestion search proved; anything short of complete is
     /// labeled in the rendered output.
     pub search_scope: layout::SearchScope,
-    /// False when a candidate comparison was out of the dominance engine's budget (varlena
-    /// sequences differ and too many varlenas to enumerate): findings may be missed, and the
-    /// output says so instead of printing a clean verdict.
-    pub dominance_evaluated: bool,
+    /// How far the dominance search went: [`DominanceScope::Exhaustive`] proves a clean table
+    /// has no dominating reorder at all; [`DominanceScope::Budgeted`] means findings may have
+    /// been missed, and the output says so instead of printing an unqualified clean verdict.
+    pub dominance_search: DominanceScope,
     /// A workload-dependent alternative order for the reader to weigh: present when no
     /// candidate dominates but one is strictly better somewhere (or by worst case). Reported,
     /// never gated.
@@ -245,23 +245,129 @@ pub enum BandWinner {
     Mixed,
 }
 
+/// How far the dominance search went. Anything short of exhaustive must temper the clean
+/// verdict: an unqualified "no dominating reorder exists" may only follow a completed sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "snake_case"))]
+pub enum DominanceScope {
+    /// Every distinct class sequence was dominance-tested against the current order (a
+    /// candidate failing a necessary condition counts as tested): absence of a finding proves
+    /// no dominating reorder exists.
+    Exhaustive,
+    /// The sweep was skipped or trimmed by its budgets (order space too large, or a comparison
+    /// out of the enumeration budget): a clean verdict claims only what was searched.
+    Budgeted,
+}
+
 /// What the decision policy concluded for one estimate-tier table.
 struct Decision {
     order: Vec<usize>,
     avoidable_deterministic: u64,
     avoidable_dominance: u64,
     dominance_saving: Option<SavingRange>,
-    dominance_evaluated: bool,
+    dominance_search: DominanceScope,
     frontier_order: Option<Vec<usize>>,
 }
 
-/// The estimate-tier decision policy (docs/design.md): gather the search poles, keep only a
-/// candidate that dominates the current order (never worse in any realization), and surface
-/// the best non-dominating candidate as a frontier instead of a recommendation.
+/// The dominance sweep covers every distinct class sequence up to this many candidates.
+const SWEEP_SEQUENCE_CAP: usize = 5040;
+/// Total realization-walk work the sweep may spend on candidate comparisons.
+const SWEEP_WORK_BUDGET: u64 = 1 << 22;
+
+/// The estimate-tier decision policy (docs/design.md): sweep the dominance-complete order
+/// space within budgets, recommend the best dominating order (smallest worst case), and
+/// surface the best non-dominating search pole as a frontier instead of a recommendation.
+/// Scalar-objective poles alone were measured to miss 11-19% of dominating reorders on 4-5
+/// column varlena schemas, which is why the sweep exists.
 fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) -> Decision {
     let n = kinds.len();
     let identity: Vec<usize> = (0..n).collect();
-    let mut candidates: Vec<&Vec<usize>> = Vec::new();
+    let mut dominance_search = DominanceScope::Budgeted;
+    let mut dominating: Vec<(Vec<usize>, crate::dominance::DiffBounds, Walk)> = Vec::new();
+    if let Some(orders) = layout::order_space(kinds, SWEEP_SEQUENCE_CAP) {
+        let mut budget = SWEEP_WORK_BUDGET;
+        let mut complete = true;
+        for candidate in orders {
+            if candidate == identity {
+                continue;
+            }
+            let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
+            let cand_walk = layout::walk(&ordered);
+            // Dominance implies pointwise <=, so it implies <= on the max, the min, and the
+            // uniform mean: candidates failing any of these are proven non-dominating for free.
+            if cand_walk.padding_max() > current_walk.padding_max()
+                || cand_walk.padding_min() > current_walk.padding_min()
+                || cand_walk.expected_padding_eighths() > current_walk.expected_padding_eighths()
+            {
+                continue;
+            }
+            let cost = crate::dominance::comparison_cost(kinds, &identity, &candidate);
+            if cost > budget {
+                complete = false;
+                continue;
+            }
+            budget -= cost;
+            match crate::dominance::compare(kinds, &identity, &candidate) {
+                Some(diff) if diff.b_dominates() => dominating.push((candidate, diff, cand_walk)),
+                Some(_) => {}
+                None => complete = false,
+            }
+        }
+        if complete {
+            dominance_search = DominanceScope::Exhaustive;
+        }
+    } else {
+        // Order space too large to sweep: fall back to the search poles plus the
+        // dominance-safe repack of the current order's own fixed prefix (suffix preserved, so
+        // any prefix improvement dominates by the never-negative-recovery induction).
+        let mut candidates: Vec<Vec<usize>> = Vec::new();
+        for candidate in [
+            search.minimax_pole.clone(),
+            search.certainty_pole.clone(),
+            Some(search.heuristic.clone()),
+            Some(current_prefix_repack(kinds)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if candidate != identity && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in candidates {
+            let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
+            let cand_walk = layout::walk(&ordered);
+            if let Some(diff) = crate::dominance::compare(kinds, &identity, &candidate)
+                && diff.b_dominates()
+            {
+                dominating.push((candidate, diff, cand_walk));
+            }
+        }
+    }
+    if let Some((order, diff, cand_walk)) = dominating
+        .into_iter()
+        .min_by_key(|(_, _, w)| (w.padding_max(), w.padding, w.expected_padding_eighths()))
+    {
+        // The gate never claims more than the engine's proven maximum saving: certain pads the
+        // reorder converts into smaller data-dependent ones are capped at what is attainable.
+        let max_saving = diff.max as u64;
+        let det = current_walk.padding.saturating_sub(cand_walk.padding).min(max_saving);
+        return Decision {
+            order,
+            avoidable_deterministic: det,
+            avoidable_dominance: max_saving - det,
+            dominance_saving: Some(SavingRange {
+                min: diff.min as u64,
+                max: max_saving,
+            }),
+            dominance_search,
+            frontier_order: None,
+        };
+    }
+    // No dominating order: surface the most useful pole as a frontier. A pole qualifies when
+    // it wins somewhere and improves a realization-free summary (worst case, or certain
+    // padding, the certainty-trade case). Documented as deviation five in docs/design.md.
+    let mut frontier_pick: Option<Vec<usize>> = None;
     for candidate in [
         search.minimax_pole.as_ref(),
         search.certainty_pole.as_ref(),
@@ -270,59 +376,16 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
     .into_iter()
     .flatten()
     {
-        if candidate != &identity && !candidates.contains(&candidate) {
-            candidates.push(candidate);
+        if *candidate == identity || frontier_pick.is_some() {
+            continue;
         }
-    }
-    let mut dominance_evaluated = true;
-    let mut dominating: Vec<(&Vec<usize>, crate::dominance::DiffBounds, Walk)> = Vec::new();
-    let mut frontier_pick: Option<(&Vec<usize>, Walk)> = None;
-    for candidate in candidates {
         let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
         let cand_walk = layout::walk(&ordered);
-        match crate::dominance::compare(kinds, &identity, candidate) {
-            Some(diff) if diff.b_dominates() => dominating.push((candidate, diff, cand_walk)),
-            Some(diff) => {
-                // Frontier material: strictly better somewhere, and better on a
-                // realization-free summary (worst case, or certain padding at equal worst).
-                let better_summary = cand_walk.padding_max() < current_walk.padding_max()
-                    || (cand_walk.padding_max() == current_walk.padding_max()
-                        && cand_walk.padding < current_walk.padding);
-                if diff.max > 0 && better_summary && frontier_pick.is_none() {
-                    frontier_pick = Some((candidate, cand_walk));
-                }
-            }
-            None => dominance_evaluated = false,
-        }
-    }
-    if let Some((order, diff, cand_walk)) = dominating
-        .into_iter()
-        .min_by_key(|(_, _, w)| (w.padding_max(), w.padding, w.expected_padding_eighths()))
-    {
-        let det = current_walk.padding.saturating_sub(cand_walk.padding);
-        let dominance = (diff.max as u64).saturating_sub(det);
-        return Decision {
-            order: order.clone(),
-            avoidable_deterministic: det,
-            avoidable_dominance: dominance,
-            dominance_saving: Some(SavingRange {
-                min: diff.min as u64,
-                max: diff.max as u64,
-            }),
-            dominance_evaluated: true,
-            frontier_order: None,
-        };
-    }
-    // The certainty pole earns a frontier line even at a higher worst case: it removes certain
-    // padding the current order pays in full (the reader may know the payloads are friendly).
-    if frontier_pick.is_none()
-        && let Some(candidate) = search.certainty_pole.as_ref().filter(|c| *c != &identity)
-    {
-        let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
-        let cand_walk = layout::walk(&ordered);
-        let wins_somewhere = crate::dominance::compare(kinds, &identity, candidate).map(|diff| diff.max > 0);
-        if cand_walk.padding < current_walk.padding && wins_somewhere.unwrap_or(false) {
-            frontier_pick = Some((candidate, cand_walk));
+        let better_summary =
+            cand_walk.padding_max() < current_walk.padding_max() || cand_walk.padding < current_walk.padding;
+        let wins_somewhere = crate::dominance::compare(kinds, &identity, candidate).is_some_and(|diff| diff.max > 0);
+        if better_summary && wins_somewhere {
+            frontier_pick = Some(candidate.clone());
         }
     }
     Decision {
@@ -330,9 +393,17 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
         avoidable_deterministic: 0,
         avoidable_dominance: 0,
         dominance_saving: None,
-        dominance_evaluated,
-        frontier_order: frontier_pick.map(|(order, _)| order.clone()),
+        dominance_search,
+        frontier_order: frontier_pick,
     }
+}
+
+/// The current order with its leading fixed run repacked to the deterministic minimum and the
+/// suffix untouched: dominance-safe by construction, and free at any table size.
+fn current_prefix_repack(kinds: &[ColumnKind]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..kinds.len()).collect();
+    layout::refine_leading_fixed(kinds, &mut order);
+    order
 }
 
 fn frontier_report(
@@ -408,7 +479,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             avoidable_deterministic: 0,
             avoidable_dominance: 0,
             dominance_saving: None,
-            dominance_evaluated: true,
+            dominance_search: DominanceScope::Exhaustive,
             frontier_order: None,
         },
         Tier::Estimate => decide(&kinds, &search, &current_walk),
@@ -419,7 +490,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             avoidable_deterministic: 0,
             avoidable_dominance: 0,
             dominance_saving: None,
-            dominance_evaluated: true,
+            dominance_search: DominanceScope::Exhaustive,
             frontier_order: None,
         },
     };
@@ -499,7 +570,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             decision.dominance_saving
         },
         search_scope: search.scope,
-        dominance_evaluated: decision.dominance_evaluated,
+        dominance_search: decision.dominance_search,
         frontier,
         assumed_types,
         dropped_columns: table.dropped_count,

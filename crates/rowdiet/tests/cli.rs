@@ -131,7 +131,7 @@ fn interleaved_varlenas_report_dominance_avoidable_waste() {
     assert_eq!(grouped["current"]["padding_max"], 12);
     assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
     assert!(grouped["frontier"].is_null());
-    assert_eq!(grouped["dominance_evaluated"], true);
+    assert_eq!(grouped["dominance_search"], "exhaustive");
     // Columns at data-dependent offsets claim no point placement.
     assert!(interleaved["columns"][6]["offset"].is_null(), "{interleaved}");
     assert!(interleaved["columns"][6]["pad_before"].is_null(), "{interleaved}");
@@ -150,7 +150,7 @@ fn varlena_text_output_states_the_policy_and_gates_fractionally() {
         "{stdout}"
     );
     assert!(stdout.contains("dominance-proven"), "{stdout}");
-    assert!(stdout.contains("no dominating reorder found"), "{stdout}");
+    assert!(stdout.contains("no dominating reorder exists"), "{stdout}");
     assert!(
         stdout.contains("display-only"),
         "the policy must be stated where the numbers are shown: {stdout}"

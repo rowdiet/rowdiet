@@ -204,7 +204,10 @@ fn load_baseline(path: &Path) -> Result<Baseline, String> {
     }
     for (name, entry) in &baseline.tables {
         if !entry.bytes.is_finite() || entry.bytes < 0.0 {
-            return Err(format!("{}: entry `{name}` has a non-finite allowance", path.display()));
+            return Err(format!(
+                "{}: entry `{name}` must have a finite, non-negative allowance",
+                path.display()
+            ));
         }
     }
     Ok(baseline)

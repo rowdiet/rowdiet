@@ -191,3 +191,130 @@ fn flagship_pairs_have_the_measured_verdicts() {
         "a friendly long text makes fixed-first strictly worse"
     );
 }
+
+/// A from-scratch oracle sharing no code with the engine: byte offsets instead of residues,
+/// explicit alignment arithmetic, concrete payload lengths for all three storage forms (short
+/// 0..=7, long 127..=134, and the 18-byte TOAST pointer). A wrong storage convention inside
+/// `varlena_step` passes the engine-vs-engine agreement test unnoticed; it cannot pass this.
+mod independent_oracle {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Copy)]
+    enum Value {
+        Short(u64),
+        Long(u64),
+        Toast,
+    }
+
+    fn align_up(off: u64, align: u64) -> u64 {
+        off.div_ceil(align) * align
+    }
+
+    fn oracle_pad(kinds: &[ColumnKind], order: &[usize], values: &[Value], slot_of: &[usize]) -> u64 {
+        let mut off = 0u64;
+        let mut total = 0u64;
+        for &i in order {
+            match kinds[i] {
+                ColumnKind::Fixed { len, align } => {
+                    let aligned = align_up(off, align.bytes());
+                    total += aligned - off;
+                    off = aligned + len;
+                }
+                ColumnKind::Varlena { align, .. } => match values[slot_of[i]] {
+                    Value::Short(len) => off += 1 + len,
+                    Value::Long(len) => {
+                        let aligned = align_up(off, align.bytes());
+                        total += aligned - off;
+                        off = aligned + 4 + len;
+                    }
+                    Value::Toast => off += 18,
+                },
+            }
+        }
+        total
+    }
+
+    fn oracle_bounds(kinds: &[ColumnKind], a: &[usize], b: &[usize]) -> DiffBounds {
+        let varlenas: Vec<usize> = (0..kinds.len())
+            .filter(|&i| matches!(kinds[i], ColumnKind::Varlena { .. }))
+            .collect();
+        let mut slot_of = vec![usize::MAX; kinds.len()];
+        for (slot, &c) in varlenas.iter().enumerate() {
+            slot_of[c] = slot;
+        }
+        let domains: Vec<Vec<Value>> = varlenas
+            .iter()
+            .map(|&c| {
+                let mut domain: Vec<Value> = (0..8).map(Value::Short).collect();
+                if long_capable(kinds[c]) {
+                    domain.extend((127..135).map(Value::Long));
+                    domain.push(Value::Toast);
+                }
+                domain
+            })
+            .collect();
+        let mut bounds: Option<DiffBounds> = None;
+        let mut values = vec![Value::Short(0); varlenas.len()];
+        #[allow(clippy::too_many_arguments)]
+        fn go(
+            kinds: &[ColumnKind],
+            a: &[usize],
+            b: &[usize],
+            domains: &[Vec<Value>],
+            slot_of: &[usize],
+            values: &mut Vec<Value>,
+            depth: usize,
+            bounds: &mut Option<DiffBounds>,
+        ) {
+            if depth == domains.len() {
+                let d = oracle_pad(kinds, a, values, slot_of) as i64 - oracle_pad(kinds, b, values, slot_of) as i64;
+                match bounds {
+                    Some(existing) => {
+                        existing.min = existing.min.min(d);
+                        existing.max = existing.max.max(d);
+                    }
+                    slot @ None => *slot = Some(DiffBounds { min: d, max: d }),
+                }
+                return;
+            }
+            for &value in &domains[depth] {
+                values[depth] = value;
+                go(kinds, a, b, domains, slot_of, values, depth + 1, bounds);
+            }
+        }
+        go(kinds, a, b, &domains, &slot_of, &mut values, 0, &mut bounds);
+        bounds.expect("at least one realization")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn engine_bounds_match_the_independent_oracle(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                ],
+                2..=5
+            ).prop_filter("at most 3 varlenas keeps the oracle enumerable", |kinds| {
+                kinds.iter().filter(|k| matches!(k, ColumnKind::Varlena { .. })).count() <= 3
+            }),
+            rotation in 0usize..120
+        ) {
+            let n = kinds.len();
+            let a: Vec<usize> = (0..n).collect();
+            let b: Vec<usize> = (0..n).map(|i| (i + 1 + rotation % n.max(1)) % n).collect();
+            let engine = compare(&kinds, &a, &b).expect("within budget");
+            let oracle = oracle_bounds(&kinds, &a, &b);
+            prop_assert_eq!(engine, oracle, "kinds {:?} b {:?}", kinds, b);
+        }
+    }
+}
