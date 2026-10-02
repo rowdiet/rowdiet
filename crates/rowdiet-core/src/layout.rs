@@ -536,6 +536,30 @@ pub fn order_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> 
     Some(out)
 }
 
+/// The members of [`order_space`] that keep same-class varlenas in written order, generated over
+/// padding classes: the candidate space an earlier, collapsed sweep tested, in the order it tested
+/// them. None when it exceeds `cap`.
+pub fn class_sequence_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> {
+    let identity: Vec<usize> = (0..kinds.len()).collect();
+    let classes = padding_classes(kinds, &identity);
+    let mut sequences: usize = 1;
+    let mut remaining = kinds.len();
+    for class in &classes {
+        sequences = sequences.checked_mul(binomial(remaining, class.members.len(), cap)?)?;
+        if sequences > cap {
+            return None;
+        }
+        remaining -= class.members.len();
+    }
+    let mut queues: Vec<std::collections::VecDeque<usize>> =
+        classes.iter().map(|c| c.members.iter().copied().collect()).collect();
+    let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
+    let mut out = Vec::with_capacity(sequences);
+    let mut current = Vec::with_capacity(kinds.len());
+    generate_orders(&mut queues, &mut counts, kinds.len(), &mut current, &mut out);
+    Some(out)
+}
+
 /// C(n, k), or None past `cap` (the caller cannot use a larger space anyway).
 fn binomial(n: usize, k: usize, cap: usize) -> Option<usize> {
     let mut result: usize = 1;

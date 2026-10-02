@@ -372,8 +372,9 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
 }
 
 /// Test every member of the pointwise-complete order space against the current order and return
-/// whether every member was decided. Members that keep same-class varlenas in written order go
-/// first, then lower worst cases, so a trimmed sweep spends its budget where findings are.
+/// whether every member was decided. The class-sequence members go first, in the order the
+/// collapsed sweep tested them, so a trimmed sweep finds at least what that sweep found; the
+/// rest follow by ascending worst case.
 fn sweep(
     kinds: &[ColumnKind],
     current_walk: &Walk,
@@ -381,11 +382,7 @@ fn sweep(
     dominating: &mut Vec<(Vec<usize>, DiffBounds)>,
 ) -> bool {
     let identity: Vec<usize> = (0..kinds.len()).collect();
-    let mut ranked: Vec<((bool, u64, u64, u64), Vec<usize>)> = Vec::new();
-    for candidate in orders {
-        if candidate == identity {
-            continue;
-        }
+    let passes_prunes = |candidate: &[usize]| -> Option<Walk> {
         let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
         let cand_walk = layout::walk(&ordered);
         // Dominance implies pointwise <=, so it implies <= on the max, the min, and the
@@ -394,24 +391,37 @@ fn sweep(
         // enumeration oracle test), so it is a sound prune; note this makes the display
         // expectation correctness-bearing here, so its model cannot change independently.
         // All three prunes were brute-force-checked: no dominating candidate fails any.
-        if cand_walk.padding_max() > current_walk.padding_max()
+        let pruned = cand_walk.padding_max() > current_walk.padding_max()
             || cand_walk.padding_min() > current_walk.padding_min()
-            || cand_walk.expected_padding_eighths() > current_walk.expected_padding_eighths()
-        {
+            || cand_walk.expected_padding_eighths() > current_walk.expected_padding_eighths();
+        (!pruned).then_some(cand_walk)
+    };
+    let class_sequences = layout::class_sequence_space(kinds, orders.len()).unwrap_or_default();
+    let mut rest: Vec<((u64, u64, u64), Vec<usize>)> = Vec::new();
+    for candidate in orders {
+        if keeps_class_order(kinds, &candidate) {
             continue;
         }
-        let key = (
-            !keeps_class_order(kinds, &candidate),
-            cand_walk.padding_max(),
-            cand_walk.padding,
-            cand_walk.expected_padding_eighths(),
-        );
-        ranked.push((key, candidate));
+        if let Some(cand_walk) = passes_prunes(&candidate) {
+            let key = (
+                cand_walk.padding_max(),
+                cand_walk.padding,
+                cand_walk.expected_padding_eighths(),
+            );
+            rest.push((key, candidate));
+        }
     }
-    ranked.sort();
+    rest.sort();
+    let ranked = class_sequences
+        .into_iter()
+        .filter(|candidate| passes_prunes(candidate).is_some())
+        .chain(rest.into_iter().map(|(_, candidate)| candidate));
     let mut budget = SWEEP_WORK_BUDGET;
     let mut complete = true;
-    for (_, candidate) in ranked {
+    for candidate in ranked {
+        if candidate == identity {
+            continue;
+        }
         let cost = crate::dominance::comparison_cost(kinds, &identity, &candidate);
         if cost > budget {
             complete = false;
