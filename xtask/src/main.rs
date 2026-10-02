@@ -1,14 +1,22 @@
 //! Repository tasks. `cargo run -p xtask -- measure` regression-tests the layout model's
 //! claims against real tuples: it builds the release binary, applies DDL fixtures to a
 //! disposable PostgreSQL (Docker, pageinspect), inserts short-heavy and long-heavy workloads,
-//! and asserts the three properties from the decision-policy spec:
+//! and asserts the properties from the decision-policy spec:
 //!
 //! (a) measured per-row padding falls inside every reported [min, max];
 //! (b) whenever the tool recommends a reorder, the suggested order measures no worse than the
-//!     current order on both workloads;
-//! (c) every declared frontier band winner holds on a workload derived from that band's
-//!     `long_form` set, and every declared boundary pair flips the measured winner;
+//!     current order on every row of both workloads;
+//! (c) every declared frontier band holds row by row on a workload that sweeps payload residues
+//!     inside the band: each row's saving lies inside the band's bounds, the declared winner
+//!     matches the signs measured, and where every residue is controllable the measured extremes
+//!     equal the bounds; every declared boundary pair flips the measured winner;
 //! (d) the gated headline never exceeds the dominance engine's proven maximum saving.
+//!
+//! Rows are generated deterministically, so the current and the alternative table hold the same
+//! values row for row and pair by insertion order. Padding is the tuple length minus the header
+//! and the stored bytes of every attribute (`heap_page_item_attrs`), which counts short headers,
+//! compressed values and TOAST pointers as they sit on the page. Array workloads include
+//! uncompressed short and long arrays, compressed inline arrays, and TOAST pointers.
 //!
 //! Skipped (exit 0, loud) when no reachable container: the harness is for maintainers and
 //! Docker-equipped CI legs, and plain CI must not fail for lacking a database. Container/user/db
@@ -82,40 +90,135 @@ struct Measured {
     max: i64,
 }
 
+/// Two tables holding the same rows, paired by insertion order. `saving` is current minus
+/// alternative padding per row.
+#[derive(Debug, Clone, Copy)]
+struct Paired {
+    current: Measured,
+    alternative: Measured,
+    saving_min: i64,
+    saving_max: i64,
+    /// Rows the toaster stored differently in the two orders, left out of the savings.
+    stored_differently: u64,
+}
+
 struct Column {
     name: &'static str,
     sql_type: &'static str,
 }
 
-/// Per-type SQL: (size expression, short-heavy generator, long-heavy generator). `g` is the
-/// row counter, so widths sweep the payload residues deterministically.
-fn type_spec(sql_type: &str, name: &str) -> (String, String, String) {
-    let col = format!("t.{name}");
+fn is_varlena(sql_type: &str) -> bool {
+    matches!(sql_type, "text" | "float8[]" | "numeric" | "jsonb" | "text[]") || sql_type.starts_with("varchar")
+}
+
+/// A per-column seed from the name, the same in every order of the table. Distinct values keep
+/// the toaster's size ties apart, which it breaks by attribute number and so by order.
+fn column_seed(name: &str) -> usize {
+    name.bytes().map(usize::from).sum::<usize>() % 97
+}
+
+/// Values for an uncompressed float8[] of `count` elements.
+fn float_array(count: &str, seed: usize) -> String {
+    format!("(SELECT array_agg((g * 1000 + x + {seed})::float8) FROM generate_series(1, ({count})::int) x)")
+}
+
+/// Mostly-zero float8[] past the tuple threshold: compressed inline, at a length that varies.
+fn compressible_array(variety: &str, seed: usize) -> String {
+    format!(
+        "(SELECT array_agg(CASE WHEN x % (1 + ({variety}) % 17) = 0 THEN (x + {seed})::float8 ELSE 0 END) \
+         FROM generate_series(1, (300 + {seed} + ({variety}) % 64)::int) x)"
+    )
+}
+
+/// Incompressible float8[] past the tuple threshold: moved out of line, an 18-byte pointer.
+fn toasted_array(seed: usize) -> String {
+    format!("(SELECT array_agg(sin(g * 1000 + x)) FROM generate_series(1, 400 + {seed}) x)")
+}
+
+/// Per-type (short-heavy, long-heavy) generators. `g` is the row counter, so widths sweep the
+/// payload residues deterministically and every table gets the same rows.
+fn type_spec(sql_type: &str, seed: usize) -> (String, String) {
+    if let Some(n) = sql_type
+        .strip_prefix("varchar(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let generator = format!(
+            "repeat('x', (g % {})::int)",
+            n.parse::<u64>().expect("varchar length") + 1
+        );
+        return (generator.clone(), generator);
+    }
     match sql_type {
         "text" => (
-            format!("pg_column_size({col})"),
             "repeat('x', (g % 16)::int)".to_string(),
             "repeat('x', (130 + (g * 7) % 110)::int)".to_string(),
         ),
         "float8[]" => (
-            format!("pg_column_size({col})"),
-            "(SELECT array_agg(random()) FROM generate_series(1, (1 + g % 2)::int))".to_string(),
-            "(SELECT array_agg(random()) FROM generate_series(1, (25 + g % 16)::int))".to_string(),
+            float_array("1 + g % 2", seed),
+            format!(
+                "CASE WHEN g % 2 = 0 THEN {} ELSE {} END",
+                float_array("25 + g % 16", seed),
+                compressible_array("g", seed)
+            ),
         ),
-        "bigint" => (8.to_string(), "42".into(), "42".into()),
-        "int4_alias_integer" => (4.to_string(), "7".into(), "7".into()),
-        "integer" => (4.to_string(), "7".into(), "7".into()),
-        "smallint" => (2.to_string(), "1".into(), "1".into()),
-        "boolean" => (1.to_string(), "true".into(), "true".into()),
-        "float8" => (8.to_string(), "1.5".into(), "1.5".into()),
-        "timestamp" => (8.to_string(), "now()::timestamp".into(), "now()::timestamp".into()),
-        "timetz" => (12.to_string(), "now()::timetz".into(), "now()::timetz".into()),
-        "macaddr" => (
-            6.to_string(),
-            "'08:00:2b:01:02:03'".into(),
-            "'08:00:2b:01:02:03'".into(),
+        "numeric" => (
+            "((g % 997) * 1.25)::numeric".to_string(),
+            "('1' || repeat('7', (260 + g % 23)::int))::numeric".to_string(),
         ),
+        "jsonb" => (
+            "jsonb_build_object('k', repeat('x', (g % 16)::int))".to_string(),
+            "jsonb_build_object('k', repeat('x', (200 + g % 40)::int))".to_string(),
+        ),
+        "text[]" => (
+            "ARRAY[repeat('x', (g % 5)::int)]".to_string(),
+            "(SELECT array_agg(repeat('x', (x % 7)::int)) FROM generate_series(1, (30 + g % 9)::int) x)".to_string(),
+        ),
+        "bigint" => ("42".into(), "42".into()),
+        "int4_alias_integer" | "integer" => ("7".into(), "7".into()),
+        "smallint" => ("1".into(), "1".into()),
+        "boolean" => ("true".into(), "true".into()),
+        "float8" => ("1.5".into(), "1.5".into()),
+        "timestamp" => (
+            "'2024-01-02 03:04:05'::timestamp".into(),
+            "'2024-01-02 03:04:05'::timestamp".into(),
+        ),
+        "timestamptz" => (
+            "'2024-01-02 03:04:05+00'::timestamptz".into(),
+            "'2024-01-02 03:04:05+00'::timestamptz".into(),
+        ),
+        "timetz" => ("'03:04:05+02'::timetz".into(), "'03:04:05+02'::timetz".into()),
+        "macaddr" => ("'08:00:2b:01:02:03'".into(), "'08:00:2b:01:02:03'".into()),
         other => panic!("no type spec for {other}"),
+    }
+}
+
+/// A band workload's generator for one varlena and whether it sweeps every residue: `selector`
+/// picks a payload residue (0..8) and, for arrays, the storage shape. Long texts are 128 +
+/// residue bytes and short texts residue bytes. Long arrays are uncompressed (payload 4 mod 8)
+/// or compressed inline (any residue); short arrays are uncompressed or a TOAST pointer.
+fn band_generator(sql_type: &str, long: bool, selector: &str, seed: usize) -> (String, bool) {
+    let swept = match (sql_type, long) {
+        ("text", true) => Some(format!("repeat('x', (128 + {selector})::int)")),
+        ("text", false) => Some(format!("repeat('x', ({selector})::int)")),
+        ("float8[]", true) => Some(format!(
+            "CASE WHEN {selector} < 4 THEN {} ELSE {} END",
+            float_array(&format!("16 + {selector}"), seed),
+            compressible_array(&format!("g * 7 + {selector}"), seed)
+        )),
+        ("float8[]", false) => Some(format!(
+            "CASE WHEN {selector} < 6 THEN {} ELSE {} END",
+            float_array(&format!("1 + {selector} % 3"), seed),
+            toasted_array(seed)
+        )),
+        _ => None,
+    };
+    // Other types fall back to their plain generators, which do not sweep every residue.
+    match swept {
+        Some(generator) => (generator, true),
+        None => {
+            let (short, long_gen) = type_spec(sql_type, seed);
+            (if long { long_gen } else { short }, false)
+        }
     }
 }
 
@@ -137,6 +240,16 @@ fn col(name: &'static str, sql_type: &'static str) -> Column {
     Column { name, sql_type }
 }
 
+fn numbered(prefix: &str, count: u32, sql_type: &'static str) -> Vec<Column> {
+    (0..count)
+        .map(|i| Column {
+            name: Box::leak(format!("{prefix}{i}").into_boxed_str()),
+            sql_type,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
 fn fixtures() -> Vec<Fixture> {
     let plain = |name, columns| Fixture {
         name,
@@ -180,17 +293,11 @@ fn fixtures() -> Vec<Fixture> {
             boundary: Some((
                 vec![
                     ("txt", "repeat('x', (130 + (g * 7) % 110)::int)".into()),
-                    (
-                        "arr",
-                        "(SELECT array_agg(random()) FROM generate_series(1, (1 + g % 2)::int))".into(),
-                    ),
+                    ("arr", float_array("1 + g % 2", column_seed("arr"))),
                 ],
                 vec![
                     ("txt", "repeat('x', (g % 16)::int)".into()),
-                    (
-                        "arr",
-                        "(SELECT array_agg(random()) FROM generate_series(1, (25 + g % 16)::int))".into(),
-                    ),
+                    ("arr", float_array("25 + g % 16", column_seed("arr"))),
                 ],
             )),
             toast_column: None,
@@ -206,14 +313,8 @@ fn fixtures() -> Vec<Fixture> {
             name: "int_first",
             columns: vec![col("n", "int4_alias_integer"), col("arr", "float8[]")],
             boundary: Some((
-                vec![(
-                    "arr",
-                    "(SELECT array_agg(random()) FROM generate_series(1, (1 + g % 2)::int))".into(),
-                )],
-                vec![(
-                    "arr",
-                    "(SELECT array_agg(random()) FROM generate_series(1, (25 + g % 16)::int))".into(),
-                )],
+                vec![("arr", float_array("1 + g % 2", column_seed("arr")))],
+                vec![("arr", float_array("25 + g % 16", column_seed("arr")))],
             )),
             toast_column: None,
         },
@@ -265,111 +366,95 @@ fn fixtures() -> Vec<Fixture> {
             boundary: None,
             toast_column: Some("t"),
         },
+        // Array residues: a short uncompressed float8[] stores payload 4 mod 8, which makes
+        // (macaddr, smallint, a2, a1) dominate; any-residue modeling called this table clean.
+        plain(
+            "pin",
+            vec![
+                col("s", "smallint"),
+                col("a1", "float8[]"),
+                col("a2", "float8[]"),
+                col("m", "macaddr"),
+            ],
+        ),
+        // A trimmed sweep: four proven-short varchars and a text exhaust the comparison budget;
+        // the dominating minimax pole must be recommended and measure no worse.
+        plain(
+            "orders",
+            vec![
+                col("id", "bigint"),
+                col("country", "varchar(2)"),
+                col("currency", "varchar(3)"),
+                col("status", "varchar(16)"),
+                col("channel", "varchar(12)"),
+                col("note", "text"),
+            ],
+        ),
     ];
+    // Fixed waste past 24 fixed columns: the prefix repack must gate it at any width.
+    let mut wide36 = Vec::new();
+    for (flag, reference) in numbered("flag", 10, "boolean")
+        .into_iter()
+        .zip(numbered("ref", 10, "bigint"))
+    {
+        wide36.extend([flag, reference]);
+    }
+    for (kind, at) in numbered("kind", 5, "smallint")
+        .into_iter()
+        .zip(numbered("at", 5, "timestamptz"))
+    {
+        wide36.extend([kind, at]);
+    }
+    wide36.extend([
+        col("name", "varchar(20)"),
+        col("description", "text"),
+        col("payload", "jsonb"),
+        col("notes", "text"),
+        col("amount", "numeric"),
+        col("tags", "text[]"),
+    ]);
+    out.push(plain("wide36", wide36));
+    // The exact tier past 24 columns: alternating timetz and int4 saves a MAXALIGN rung.
+    let mut exact26 = Vec::new();
+    for (tz, int) in numbered("tz", 11, "timetz")
+        .into_iter()
+        .zip(numbered("i", 11, "integer"))
+    {
+        exact26.extend([tz, int]);
+    }
+    exact26.extend([
+        col("tz11", "timetz"),
+        col("tz12", "timetz"),
+        col("i11", "integer"),
+        col("i12", "integer"),
+    ]);
+    out.push(plain("exact26", exact26));
     // The headline-invariant repro: the dominating repack removes 28 B of certain padding but
     // pays new data-dependent pads, so only 24 B is attainable; property (d) pins the headline
     // to the proven range.
-    let mut m23 = Vec::new();
-    for i in 0..6u32 {
-        m23.push(Column {
-            name: Box::leak(format!("tz{i}").into_boxed_str()),
-            sql_type: "timetz",
-        });
-    }
-    for i in 0..6u32 {
-        m23.push(Column {
-            name: Box::leak(format!("mm{i}").into_boxed_str()),
-            sql_type: "macaddr",
-        });
-    }
-    for i in 0..5u32 {
-        m23.push(Column {
-            name: Box::leak(format!("bb{i}").into_boxed_str()),
-            sql_type: "bigint",
-        });
-    }
-    for i in 0..3u32 {
-        m23.push(Column {
-            name: Box::leak(format!("ss{i}").into_boxed_str()),
-            sql_type: "smallint",
-        });
-    }
-    for i in 0..3u32 {
-        m23.push(Column {
-            name: Box::leak(format!("tt{i}").into_boxed_str()),
-            sql_type: "text",
-        });
-    }
-    out.push(Fixture {
-        name: "m23",
-        columns: m23,
-        boundary: None,
-        toast_column: None,
-    });
+    let mut m23 = numbered("tz", 6, "timetz");
+    m23.extend(numbered("mm", 6, "macaddr"));
+    m23.extend(numbered("bb", 5, "bigint"));
+    m23.extend(numbered("ss", 3, "smallint"));
+    m23.extend(numbered("tt", 3, "text"));
+    out.push(plain("m23", m23));
     // The 25-column cap cliff: deterministic 24 B/row, must gate and must measure.
-    let mut cliff = Vec::new();
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("tz{i}").into_boxed_str()),
-            sql_type: "timetz",
-        });
-    }
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("m{i}").into_boxed_str()),
-            sql_type: "macaddr",
-        });
-    }
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("b{i}").into_boxed_str()),
-            sql_type: "bigint",
-        });
-    }
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("i{i}").into_boxed_str()),
-            sql_type: "int4_alias_integer",
-        });
-    }
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("s{i}").into_boxed_str()),
-            sql_type: "smallint",
-        });
-    }
-    for i in 0..4u32 {
-        cliff.push(Column {
-            name: Box::leak(format!("f{i}").into_boxed_str()),
-            sql_type: "boolean",
-        });
-    }
+    let mut cliff = numbered("tz", 4, "timetz");
+    cliff.extend(numbered("m", 4, "macaddr"));
+    cliff.extend(numbered("b", 4, "bigint"));
+    cliff.extend(numbered("i", 4, "int4_alias_integer"));
+    cliff.extend(numbered("s", 4, "smallint"));
+    cliff.extend(numbered("f", 4, "boolean"));
     cliff.push(col("note", "text"));
-    out.push(Fixture {
-        name: "cliff25",
-        columns: cliff,
-        boundary: None,
-        toast_column: None,
-    });
+    out.push(plain("cliff25", cliff));
     // The wide-table false negative: 21 bigints push the whole-order search over budget; the
     // fixed-prefix repack must still be found, gated, and measured better.
-    let mut wide = Vec::new();
-    for i in 0..21u32 {
-        wide.push(Column {
-            name: Box::leak(format!("w{i}").into_boxed_str()),
-            sql_type: "bigint",
-        });
-    }
+    let mut wide = numbered("w", 21, "bigint");
     wide.push(col("t1", "timetz"));
     wide.push(col("t2", "timetz"));
     wide.push(col("s", "smallint"));
     wide.push(col("note", "text"));
-    out.push(Fixture {
-        name: "wide25",
-        columns: wide,
-        boundary: None,
-        toast_column: None,
-    });
+    out.push(plain("wide25", wide));
     out
 }
 
@@ -473,24 +558,18 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     }
     // The alternative order comes from the tool itself: the recommendation when it gates, the
     // frontier order when it reports one.
+    let names = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .expect("order")
+            .iter()
+            .map(|v| v.as_str().expect("name").to_string())
+            .collect()
+    };
     let alt_names: Option<Vec<String>> = if avoidable > 0.0 {
-        Some(
-            table_report["suggested_order"]
-                .as_array()
-                .expect("order")
-                .iter()
-                .map(|v| v.as_str().expect("name").to_string())
-                .collect(),
-        )
+        Some(names(&table_report["suggested_order"]))
     } else if table_report["frontier"].is_object() {
-        Some(
-            table_report["frontier"]["order"]
-                .as_array()
-                .expect("frontier order")
-                .iter()
-                .map(|v| v.as_str().expect("name").to_string())
-                .collect(),
-        )
+        Some(names(&table_report["frontier"]["order"]))
     } else {
         None
     };
@@ -525,7 +604,7 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
         }
         pg.query(&alter).expect("set storage");
     }
-    let workloads: Vec<(String, Vec<(&str, String)>)> = {
+    let workloads: Vec<(String, Workload)> = {
         let mut w = vec![("short".to_string(), Vec::new())];
         if let Some(toast) = fixture.toast_column {
             w.push(("toast".to_string(), vec![(toast, "repeat('y', 4096)".to_string())]));
@@ -535,8 +614,8 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
                 fixture
                     .columns
                     .iter()
-                    .filter(|c| matches!(c.sql_type, "text" | "float8[]"))
-                    .map(|c| (c.name, type_spec(c.sql_type, c.name).2))
+                    .filter(|c| is_varlena(c.sql_type))
+                    .map(|c| (c.name, type_spec(c.sql_type, column_seed(c.name)).1))
                     .collect(),
             ));
         }
@@ -548,12 +627,37 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     };
     let mut means: std::collections::BTreeMap<(String, bool), f64> = std::collections::BTreeMap::new();
     for (workload, overrides) in &workloads {
-        for (is_alt, table, columns) in [(false, &cur_table, Some(&current)), (true, &alt_table, alt.as_ref())] {
-            let Some(columns) = columns else { continue };
-            let insert = insert_sql(table, columns, workload, overrides, fixture.toast_column);
-            pg.query(&format!("TRUNCATE {table};\n{insert}")).expect("insert");
-            let toast_now = fixture.toast_column.filter(|_| workload == "toast");
-            let measured = measure_table(pg, table, columns, toast_now);
+        let measured: Vec<(bool, Measured)> = match &alt {
+            Some(alt_cols) => {
+                let insert_cur = insert_sql(&cur_table, &current, workload, overrides, 1200);
+                let insert_alt = insert_sql(&alt_table, alt_cols, workload, overrides, 1200);
+                pg.query(&format!(
+                    "TRUNCATE {cur_table}, {alt_table};\n{insert_cur}\n{insert_alt}"
+                ))
+                .expect("insert");
+                let paired = measure_pair(pg, (&cur_table, &current), (&alt_table, alt_cols));
+                if paired.stored_differently > 0 {
+                    println!(
+                        "| {} | pair | {workload} | - | {} row(s) stored differently by the toaster, not compared | - |",
+                        fixture.name, paired.stored_differently
+                    );
+                }
+                // Property (b): a recommendation is pointwise, so no row may measure worse.
+                if avoidable > 0.0 && paired.saving_min < 0 {
+                    failures.push(format!(
+                        "{}/{workload}: the recommended order measures worse on some row (saving {}..{}, means {:.3} vs {:.3})",
+                        fixture.name, paired.saving_min, paired.saving_max, paired.alternative.mean, paired.current.mean
+                    ));
+                }
+                vec![(false, paired.current), (true, paired.alternative)]
+            }
+            None => {
+                let insert = insert_sql(&cur_table, &current, workload, overrides, 1200);
+                pg.query(&format!("TRUNCATE {cur_table};\n{insert}")).expect("insert");
+                vec![(false, measure_table(pg, &cur_table, &current))]
+            }
+        };
+        for (is_alt, measured) in measured {
             means.insert((workload.clone(), is_alt), measured.mean);
             let (model_min, model_max) = model_bounds(usize::from(is_alt));
             println!(
@@ -566,26 +670,14 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
                 measured.max,
                 measured.rows
             );
+            // Property (a): every row inside the model's bounds.
             if measured.min < model_min || measured.max > model_max {
                 failures.push(format!(
-                    "{}/{table}/{workload}: measured [{}-{}] outside model [{model_min},{model_max}]",
-                    fixture.name, measured.min, measured.max
-                ));
-            }
-        }
-    }
-    if avoidable > 0.0 {
-        for workload in ["short", "long", "toast"] {
-            let (Some(cur), Some(alt_mean)) = (
-                means.get(&(workload.to_string(), false)),
-                means.get(&(workload.to_string(), true)),
-            ) else {
-                continue;
-            };
-            if *alt_mean > cur + 0.05 {
-                failures.push(format!(
-                    "{}/{workload}: recommended order measures worse ({alt_mean:.3} vs {cur:.3})",
-                    fixture.name
+                    "{}/{}/{workload}: measured [{}-{}] outside model [{model_min},{model_max}]",
+                    fixture.name,
+                    if is_alt { &alt_table } else { &cur_table },
+                    measured.min,
+                    measured.max
                 ));
             }
         }
@@ -602,8 +694,7 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
             ));
         }
     }
-    // Property (c), band half: every declared band winner must hold on a workload derived from
-    // that band's long_form set. Mislabeling a single band fails the run.
+    // Property (c), band half: every declared band holds row by row on a residue sweep inside it.
     if let (Some(alt_cols), true) = (&alt, table_report["frontier"].is_object()) {
         verify_bands(
             pg,
@@ -618,10 +709,15 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     }
 }
 
-/// Measure each declared frontier band under a workload that stores exactly its `long_form`
-/// columns long and every other varlena short, and assert the declared winner. Mixed bands are
-/// held to their own claim: the winner must actually flip across text-width residues inside
-/// the band, so a definite winner mislabeled as mixed fails the run.
+/// Rows of a band workload: every residue combination of the first three varlenas, four times
+/// over with different array contents.
+const BAND_ROWS: u64 = 2048;
+
+/// Measure each declared frontier band on a workload that keeps exactly its `long_form` columns
+/// long and sweeps every varlena's payload residue, then hold the band to its claim row by row:
+/// each row's saving inside the band's bounds, the declared winner's signs (alternative never
+/// worse and better somewhere, current the reverse, tie all zero, mixed both signs), and, where
+/// no long array leaves a residue to compression, the bounds attained exactly.
 #[allow(clippy::too_many_arguments)]
 fn verify_bands(
     pg: &Pg,
@@ -634,71 +730,68 @@ fn verify_bands(
     failures: &mut Vec<String>,
 ) {
     let bands = table_report["frontier"]["bands"].as_array().expect("bands");
-    let mut checked = 0usize;
+    let varlenas: Vec<&Column> = fixture.columns.iter().filter(|c| is_varlena(c.sql_type)).collect();
     for band in bands {
-        if checked >= 4 {
-            break;
-        }
         let winner = band["winner"].as_str().expect("winner");
+        let (min_saving, max_saving) = (
+            band["min_saving"].as_i64().expect("min_saving"),
+            band["max_saving"].as_i64().expect("max_saving"),
+        );
         let long_form: Vec<&str> = band["long_form"]
             .as_array()
             .expect("long_form")
             .iter()
             .map(|v| v.as_str().expect("column name"))
             .collect();
-        let overrides: Vec<(&str, String)> = fixture
-            .columns
+        let mut controllable = true;
+        let overrides: Workload = varlenas
             .iter()
-            .filter(|c| matches!(c.sql_type, "text" | "float8[]"))
-            .map(|c| {
-                let spec = type_spec(c.sql_type, c.name);
-                let generator = if long_form.contains(&c.name) { spec.2 } else { spec.1 };
+            .enumerate()
+            .map(|(k, c)| {
+                let selector = if k < 3 {
+                    format!("((g / {}) % 8)", 8u64.pow(k as u32))
+                } else {
+                    format!("((g * {} + g / 8) % 8)", 2 * k + 3)
+                };
+                let long = long_form.contains(&c.name);
+                let (generator, swept) = band_generator(c.sql_type, long, &selector, column_seed(c.name));
+                controllable &= swept && !(long && c.sql_type == "float8[]");
                 (c.name, generator)
             })
             .collect();
-        let described = format!("band [{}]", long_form.join(", "));
+        let insert_cur = insert_sql(cur_table, current, "band", &overrides, BAND_ROWS);
+        let insert_alt = insert_sql(alt_table, alt_cols, "band", &overrides, BAND_ROWS);
+        pg.query(&format!(
+            "TRUNCATE {cur_table}, {alt_table};\n{insert_cur}\n{insert_alt}"
+        ))
+        .expect("band insert");
+        let paired = measure_pair(pg, (cur_table, current), (alt_table, alt_cols));
         let band_label = if long_form.is_empty() {
             "all short".to_string()
         } else {
             long_form.join("+")
         };
-        if winner == "mixed" {
-            let min_saving = band["min_saving"].as_i64().expect("min_saving");
-            let max_saving = band["max_saving"].as_i64().expect("max_saving");
-            verify_mixed_band(
-                pg,
-                fixture,
-                current,
-                alt_cols,
-                cur_table,
-                alt_table,
-                &long_form,
-                &band_label,
-                (min_saving, max_saving),
-                failures,
-            );
-            checked += 1;
-            continue;
-        }
-        let mut band_means = [0.0f64; 2];
-        for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
-            let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
-            pg.query(&format!(
-                "TRUNCATE {table};
-{insert}"
-            ))
-            .expect("band insert");
-            band_means[index] = measure_table(pg, table, columns, None).mean;
-        }
-        let [cur_mean, alt_mean] = band_means;
         println!(
-            "| {} | band | {band_label} -> {winner} | - | cur {cur_mean:.3} vs alt {alt_mean:.3} | 1200 |",
+            "| {} | band | {band_label} -> {winner} [{min_saving},{max_saving}] | - | saving {}..{}, cur {:.3} vs alt {:.3} | {} |",
             fixture.name,
+            paired.saving_min,
+            paired.saving_max,
+            paired.current.mean,
+            paired.alternative.mean,
+            paired.current.rows
         );
+        let (lo, hi) = (paired.saving_min, paired.saving_max);
+        if lo < min_saving || hi > max_saving {
+            failures.push(format!(
+                "{}: band [{band_label}] measures savings {lo}..{hi} outside its bounds [{min_saving},{max_saving}]",
+                fixture.name
+            ));
+        }
         let holds = match winner {
-            "alternative" => alt_mean <= cur_mean + 0.05,
-            "current" => cur_mean <= alt_mean + 0.05,
-            "tie" => (cur_mean - alt_mean).abs() <= 0.05,
+            "alternative" => lo >= 0 && hi > 0,
+            "current" => hi <= 0 && lo < 0,
+            "tie" => lo == 0 && hi == 0,
+            "mixed" => lo < 0 && hi > 0,
             other => {
                 failures.push(format!("{}: unknown band winner {other}", fixture.name));
                 true
@@ -706,11 +799,16 @@ fn verify_bands(
         };
         if !holds {
             failures.push(format!(
-                "{}: {described} declared {winner} but measures cur {cur_mean:.3} vs alt {alt_mean:.3}",
+                "{}: band [{band_label}] declared {winner} but measures savings {lo}..{hi}",
                 fixture.name
             ));
         }
-        checked += 1;
+        if controllable && (lo, hi) != (min_saving, max_saving) {
+            failures.push(format!(
+                "{}: band [{band_label}] bounds [{min_saving},{max_saving}] but every residue measures {lo}..{hi}",
+                fixture.name
+            ));
+        }
     }
 }
 
@@ -719,7 +817,7 @@ fn insert_sql(
     columns: &[(&str, &str)],
     workload: &str,
     overrides: &[(&str, String)],
-    toast_column: Option<&str>,
+    rows: u64,
 ) -> String {
     let names: Vec<&str> = columns.iter().map(|(n, _)| *n).collect();
     let exprs: Vec<String> = columns
@@ -728,9 +826,8 @@ fn insert_sql(
             if let Some((_, expr)) = overrides.iter().find(|(n, _)| n == name) {
                 return expr.clone();
             }
-            let (_, short, long) = type_spec(ty, name);
-            let long_pick = workload != "short" && toast_column != Some(*name);
-            if long_pick && matches!(*ty, "text" | "float8[]") {
+            let (short, long) = type_spec(ty, column_seed(name));
+            if workload != "short" && is_varlena(ty) {
                 long
             } else {
                 short
@@ -738,31 +835,42 @@ fn insert_sql(
         })
         .collect();
     format!(
-        "INSERT INTO {table} ({}) SELECT {} FROM generate_series(1, 1200) g;",
+        "INSERT INTO {table} ({}) SELECT {} FROM generate_series(1, {rows}) g ORDER BY g;",
         names.join(", "),
         exprs.join(", ")
     )
 }
 
-fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)], toast_column: Option<&str>) -> Measured {
-    let sizes: Vec<String> = columns
+/// Per-row padding: the tuple length minus the header and every attribute's stored bytes. Each
+/// row also carries its values (`key`, in column-name order, numbered within duplicates) to pair
+/// it with the same row of another order, and its stored sizes (`forms`, same order) to tell
+/// whether the toaster stored it the same way there.
+fn row_pads_sql(table: &str, columns: &[(&str, &str)]) -> String {
+    let mut by_name: Vec<(usize, &str)> = columns.iter().enumerate().map(|(i, (n, _))| (i, *n)).collect();
+    by_name.sort_by_key(|(_, n)| *n);
+    let key: Vec<String> = by_name.iter().map(|(_, n)| format!("t.{n}::text")).collect();
+    let forms: Vec<String> = by_name
         .iter()
-        .map(|(name, ty)| {
-            if toast_column == Some(*name) {
-                "18".to_string()
-            } else {
-                type_spec(ty, name).0
-            }
-        })
+        .map(|(i, _)| format!("length(h.t_attrs[{}])", i + 1))
         .collect();
+    format!(
+        "SELECT k.key, row_number() OVER (PARTITION BY k.key ORDER BY h.p, h.lp) AS dup, \
+                ARRAY[{forms}] AS forms, \
+                h.lp_len - h.t_hoff - (SELECT sum(length(a)) FROM unnest(h.t_attrs) a) AS pad \
+         FROM (SELECT p, (heap_page_item_attrs(get_raw_page('{table}', p::int), '{table}'::regclass)).* \
+               FROM generate_series(0, pg_relation_size('{table}') / 8192 - 1) p) h \
+         JOIN {table} t ON t.ctid = format('(%s,%s)', h.p, h.lp)::tid \
+         CROSS JOIN LATERAL (SELECT concat_ws('|', {key}) AS key) k \
+         WHERE h.lp_len > 0",
+        forms = forms.join(", "),
+        key = key.join(", ")
+    )
+}
+
+fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)]) -> Measured {
     let sql = format!(
-        "SELECT count(*), round(avg(pad)::numeric, 3), min(pad), max(pad) FROM (
-           SELECT h.lp_len - h.t_hoff - ({sizes}) AS pad
-           FROM (SELECT p, (heap_page_items(get_raw_page('{table}', p::int))).*
-                 FROM generate_series(0, pg_relation_size('{table}')/8192 - 1) p) h
-           JOIN {table} t ON t.ctid = format('(%s,%s)', h.p, h.lp)::tid
-         ) x;",
-        sizes = sizes.join(" + "),
+        "SELECT count(*), round(avg(pad)::numeric, 3), min(pad), max(pad) FROM ({}) x;",
+        row_pads_sql(table, columns)
     );
     let out = pg.query(&sql).expect("measure query");
     let fields: Vec<&str> = out.trim().split('|').collect();
@@ -774,99 +882,48 @@ fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)], toast_column: O
     }
 }
 
-/// A mixed band claims the winner flips with payload lengths mod 8 inside the band. First hold
-/// the label to its own bounds: mixed requires both signs to be attainable, so a band whose
-/// reported min/max saving proves a definite winner is mislabeled and fails outright (this is
-/// what kills a mutation that forces every winner to mixed). Then sweep the text-width residue
-/// (long texts 128+r bytes, short texts r bytes) and demand both measured signs; a band that
-/// never flips fails unless a residue-pinned varlena (an array, whose realizable payloads reach
-/// only a subset of the model's residues, the documented superset imprecision) explains it.
-#[allow(clippy::too_many_arguments)]
-fn verify_mixed_band(
-    pg: &Pg,
-    fixture: &Fixture,
-    current: &[(&str, &str)],
-    alt_cols: &[(&str, &str)],
-    cur_table: &str,
-    alt_table: &str,
-    long_form: &[&str],
-    band_label: &str,
-    bounds: (i64, i64),
-    failures: &mut Vec<String>,
-) {
-    let (min_saving, max_saving) = bounds;
-    if !(min_saving < 0 && max_saving > 0) {
-        failures.push(format!(
-            "{}: band [{band_label}] declared mixed but its own bounds [{min_saving},{max_saving}] prove a definite winner",
-            fixture.name
-        ));
-        return;
-    }
-    let has_text = fixture.columns.iter().any(|c| c.sql_type == "text");
-    if !has_text {
-        println!(
-            "| {} | band | {band_label} -> mixed | - | no text column to sweep, skipped | - |",
-            fixture.name
-        );
-        return;
-    }
-    let mut current_wins = false;
-    let mut alternative_wins = false;
-    for residue in 0..8u64 {
-        let overrides: Vec<(&str, String)> = fixture
-            .columns
-            .iter()
-            .filter(|c| matches!(c.sql_type, "text" | "float8[]"))
-            .map(|c| {
-                let generator = if c.sql_type == "text" {
-                    let width = if long_form.contains(&c.name) {
-                        128 + residue
-                    } else {
-                        residue
-                    };
-                    format!("repeat('x', {width})")
-                } else if long_form.contains(&c.name) {
-                    type_spec(c.sql_type, c.name).2
-                } else {
-                    type_spec(c.sql_type, c.name).1
-                };
-                (c.name, generator)
-            })
-            .collect();
-        let mut band_means = [0.0f64; 2];
-        for (index, (table, columns)) in [(cur_table, current), (alt_table, alt_cols)].iter().enumerate() {
-            let insert = insert_sql(table, columns, "band", &overrides, fixture.toast_column);
-            pg.query(&format!("TRUNCATE {table};\n{insert}")).expect("band insert");
-            band_means[index] = measure_table(pg, table, columns, None).mean;
-        }
-        let [cur_mean, alt_mean] = band_means;
-        if alt_mean < cur_mean - 0.05 {
-            alternative_wins = true;
-        }
-        if cur_mean < alt_mean - 0.05 {
-            current_wins = true;
-        }
-        if current_wins && alternative_wins {
-            break;
-        }
-    }
-    println!(
-        "| {} | band | {band_label} -> mixed | - | flips: cur-wins {current_wins}, alt-wins {alternative_wins} | 1200 |",
-        fixture.name
+/// Pair the rows of two orders of one table by their values. Savings count only rows the toaster
+/// stored the same way in both orders: it compresses or moves out the largest attribute first
+/// and breaks ties by attribute number, so a row near its size threshold or with tied sizes can
+/// realize differently in two orders, and the model's claims are per realization.
+fn measure_pair(pg: &Pg, cur: (&str, &[(&str, &str)]), alt: (&str, &[(&str, &str)])) -> Paired {
+    let sql = format!(
+        "WITH c AS ({}), a AS ({}), j AS (SELECT c.pad AS cp, a.pad AS ap, c.forms = a.forms AS same \
+                                     FROM c JOIN a USING (key, dup)) \
+         SELECT (SELECT count(*) FROM j), (SELECT count(*) FROM c), (SELECT count(*) FROM a), \
+                round(avg(cp)::numeric, 3), min(cp), max(cp), \
+                round(avg(ap)::numeric, 3), min(ap), max(ap), \
+                min(cp - ap) FILTER (WHERE same), max(cp - ap) FILTER (WHERE same), \
+                count(*) FILTER (WHERE NOT same) \
+         FROM j;",
+        row_pads_sql(cur.0, cur.1),
+        row_pads_sql(alt.0, alt.1)
     );
-    if !(current_wins && alternative_wins) {
-        let residue_pinned = fixture.columns.iter().any(|c| c.sql_type == "float8[]");
-        if residue_pinned {
-            println!(
-                "| {} | band | {band_label} | - | non-flip explained by a residue-pinned array (superset model) | - |",
-                fixture.name
-            );
-        } else {
-            failures.push(format!(
-                "{}: band [{band_label}] declared mixed but a residue sweep never flips the winner (cur-wins {current_wins}, alt-wins {alternative_wins})",
-                fixture.name
-            ));
-        }
+    let out = pg.query(&sql).expect("pair query");
+    let f: Vec<&str> = out.trim().split('|').collect();
+    let rows: u64 = f[0].parse().expect("rows");
+    assert_eq!(
+        (
+            f[1].parse::<u64>().expect("cur rows"),
+            f[2].parse::<u64>().expect("alt rows")
+        ),
+        (rows, rows),
+        "{} and {} must pair row for row",
+        cur.0,
+        alt.0
+    );
+    let measured = |mean: &str, min: &str, max: &str| Measured {
+        rows,
+        mean: mean.parse().expect("mean"),
+        min: min.parse().expect("min"),
+        max: max.parse().expect("max"),
+    };
+    Paired {
+        current: measured(f[3], f[4], f[5]),
+        alternative: measured(f[6], f[7], f[8]),
+        saving_min: f[9].parse().expect("saving min"),
+        saving_max: f[10].parse().expect("saving max"),
+        stored_differently: f[11].parse().expect("differing rows"),
     }
 }
 
