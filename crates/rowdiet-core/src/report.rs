@@ -174,6 +174,11 @@ pub struct ColumnReport {
     /// included); None once it is data-dependent (payload lengths of earlier varlenas, or this
     /// varlena's own pad).
     pub offset: Option<u64>,
+    /// The statement that added the column: its CREATE TABLE or its ADD COLUMN.
+    pub added_in: Origin,
+    /// Physical attribute number, 1-based, as PostgreSQL numbers it: a column added after a
+    /// drop is numbered past the dropped slot.
+    pub attnum: usize,
 }
 
 /// Layout numbers for one column order — [`TableReport::current`] and
@@ -832,6 +837,8 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             kind: c.kind,
             pad_before: w.pad_before.exact(),
             offset: w.offset,
+            added_in: c.origin.clone(),
+            attnum: c.attnum,
         })
         .collect();
     let mut assumed_types: Vec<String> = table
@@ -855,7 +862,13 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         scope => scope,
     };
     let any_nullable = table.columns.iter().any(|c| !c.not_null);
-    let layout_signature = layout_signature(&kinds);
+    let mut slots: Vec<Option<ColumnKind>> = vec![None; kinds.len() + table.dropped_count];
+    for column in &table.columns {
+        if let Some(slot) = column.attnum.checked_sub(1).and_then(|i| slots.get_mut(i)) {
+            *slot = Some(column.kind);
+        }
+    }
+    let layout_signature = layout_signature(&slots);
     TableReport {
         name: table.key,
         display: table.display,
@@ -889,25 +902,130 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     }
 }
 
-/// Canonical signature of a kind sequence: `f{len}{align}` per fixed column, `v{align}` per
-/// varlena (`p` appended when typmod-proven short), comma-joined — e.g. `f8d,f4i,vi,vip`.
-/// Stored verbatim in baseline entries: self-describing in diffs, and free of hash-stability
-/// concerns across releases. `ADD COLUMN` appends, so growth keeps the old signature as a
-/// comma-boundary prefix — the property the baseline gate's prefix rule relies on.
-pub fn layout_signature(kinds: &[ColumnKind]) -> String {
-    let parts: Vec<String> = kinds
+/// Canonical signature of the physical attribute slots: `f{len}{align}` per fixed column,
+/// `v{align}` per varlena (`p` appended when typmod-proven short), `-` per dropped slot,
+/// comma-joined, e.g. `f8d,f4i,-,vi,vip`. Stored verbatim in baseline entries: self-describing in
+/// diffs, and free of hash-stability concerns across releases. `ADD COLUMN` appends a slot and
+/// `DROP COLUMN` turns one into `-` without moving any other, which is what lets the baseline
+/// gate tell the committed slots from the appended ones.
+pub fn layout_signature(slots: &[Option<ColumnKind>]) -> String {
+    let parts: Vec<String> = slots
         .iter()
-        .map(|kind| match kind {
-            ColumnKind::Fixed { len, align } => format!("f{len}{}", align_letter(*align)),
-            ColumnKind::Varlena {
+        .map(|slot| match slot {
+            Some(ColumnKind::Fixed { len, align }) => format!("f{len}{}", align_letter(*align)),
+            Some(ColumnKind::Varlena {
                 align, proven_short, ..
-            } => {
+            }) => {
                 let p = if *proven_short { "p" } else { "" };
                 format!("v{}{p}", align_letter(*align))
             }
+            None => "-".to_string(),
         })
         .collect();
     parts.join(",")
+}
+
+/// The appended block of a table whose leading slots are committed: applied in production,
+/// where only a rewrite could reorder them. The block's order is still free while the migration
+/// that appends it is unapplied, so it is judged by dominance among orders of the block, starting
+/// from the offset residues the committed columns can end at; those are never reordered.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct BlockFinding {
+    /// The statements that appended the block's columns, in order, each once.
+    pub origins: Vec<Origin>,
+    /// Committed attribute slots ahead of the block, dropped ones included.
+    pub committed_slots: usize,
+    /// Live committed columns ahead of the block.
+    pub prefix_columns: usize,
+    /// The block's columns in written order (display names).
+    pub columns: Vec<String>,
+    /// The block order to write instead; the written order when nothing dominates it.
+    pub suggested_order: Vec<String>,
+    /// What the suggested block order saves: deterministic plus dominance-proven, as for a table
+    /// (row-size bytes at the exact tier, padding bytes at the estimate tier).
+    pub avoidable_bytes_per_row: f64,
+    /// Exactly-known waste the block reorder removes, bytes/row.
+    pub avoidable_deterministic: u64,
+    /// Further worst-case waste the dominating block order removes, bytes/row.
+    pub avoidable_dominance: u64,
+    /// Guaranteed-to-maximum saving of the suggested block order over every realization.
+    pub dominance_saving: Option<SavingRange>,
+    /// How far the search over block orders went.
+    pub dominance_search: DominanceScope,
+    /// How much of the block's order space the pole search proved.
+    pub search_scope: layout::SearchScope,
+    /// A workload-dependent alternative block order, reported and never gated.
+    pub frontier: Option<Frontier>,
+}
+
+/// Judge the columns of `table` past its first `committed_slots` attribute slots as an appended
+/// block, or None when there is no block (nothing was appended) or the table could not be
+/// modeled.
+pub fn block_finding(table: &TableReport, committed_slots: usize) -> Option<BlockFinding> {
+    let prefix_columns = table.columns.iter().take_while(|c| c.attnum <= committed_slots).count();
+    if table.incomplete || prefix_columns >= table.columns.len() {
+        return None;
+    }
+    let columns: Vec<Column> = table
+        .columns
+        .iter()
+        .map(|c| Column {
+            kind: c.kind,
+            nullable: !c.not_null,
+        })
+        .collect();
+    let (prefix, block) = columns.split_at(prefix_columns);
+    let names: Vec<String> = table.columns[prefix_columns..].iter().map(|c| c.name.clone()).collect();
+    let block_kinds: Vec<ColumnKind> = block.iter().map(|c| c.kind).collect();
+    let start = Start::after(prefix);
+    let walk = layout::walk_from(start, &block_kinds);
+    let search = layout::search_from(start, &block_kinds);
+    let measure = if table.tier == Tier::Exact {
+        Measure::RowSize
+    } else {
+        Measure::Padding
+    };
+    let decision = decide(start, block, &search, &walk, measure);
+    let avoidable = decision.avoidable_deterministic + decision.avoidable_dominance;
+    let order = if avoidable == 0 {
+        (0..block.len()).collect()
+    } else {
+        decision.order
+    };
+    let frontier = decision
+        .frontier_order
+        .as_ref()
+        .map(|alternative| frontier_report(start, block, &names, &walk, alternative, measure));
+    let mut origins: Vec<Origin> = Vec::new();
+    for column in &table.columns[prefix_columns..] {
+        if !origins.contains(&column.added_in) {
+            origins.push(column.added_in.clone());
+        }
+    }
+    Some(BlockFinding {
+        origins,
+        committed_slots,
+        prefix_columns,
+        suggested_order: order.iter().map(|&i| names[i].clone()).collect(),
+        columns: names,
+        avoidable_bytes_per_row: avoidable as f64,
+        avoidable_deterministic: decision.avoidable_deterministic,
+        avoidable_dominance: decision.avoidable_dominance,
+        dominance_saving: (avoidable > 0).then_some(decision.dominance_saving).flatten(),
+        dominance_search: match decision.dominance_search {
+            DominanceScope::Exhaustive
+                if block
+                    .iter()
+                    .any(|c| matches!(c.kind, ColumnKind::Varlena { payload, .. } if !payload.verified)) =>
+            {
+                DominanceScope::Superset
+            }
+            scope => scope,
+        },
+        search_scope: search.scope,
+        frontier,
+    })
 }
 
 fn align_letter(align: layout::Align) -> char {

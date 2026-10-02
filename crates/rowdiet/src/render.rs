@@ -2,7 +2,7 @@
 
 use rowdiet_core::dominance::Measure;
 use rowdiet_core::layout::SearchScope;
-use rowdiet_core::report::{BandWinner, DominanceScope, Frontier};
+use rowdiet_core::report::{BandWinner, BlockFinding, DominanceScope, Frontier};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOutcome) -> String {
     let mut out = String::new();
     for table in &analysis.tables {
-        render_table(&mut out, table, rows, suggest, gate.verdicts.get(&table.name).copied());
+        render_table(&mut out, table, rows, suggest, gate);
     }
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "notes:");
@@ -47,17 +47,13 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOu
 
 fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
     let mut new_violations = 0u32;
-    let mut regressions = 0u32;
-    let mut grown = 0u32;
+    let mut blocks = 0u32;
     let mut modified = 0u32;
-    let mut ratchets = 0u32;
     for verdict in gate.verdicts.values() {
         match verdict {
             TableVerdict::NewViolation { .. } => new_violations += 1,
-            TableVerdict::Regression { .. } => regressions += 1,
-            TableVerdict::GrownSinceBaseline { .. } => grown += 1,
+            TableVerdict::BlockNotDominanceOptimal { .. } => blocks += 1,
             TableVerdict::ModifiedSinceBaseline { .. } => modified += 1,
-            TableVerdict::RatchetOpportunity { .. } => ratchets += 1,
             // Counted in gate.incomplete_tables and reported on the degraded line below.
             TableVerdict::Pass | TableVerdict::Incomplete => {}
         }
@@ -86,11 +82,8 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         if new_violations > 0 {
             parts.push(format!("{new_violations} table(s) over the fail-over gate"));
         }
-        if regressions > 0 {
-            parts.push(format!("{regressions} regression(s) vs baseline"));
-        }
-        if grown > 0 {
-            parts.push(format!("{grown} grown since baseline"));
+        if blocks > 0 {
+            parts.push(format!("{blocks} appended block(s) not dominance-optimal"));
         }
         if modified > 0 {
             parts.push(format!("{modified} modified since baseline"));
@@ -106,10 +99,12 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         }
         let _ = writeln!(out, "FAIL: {}", parts.join(", "));
     }
-    if ratchets > 0 {
+    if !gate.ignored_allowances.is_empty() {
         let _ = writeln!(
             out,
-            "baseline: {ratchets} table(s) now beat their allowance — tighten via --accept <table> or --update-baseline"
+            "baseline: byte allowances ignored for {} (appended blocks are judged by dominance now; \
+             --update-baseline or --accept drops them)",
+            escape_text(&gate.ignored_allowances.join(", "))
         );
     }
     if !gate.orphaned.is_empty() {
@@ -128,7 +123,9 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
     }
 }
 
-fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, verdict: Option<TableVerdict>) {
+fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, gate: &GateOutcome) {
+    let verdict = gate.verdicts.get(&t.name).copied();
+    let block = gate.blocks.get(&t.name);
     let loc = escape_text(&t.origin.to_string()).into_owned();
     let display = escape_text(&t.display);
     if t.ignored {
@@ -185,7 +182,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         let _ = writeln!(out, "{mark} {display} ({loc}) — {detail} [{}]", tier_label(t));
         render_frontier(out, t);
         render_flags(out, t);
-        render_verdict(out, t, verdict);
+        render_verdict(out, t, verdict, block);
         return;
     }
     let _ = writeln!(
@@ -238,43 +235,83 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         }
     }
     render_flags(out, t);
-    render_verdict(out, t, verdict);
+    render_verdict(out, t, verdict, block);
     if suggest {
         render_suggestion(out, t);
     }
 }
 
-fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdict>) {
-    match verdict {
-        Some(TableVerdict::Regression { avoidable, allowed }) => {
-            let _ = writeln!(
-                out,
-                "  ✗ regression: {avoidable:.1} B/row exceeds the baselined allowance of {allowed}"
-            );
+fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdict>, block: Option<&BlockFinding>) {
+    if let Some(block) = block {
+        render_block(
+            out,
+            t,
+            block,
+            matches!(verdict, Some(TableVerdict::BlockNotDominanceOptimal { .. })),
+        );
+    }
+    if let Some(TableVerdict::ModifiedSinceBaseline { .. }) = verdict {
+        let _ = writeln!(
+            out,
+            "  ✗ modified since baseline: the committed layout changed; meet fail-over or re-accept with --accept {}",
+            escape_text(&t.name)
+        );
+    }
+}
+
+/// The appended block of a baselined table: the one order still free, judged with the
+/// committed prefix in place.
+fn render_block(out: &mut String, t: &TableReport, block: &BlockFinding, failing: bool) {
+    let dropped = block.committed_slots - block.prefix_columns;
+    let appended = format!(
+        "{} column(s) after a committed prefix of {}{}",
+        block.columns.len(),
+        block.prefix_columns,
+        if dropped > 0 {
+            format!(" and {dropped} dropped slot(s)")
+        } else {
+            String::new()
         }
-        Some(TableVerdict::GrownSinceBaseline { allowed, .. }) => {
-            let _ = writeln!(
-                out,
-                "  ✗ grown since baseline: appended columns push waste past the allowance of {allowed} — \
-                 reorder them in the appending migration, or --accept {}",
-                escape_text(&t.name)
-            );
+    );
+    // One location per migration file: the first statement there that appends to the block.
+    let mut origins: Vec<String> = Vec::new();
+    for (i, origin) in block.origins.iter().enumerate() {
+        if block.origins[..i].iter().all(|o| o.source != origin.source) {
+            origins.push(origin.to_string());
         }
-        Some(TableVerdict::ModifiedSinceBaseline { .. }) => {
-            let _ = writeln!(
-                out,
-                "  ✗ modified since baseline: the allowance expired — meet fail-over or re-accept with --accept {}",
-                escape_text(&t.name)
-            );
-        }
-        Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
-            let _ = writeln!(
-                out,
-                "  ↓ ratchet: allowance {allowed} can tighten to {avoidable} — --accept {}",
-                escape_text(&t.name)
-            );
-        }
-        Some(TableVerdict::Pass | TableVerdict::NewViolation { .. } | TableVerdict::Incomplete) | None => {}
+    }
+    let origins = escape_text(&origins.join(", ")).into_owned();
+    if block.avoidable_bytes_per_row == 0.0 {
+        let claim = match block.dominance_search {
+            DominanceScope::Exhaustive => "no dominating block order exists",
+            DominanceScope::Budgeted => "no dominating block order found (dominance search budgeted)",
+            DominanceScope::Superset => "no dominating block order found (payload lengths unverified)",
+        };
+        let _ = writeln!(out, "  ✓ appended block ({origins}, {appended}): {claim}");
+    } else {
+        let mark = if failing { "✗" } else { "↓" };
+        let _ = writeln!(
+            out,
+            "  {mark} appended block ({origins}, {appended}) is not dominance-optimal: reorder it where it is \
+             appended (the committed columns stay), or --accept {}",
+            escape_text(&t.name)
+        );
+        let basis = match block.dominance_saving {
+            Some(saving) => format!(
+                "; saves {}-{} B/row in every realization ({} B deterministic + {} B dominance-proven)",
+                saving.min, saving.max, block.avoidable_deterministic, block.avoidable_dominance
+            ),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "    block order: {} → {:.1} B/row avoidable{basis}",
+            escape_text(&block.suggested_order.join(", ")),
+            block.avoidable_bytes_per_row
+        );
+    }
+    if let Some(frontier) = &block.frontier {
+        render_frontier_body(out, t, frontier, "    block frontier");
     }
 }
 
@@ -304,10 +341,15 @@ fn scope_note(t: &TableReport) -> &'static str {
 /// The workload-dependent alternative: both orders, worst cases, and the decision boundary by
 /// storage-form band. Reported only; the gate never sees it.
 fn render_frontier(out: &mut String, t: &TableReport) {
-    let Some(frontier) = &t.frontier else { return };
+    if let Some(frontier) = &t.frontier {
+        render_frontier_body(out, t, frontier, "  frontier ");
+    }
+}
+
+fn render_frontier_body(out: &mut String, t: &TableReport, frontier: &Frontier, label: &str) {
     let _ = writeln!(
         out,
-        "  frontier : {} — worst case {} B/row vs current {} B/row (workload-dependent, not gated)",
+        "{label}: {} — worst case {} B/row vs current {} B/row (workload-dependent, not gated)",
         escape_text(&frontier.order.join(", ")),
         frontier.alternative_worst,
         frontier.current_worst
@@ -771,14 +813,16 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             continue;
         }
         let verdict = gate.verdicts.get(&t.name).copied();
+        // A failing block is reported at the statement that appended it, below.
+        if matches!(verdict, Some(TableVerdict::BlockNotDominanceOptimal { .. })) {
+            continue;
+        }
         let level = if verdict.is_some_and(TableVerdict::failing) {
             "error"
         } else {
             "warning"
         };
         let title = match verdict {
-            Some(TableVerdict::Regression { .. }) => "rowdiet regression",
-            Some(TableVerdict::GrownSinceBaseline { .. }) => "rowdiet grown-since-baseline",
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "rowdiet modified-since-baseline",
             _ => "rowdiet",
         };
@@ -802,6 +846,36 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
                 escape_property(&t.origin.source),
                 t.origin.line,
                 escape_property(title),
+                escape_message(&message)
+            ),
+        );
+    }
+    for (name, block) in &gate.blocks {
+        if !matches!(
+            gate.verdicts.get(name),
+            Some(TableVerdict::BlockNotDominanceOptimal { .. })
+        ) {
+            continue;
+        }
+        let saving = match block.dominance_saving {
+            Some(range) => format!("; saves {}-{} B/row in every realization", range.min, range.max),
+            None => String::new(),
+        };
+        let message = format!(
+            "table {name}: appended block {} is not dominance-optimal ({:.1} B/row avoidable{saving}); block order: {}; \
+             the committed prefix stays",
+            block.columns.join(", "),
+            block.avoidable_bytes_per_row,
+            block.suggested_order.join(", ")
+        );
+        budget.emit(
+            &mut out,
+            "error",
+            &format!(
+                "::error file={},line={},title={}::{}",
+                escape_property(&block.origins[0].source),
+                block.origins[0].line,
+                escape_property("rowdiet block-not-dominance-optimal"),
                 escape_message(&message)
             ),
         );
@@ -921,12 +995,14 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         let verdict = match gate.verdicts.get(&t.name).copied() {
             Some(TableVerdict::Pass) | None => "pass".to_string(),
             Some(TableVerdict::NewViolation { .. }) => "**new violation**".to_string(),
-            Some(TableVerdict::Regression { allowed, .. }) => format!("**regression** (allowed {allowed})"),
-            Some(TableVerdict::GrownSinceBaseline { allowed, .. }) => {
-                format!("**grown since baseline** (allowed {allowed})")
-            }
+            Some(TableVerdict::BlockNotDominanceOptimal { .. }) => format!(
+                "**block not dominance-optimal** (block order: {})",
+                gate.blocks
+                    .get(&t.name)
+                    .map(|b| markdown_cell(&b.suggested_order.join(", ")))
+                    .unwrap_or_default()
+            ),
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "**modified since baseline**".to_string(),
-            Some(TableVerdict::RatchetOpportunity { allowed, .. }) => format!("ratchet (allowed {allowed})"),
             Some(TableVerdict::Incomplete) => "incomplete".to_string(),
         };
         let tier = match t.tier {
