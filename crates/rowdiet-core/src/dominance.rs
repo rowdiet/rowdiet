@@ -199,13 +199,13 @@ fn joint_walk(
     varlenas: &[usize],
     pin: Option<&FormPin<'_>>,
 ) -> DiffBounds {
-    let segments_a = fixed_segments(kinds, a);
-    let segments_b = fixed_segments(kinds, b);
-    debug_assert_eq!(segments_a.len(), varlenas.len() + 1);
-    debug_assert_eq!(segments_b.len(), varlenas.len() + 1);
+    let runs_a = run_tables(kinds, a);
+    let runs_b = run_tables(kinds, b);
+    debug_assert_eq!(runs_a.len(), varlenas.len() + 1);
+    debug_assert_eq!(runs_b.len(), varlenas.len() + 1);
     let mut states: [Option<DiffBounds>; 64] = [None; 64];
-    let (pad_a0, ra0) = fixed_run(0, &segments_a[0]);
-    let (pad_b0, rb0) = fixed_run(0, &segments_b[0]);
+    let (pad_a0, ra0) = runs_a[0][0];
+    let (pad_b0, rb0) = runs_b[0][0];
     let d0 = pad_a0 as i64 - pad_b0 as i64;
     states[(ra0 * 8 + rb0) as usize] = Some(DiffBounds { min: d0, max: d0 });
     for (k, &column) in varlenas.iter().enumerate() {
@@ -224,8 +224,8 @@ fn joint_walk(
                     }
                     let (pad_a, ra2) = varlena_step(ra, align.bytes(), form_long, payload);
                     let (pad_b, rb2) = varlena_step(rb, align.bytes(), form_long, payload);
-                    let (fa, ra3) = fixed_run(ra2, &segments_a[k + 1]);
-                    let (fb, rb3) = fixed_run(rb2, &segments_b[k + 1]);
+                    let (fa, ra3) = runs_a[k + 1][ra2 as usize];
+                    let (fb, rb3) = runs_b[k + 1][rb2 as usize];
                     let delta = (pad_a + fa) as i64 - (pad_b + fb) as i64;
                     let moved = DiffBounds {
                         min: bounds.min + delta,
@@ -277,6 +277,17 @@ fn fixed_segments(kinds: &[ColumnKind], order: &[usize]) -> Vec<Vec<(u64, u64)>>
     segments
 }
 
+/// A fixed run's effect from each start residue: (padding total, residue after).
+type RunTable = [(u64, u64); MAXALIGN as usize];
+
+/// One [`RunTable`] per fixed run of `order`, so a walk costs a step per varlena at any width.
+fn run_tables(kinds: &[ColumnKind], order: &[usize]) -> Vec<RunTable> {
+    fixed_segments(kinds, order)
+        .iter()
+        .map(|segment| std::array::from_fn(|residue| fixed_run(residue as u64, segment)))
+        .collect()
+}
+
 /// Walk a fixed run from a residue: (padding total, residue after).
 fn fixed_run(mut residue: u64, segment: &[(u64, u64)]) -> (u64, u64) {
     let mut total = 0;
@@ -301,26 +312,56 @@ fn enumerate(
     for (slot, &c) in varlenas.iter().enumerate() {
         slot_of[c] = slot;
     }
+    let plans = [WalkPlan::new(kinds, a, &slot_of), WalkPlan::new(kinds, b, &slot_of)];
     let mut assignment: Vec<(bool, u64)> = vec![(false, 0); varlenas.len()];
     let mut out: Option<DiffBounds> = None;
-    enumerate_rec(kinds, a, b, varlenas, pin, &slot_of, &mut assignment, 0, &mut out);
+    enumerate_rec(kinds, &plans, varlenas, pin, &mut assignment, 0, &mut out);
     out.expect("at least one realization exists")
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One order reduced to its varlenas (as slots into the assignment) and the fixed runs between.
+struct WalkPlan {
+    varlenas: Vec<(usize, u64)>,
+    runs: Vec<RunTable>,
+}
+
+impl WalkPlan {
+    fn new(kinds: &[ColumnKind], order: &[usize], slot_of: &[usize]) -> Self {
+        let varlenas = varlena_sequence(kinds, order)
+            .into_iter()
+            .map(|c| (slot_of[c], kinds[c].align().bytes()))
+            .collect();
+        Self {
+            varlenas,
+            runs: run_tables(kinds, order),
+        }
+    }
+
+    /// Padding of the order under one full realization, residues only.
+    fn pad(&self, assignment: &[(bool, u64)]) -> u64 {
+        let (mut total, mut residue) = self.runs[0][0];
+        for (k, &(slot, align)) in self.varlenas.iter().enumerate() {
+            let (form_long, payload) = assignment[slot];
+            let (p, next) = varlena_step(residue, align, form_long, payload);
+            let (fixed, after) = self.runs[k + 1][next as usize];
+            total += p + fixed;
+            residue = after;
+        }
+        total
+    }
+}
+
 fn enumerate_rec(
     kinds: &[ColumnKind],
-    a: &[usize],
-    b: &[usize],
+    plans: &[WalkPlan; 2],
     varlenas: &[usize],
     pin: Option<&FormPin<'_>>,
-    slot_of: &[usize],
     assignment: &mut Vec<(bool, u64)>,
     depth: usize,
     out: &mut Option<DiffBounds>,
 ) {
     if depth == varlenas.len() {
-        let d = concrete_pad(kinds, a, slot_of, assignment) as i64 - concrete_pad(kinds, b, slot_of, assignment) as i64;
+        let d = plans[0].pad(assignment) as i64 - plans[1].pad(assignment) as i64;
         let bounds = DiffBounds { min: d, max: d };
         match out {
             Some(existing) => existing.merge(bounds),
@@ -336,31 +377,9 @@ fn enumerate_rec(
                 continue;
             }
             assignment[depth] = (form_long, payload);
-            enumerate_rec(kinds, a, b, varlenas, pin, slot_of, assignment, depth + 1, out);
+            enumerate_rec(kinds, plans, varlenas, pin, assignment, depth + 1, out);
         }
     }
-}
-
-/// Padding of one order under one full realization, residues only.
-fn concrete_pad(kinds: &[ColumnKind], order: &[usize], slot_of: &[usize], assignment: &[(bool, u64)]) -> u64 {
-    let mut residue = 0u64;
-    let mut total = 0u64;
-    for &i in order {
-        match kinds[i] {
-            ColumnKind::Fixed { len, align } => {
-                let p = pad(residue, align.bytes());
-                total += p;
-                residue = (residue + p + len) % MAXALIGN;
-            }
-            ColumnKind::Varlena { align, .. } => {
-                let (form_long, payload) = assignment[slot_of[i]];
-                let (p, next) = varlena_step(residue, align.bytes(), form_long, payload);
-                total += p;
-                residue = next;
-            }
-        }
-    }
-    total
 }
 
 #[cfg(test)]
