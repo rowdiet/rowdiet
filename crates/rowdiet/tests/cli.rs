@@ -246,6 +246,8 @@ fn cargo_subcommand_shim() {
     assert_eq!(gated.status.code(), Some(1));
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn pg_exact_parser_matches_default() {
     let default_run = bin()
@@ -378,6 +380,8 @@ fn github_step_summary_file_is_appended() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn baseline_is_portable_across_parser_backends() {
     // Reports key on the fold key, not the backend-dependent display spelling, so a baseline
