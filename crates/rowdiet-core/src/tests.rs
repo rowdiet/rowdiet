@@ -1575,6 +1575,170 @@ mod decision_policy {
     }
 }
 
+/// Wide and hostile tables from the closure review of ee5844e: every one terminates within a
+/// wall-time bound, and none prints a clean verdict over a dominating reorder the engine can
+/// decide.
+mod closure_review {
+    use super::src;
+    use crate::layout::SearchScope;
+    use crate::report::{DominanceScope, SavingRange, TableReport};
+    use crate::{Config, analyze_sources};
+    use std::time::{Duration, Instant};
+
+    fn table_sql(name: &str, types: &[&str]) -> String {
+        let cols: Vec<String> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("c{i} {ty} NOT NULL"))
+            .collect();
+        format!("CREATE TABLE {name} ({});", cols.join(", "))
+    }
+
+    /// Analyze on a worker thread and fail instead of hanging when it overruns `bound`.
+    fn analyze_within(sql: String, bound: Duration) -> (TableReport, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let analysis = analyze_sources(&[src("V1__h.sql", &sql)], &Config::default());
+            let _ = tx.send((
+                analysis.tables.into_iter().next().expect("one table"),
+                started.elapsed(),
+            ));
+        });
+        rx.recv_timeout(bound).expect("analysis overran its wall-time bound")
+    }
+
+    fn repeat(ty: &'static str, n: usize) -> Vec<&'static str> {
+        vec![ty; n]
+    }
+
+    #[test]
+    fn same_class_runs_of_256_and_more_terminate() {
+        // 256 members of one padding class wrapped a u8 counter and spun the DP forever.
+        let bound = Duration::from_secs(60);
+        let (t, _) = analyze_within(table_sql("t256", &repeat("text", 256)), bound);
+        assert_eq!(t.natts, 256);
+        let mut types = repeat("timetz", 2);
+        types.extend(repeat("integer", 300));
+        let (t, _) = analyze_within(table_sql("tz_i300", &types), bound);
+        // The exact tier takes the DP's padding minimum: one int4 between the two timetz.
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn postgres_width_tables_terminate_within_the_bound() {
+        let bound = Duration::from_secs(60);
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let mut five_varlenas = repeat("integer", 1595);
+        five_varlenas.extend(["text", "text", "text", "text", "float8[]"]);
+        let mut seven_classes: Vec<&str> = (0..1595).map(|i| seven[i % 7]).collect();
+        seven_classes.extend(["text", "text", "text", "text", "float8[]"]);
+        let mut five_thousand = vec!["text"];
+        five_thousand.extend(repeat("integer", 5039));
+        for (name, types) in [
+            ("w1600_5v", five_varlenas),
+            ("w1600_7cls_5v", seven_classes),
+            ("w5040", five_thousand),
+        ] {
+            let (t, elapsed) = analyze_within(table_sql(name, &types), bound);
+            assert_eq!(t.natts, types.len(), "{name}");
+            assert!(elapsed < bound, "{name} took {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn a_dominating_pole_is_recommended_when_the_sweep_runs_out_of_budget() {
+        // Four proven-short varchars and a text exhaust the sweep's comparison budget; the
+        // minimax pole (id, note, ...) dominates the written order and used to print as a
+        // workload-dependent frontier. Measured on PostgreSQL 16: 0.000 vs 0.736 B/row mean, no
+        // row worse.
+        let a = analyze_sources(
+            &[src(
+                "V1__o.sql",
+                "CREATE TABLE orders (id bigint NOT NULL, country varchar(2) NOT NULL, \
+                 currency varchar(3) NOT NULL, status varchar(16) NOT NULL, channel varchar(12) NOT NULL, note text);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.dominance_search, DominanceScope::Budgeted);
+        assert_eq!(t.avoidable_bytes_per_row, 3.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 3 }));
+        assert_eq!(t.suggested_order[..2], ["id".to_string(), "note".to_string()]);
+        assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn fixed_waste_past_24_fixed_columns_gates() {
+        // 30 fixed columns and 6 varlenas: every pole reorders the varlenas out of the
+        // enumeration budget, and the prefix repack was a no-op past 24 fixed columns, so 100 B
+        // of deterministic padding passed clean. Measured: 100.806 vs 0.806 B/row.
+        let mut types: Vec<&str> = Vec::new();
+        for _ in 0..10 {
+            types.extend(["boolean", "bigint"]);
+        }
+        for _ in 0..5 {
+            types.extend(["smallint", "timestamptz"]);
+        }
+        types.extend(["varchar(20)", "text", "jsonb", "text", "numeric", "text[]"]);
+        let a = analyze_sources(&[src("V1__w.sql", &table_sql("wide36", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 100);
+        assert_eq!(t.avoidable_deterministic, 100);
+        assert!(t.avoidable_bytes_per_row >= 100.0, "{}", t.avoidable_bytes_per_row);
+        let saving = t.dominance_saving.expect("dominance-proven");
+        assert!(saving.min >= 97, "{saving:?}");
+    }
+
+    #[test]
+    fn fixed_waste_at_1600_columns_gates() {
+        // The same cliff at PostgreSQL's column limit: 1,590 B/row of certain padding passed
+        // clean with six varlenas.
+        let bound = Duration::from_secs(60);
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let mut types: Vec<&str> = (0..1594).map(|i| seven[i % 7]).collect();
+        types.extend(["text", "text", "jsonb", "text", "numeric", "float8[]"]);
+        let (t, _) = analyze_within(table_sql("w1600_6v", &types), bound);
+        assert_eq!(t.current.padding, 1590);
+        assert!(t.avoidable_deterministic > 0, "{}", t.avoidable_deterministic);
+        assert!(t.dominance_saving.is_some());
+    }
+
+    #[test]
+    fn exact_tier_past_24_columns_takes_the_search_minimum() {
+        // 26 fixed columns: the exact tier used the capped heuristic and printed "nothing to
+        // gain" while alternating timetz and int4 saves a MAXALIGN rung (measured 232 vs 236 B
+        // tuples, 3 vs 4 pages per 100 rows).
+        let mut types: Vec<&str> = Vec::new();
+        for _ in 0..11 {
+            types.extend(["timetz", "integer"]);
+        }
+        types.extend(["timetz", "timetz", "integer", "integer"]);
+        let a = analyze_sources(&[src("V1__e.sql", &table_sql("exact26", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 4);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn a_capped_exact_search_claims_no_exhaustiveness() {
+        // Seven fixed classes of 40 columns each put both searches over budget; the heuristic
+        // sort still pads, and the labels must say the search was capped.
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let types: Vec<&str> = (0..280).map(|i| seven[i % 7]).collect();
+        let a = analyze_sources(&[src("V1__c.sql", &table_sql("capped", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.search_scope, SearchScope::SortOnly);
+        assert_eq!(t.dominance_search, DominanceScope::Budgeted);
+        assert!(t.avoidable_bytes_per_row > 0.0, "the sort still beats round-robin");
+    }
+}
+
 /// The sweep's completeness, held to brute force: on every schema whose sweep reports
 /// exhaustive, a dominating reorder found by trying all permutations must also be found (and
 /// its best attainable saving matched) by the candidate space. The tmtm class (two same-class
