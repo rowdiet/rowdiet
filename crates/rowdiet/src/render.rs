@@ -3,6 +3,7 @@
 use rowdiet_core::layout::SearchScope;
 use rowdiet_core::report::{BandWinner, DominanceScope, Frontier};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -15,7 +16,13 @@ pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOu
         let _ = writeln!(out, "notes:");
         for note in &analysis.notes {
             // Origin's Display prints the bare source for path-level notes (line 0).
-            let _ = writeln!(out, "  {} [{}] {}", note.origin, kind_label(note.kind), note.detail);
+            let _ = writeln!(
+                out,
+                "  {} [{}] {}",
+                escape_line_start(&note.origin.to_string()),
+                kind_label(note.kind),
+                escape_text(&note.detail)
+            );
         }
     }
     let wasteful = analysis
@@ -90,22 +97,23 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         let _ = writeln!(
             out,
             "baseline: orphaned entries (no matching table): {}",
-            gate.orphaned.join(", ")
+            escape_text(&gate.orphaned.join(", "))
         );
     }
     if !gate.expired.is_empty() {
         let _ = writeln!(
             out,
             "baseline: expired entries (layout changed, table within fail-over): {}",
-            gate.expired.join(", ")
+            escape_text(&gate.expired.join(", "))
         );
     }
 }
 
 fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, verdict: Option<TableVerdict>) {
-    let loc = &t.origin;
+    let loc = escape_text(&t.origin.to_string()).into_owned();
+    let display = escape_text(&t.display);
     if t.ignored {
-        let _ = writeln!(out, "∅ {} ({loc}) — ignored (rowdiet:ignore)", t.display);
+        let _ = writeln!(out, "∅ {display} ({loc}) — ignored (rowdiet:ignore)");
         return;
     }
     // A table we could not fully model (unexpanded LIKE/INHERITS/typed table, or a partition
@@ -117,7 +125,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         } else {
             "columns not fully known"
         };
-        let _ = writeln!(out, "◌ {} ({loc}) — {detail} — not analyzable", t.display);
+        let _ = writeln!(out, "◌ {display} ({loc}) — {detail} — not analyzable");
         render_flags(out, t);
         return;
     }
@@ -134,7 +142,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
             // Incomplete tables return above as "not analyzable"; unreachable here in practice.
             (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
-        let _ = writeln!(out, "✓ {} ({loc}) — {detail} [{}]", t.display, tier_label(t.tier));
+        let _ = writeln!(out, "✓ {display} ({loc}) — {detail} [{}]", tier_label(t.tier));
         render_frontier(out, t);
         render_flags(out, t);
         render_verdict(out, t, verdict);
@@ -142,8 +150,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
     }
     let _ = writeln!(
         out,
-        "■ {} ({loc}) — {} columns — {}{}",
-        t.display,
+        "■ {display} ({loc}) — {} columns — {}{}",
         t.natts,
         tier_label(t.tier),
         scope_note(t)
@@ -162,7 +169,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         stats_line(&t.suggested),
         t.avoidable_bytes_per_row
     );
-    let _ = writeln!(out, "  order    : {}", t.suggested_order.join(", "));
+    let _ = writeln!(out, "  order    : {}", escape_text(&t.suggested_order.join(", ")));
     if let Some(n) = rows {
         // A dominance finding is a range; extrapolating only its maximum would overstate it.
         match t.dominance_saving {
@@ -210,21 +217,21 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
                 out,
                 "  ✗ grown since baseline: appended columns push waste past the allowance of {allowed} — \
                  reorder them in the appending migration, or --accept {}",
-                t.name
+                escape_text(&t.name)
             );
         }
         Some(TableVerdict::ModifiedSinceBaseline { .. }) => {
             let _ = writeln!(
                 out,
                 "  ✗ modified since baseline: the allowance expired — meet fail-over or re-accept with --accept {}",
-                t.name
+                escape_text(&t.name)
             );
         }
         Some(TableVerdict::RatchetOpportunity { avoidable, allowed }) => {
             let _ = writeln!(
                 out,
                 "  ↓ ratchet: allowance {allowed} can tighten to {avoidable} — --accept {}",
-                t.name
+                escape_text(&t.name)
             );
         }
         Some(TableVerdict::Pass | TableVerdict::NewViolation { .. } | TableVerdict::Incomplete) | None => {}
@@ -352,7 +359,11 @@ fn render_flags(out: &mut String, t: &TableReport) {
     }
     if !t.assumed_types.is_empty() {
         let list = t.assumed_types.join(", ");
-        let _ = writeln!(out, "  ⚠ assumed varlena/int-aligned (teach via --assume-type): {list}");
+        let _ = writeln!(
+            out,
+            "  ⚠ assumed varlena/int-aligned (teach via --assume-type): {}",
+            escape_text(&list)
+        );
     }
 }
 
@@ -361,14 +372,19 @@ fn render_suggestion(out: &mut String, t: &TableReport) {
         out,
         "  -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):"
     );
-    let _ = writeln!(out, "  CREATE TABLE {} (", t.display);
+    let _ = writeln!(out, "  CREATE TABLE {} (", escape_text(&t.display));
     let by_name: BTreeMap<&str, &ColumnReport> = t.columns.iter().map(|c| (c.name.as_str(), c)).collect();
     let last = t.suggested_order.len().saturating_sub(1);
     for (i, name) in t.suggested_order.iter().enumerate() {
         if let Some(col) = by_name.get(name.as_str()) {
             let not_null = if col.not_null { " NOT NULL" } else { "" };
             let comma = if i == last { "" } else { "," };
-            let _ = writeln!(out, "      {} {}{not_null}{comma}", maybe_quote(name), col.type_display);
+            let _ = writeln!(
+                out,
+                "      {} {}{not_null}{comma}",
+                maybe_quote(name),
+                escape_text(&col.type_display)
+            );
         }
     }
     let _ = writeln!(out, "  );");
@@ -382,9 +398,65 @@ fn maybe_quote(ident: &str) -> String {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if plain {
         ident.to_string()
+    } else if matches!(escape_text(ident), Cow::Owned(_)) {
+        unicode_quote(ident)
     } else {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
+}
+
+/// `U&"..."` spelling: the exact name, printed without control characters or `##[`.
+fn unicode_quote(ident: &str) -> String {
+    let mut out = String::from("U&\"");
+    for c in ident.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\"\""),
+            '[' if out.ends_with("##") => out.push_str("\\005B"),
+            c if is_line_hazard(c) => {
+                let _ = write!(out, "\\{:04X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One log line with no workflow command in it: control characters and `##[` print as escapes.
+pub(crate) fn escape_text(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(is_line_hazard) && !s.contains("##[") {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '[' if out.ends_with("##") => out.push_str("\\u{5b}"),
+            c if is_line_hazard(c) => {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// [`escape_text`] that also escapes a leading `::`, for text that opens a line.
+fn escape_line_start(s: &str) -> Cow<'_, str> {
+    let escaped = escape_text(s);
+    let body = escaped.trim_start();
+    if !body.starts_with("::") {
+        return escaped;
+    }
+    let indent = escaped.len() - body.len();
+    Cow::Owned(format!("{}\\u{{3a}}{}", &escaped[..indent], &body[1..]))
+}
+
+fn is_line_hazard(c: char) -> bool {
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
 fn tier_label(tier: Tier) -> &'static str {
@@ -668,7 +740,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
 }
 
 fn markdown_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', " ")
+    escape_text(s).replace('|', "\\|")
 }
 
 pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> Result<String, String> {
@@ -684,8 +756,9 @@ pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> 
     if analysis.tables.iter().any(|t| !t.ignored && t.tier == Tier::Estimate) {
         value["estimate_assumptions"] = serde_json::Value::String(ESTIMATE_LABEL.to_string());
     }
+    // `##[` only occurs inside strings, where `\u005b` decodes back to the same bracket.
     serde_json::to_string_pretty(&value)
-        .map(|s| s + "\n")
+        .map(|s| s.replace("##[", "##\\u005b") + "\n")
         .map_err(|e| e.to_string())
 }
 

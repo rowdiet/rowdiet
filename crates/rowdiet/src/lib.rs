@@ -96,7 +96,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     match run(&cli) {
         Ok(code) => code,
         Err(message) => {
-            eprintln!("rowdiet: {message}");
+            eprintln!("rowdiet: {}", render::escape_text(&message));
             ExitCode::from(2)
         }
     }

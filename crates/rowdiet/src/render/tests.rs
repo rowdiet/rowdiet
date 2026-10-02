@@ -257,3 +257,89 @@ fn an_unverified_payload_model_reads_as_found_everywhere() {
     assert_eq!(value["analysis"]["tables"][0]["dominance_search"], "superset");
     assert_eq!(value["analysis"]["tables"][0]["superset_types"][0], "inet");
 }
+
+fn command_lines(rendered: &str) -> Vec<&str> {
+    rendered
+        .split(['\n', '\r'])
+        .filter(|line| line.trim_start().starts_with("::") || line.contains("##["))
+        .collect()
+}
+
+#[test]
+fn text_identifiers_cannot_open_workflow_commands() {
+    let analysis = analyze(concat!(
+        "CREATE TABLE \"evil\n::error file=README.md,line=1::X\" (a boolean NOT NULL, ",
+        "\"c\n::stop-commands::tok\" bigint NOT NULL, \"x\r\n::add-mask::secret\" boolean NOT NULL, ",
+        "\"y ##[error]v1\" bigint NOT NULL);\n",
+        "CREATE TABLE n (a \"t\n::error::TYPE\" NOT NULL);\n",
+        "ALTER TABLE \"ghost\r::warning::G\" ADD COLUMN z int;",
+    ));
+    let rendered = text(&analysis, None, true, &gate(&analysis, Some(0.0)));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(!rendered.contains('\r'), "{rendered}");
+    assert!(
+        rendered.contains(r#"■ "evil\n::error file=README.md,line=1::X" (V1__init.sql:1)"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r"c\n::stop-commands::tok, "), "{rendered}");
+    assert!(
+        rendered.contains(r#"U&"x\000D\000A::add-mask::secret" BOOLEAN"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r#"U&"y ##\005Berror]v1" BIGINT"#), "{rendered}");
+    assert!(
+        rendered.contains(r#"type "t\n::error::TYPE" unresolvable"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r#"ALTER TABLE "ghost\r::warning::G""#), "{rendered}");
+}
+
+#[test]
+fn a_source_path_cannot_open_a_note_line_as_a_command() {
+    let analysis = analyze_sources(
+        &[SqlSource {
+            name: " ::error::x.sql".into(),
+            sql: "CREATE TABLE t (a mystery NOT NULL);".into(),
+        }],
+        &Config::default(),
+    );
+    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(
+        rendered.contains(r"   \u{3a}:error::x.sql:1 [unknown-type]"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn escaping_leaves_ordinary_names_alone() {
+    assert!(matches!(
+        escape_text("Mixed Case ünïcode #[x] ## [y]"),
+        Cow::Borrowed(_)
+    ));
+    assert_eq!(
+        escape_text("a\tb\u{1b}[31m\u{85}\u{2028}"),
+        r"a\tb\u{1b}[31m\u{85}\u{2028}"
+    );
+    assert_eq!(escape_text("###[x]"), r"###\u{5b}x]");
+    assert_eq!(maybe_quote("we\"ird"), "\"we\"\"ird\"");
+    assert_eq!(maybe_quote("a\\b\nc\""), r#"U&"a\\b\000Ac""""#);
+}
+
+#[test]
+fn step_summary_cells_hold_one_line() {
+    let analysis =
+        analyze("CREATE TABLE \"a\r|b\" (x int NOT NULL, y bigint NOT NULL, z int NOT NULL, w bigint NOT NULL);");
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    assert!(!summary.contains('\r'), "{summary}");
+    assert!(summary.contains(r#"| "a\r\|b" | 8.0 |"#), "{summary}");
+}
+
+#[test]
+fn json_keeps_names_exact_without_the_bracket_prefix() {
+    let analysis = analyze("CREATE TABLE \"t ##[error]x\n\" (a boolean NOT NULL, b bigint NOT NULL);");
+    let rendered = json(&analysis, None, &gate(&analysis, None)).unwrap();
+    assert!(!rendered.contains("##["), "{rendered}");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["analysis"]["tables"][0]["name"], "t ##[error]x\n");
+}
