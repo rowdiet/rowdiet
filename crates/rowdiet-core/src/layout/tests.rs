@@ -884,3 +884,40 @@ fn tier_display_matches_serde() {
         assert_eq!(json.as_str().unwrap(), tier.to_string(), "{tier:?}");
     }
 }
+
+#[test]
+fn the_search_finishes_on_one_class_as_large_as_the_budget_admits() {
+    // A class count past 255 wrapped a u8 and spun the reconstruction forever; a recursive memo
+    // overflowed the stack at this depth. The bottom-up DP needs neither.
+    let kinds = vec![fixed(12, Align::Double); 69_904];
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(search(&kinds));
+    });
+    let found = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the search terminates");
+    assert_eq!(found.scope, SearchScope::Complete);
+    let mut pole = found.certainty_pole.expect("the DP ran");
+    pole.sort_unstable();
+    assert!(pole.iter().copied().eq(0..69_904));
+}
+
+#[test]
+fn the_fixed_block_repack_runs_past_24_columns() {
+    // 30 fixed columns whose written order pads 100 B: the repack must reach zero at any width.
+    let mut kinds = Vec::new();
+    for _ in 0..10 {
+        kinds.extend([fixed(1, Align::Char), fixed(8, Align::Double)]);
+    }
+    for _ in 0..5 {
+        kinds.extend([fixed(2, Align::Short), fixed(8, Align::Double)]);
+    }
+    kinds.push(varlena(Align::Int));
+    let mut order: Vec<usize> = (0..kinds.len()).collect();
+    refine_leading_fixed(&kinds, &mut order);
+    let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
+    assert_eq!(walk(&kinds).padding, 100);
+    assert_eq!(walk(&ordered).padding, 0);
+    assert_eq!(order.last(), Some(&30), "the varlena tail stays in place");
+}

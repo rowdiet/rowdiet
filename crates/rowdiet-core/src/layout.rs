@@ -415,9 +415,9 @@ pub struct Search {
 const WHOLE_ORDER_STATE_BUDGET: usize = 1 << 20;
 
 /// Run the order search: the heuristic pole always, and the two exact lexicographic poles when
-/// the whole-order state space fits [`WHOLE_ORDER_STATE_BUDGET`] and the table has at most 24
-/// columns. A heuristic order that already achieves zero deterministic and zero worst-case
-/// padding is the global minimum of both objectives, so the search is complete without running.
+/// the whole-order state space fits [`WHOLE_ORDER_STATE_BUDGET`]. A heuristic order that already
+/// achieves zero deterministic and zero worst-case padding is the global minimum of both
+/// objectives, so the search is complete without running.
 pub fn search(kinds: &[ColumnKind]) -> Search {
     let mut heuristic: Vec<usize> = (0..kinds.len()).collect();
     heuristic.sort_by_key(|&i| sort_key(&kinds[i], i));
@@ -450,7 +450,7 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
         };
     }
     let fixed_len = heuristic.iter().take_while(|&&i| kinds[i].is_fixed()).count();
-    let fixed_refinable = fixed_len <= 24 && fixed_class_count(kinds) <= 12;
+    let fixed_refinable = fixed_block_fits(kinds, &heuristic[..fixed_len]);
     refine_fixed_block(kinds, &mut heuristic);
     let scope = if fixed_refinable && fixed_len == kinds.len() {
         // All-fixed: the fixed prefix is the whole order, so the block search is complete.
@@ -468,17 +468,17 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
     }
 }
 
-fn fixed_class_count(kinds: &[ColumnKind]) -> usize {
-    let mut keys: Vec<(u64, u64)> = kinds
+/// Memo bound of the fixed-block search: Π(class count + 1) × the 8 singleton residue states,
+/// at most 8M states (64 MB of memo). The bound caps cost at any column count.
+const FIXED_BLOCK_STATE_BUDGET: usize = 1 << 23;
+
+/// Whether [`refine_fixed_block`] searches `block` (a fixed run) exactly.
+fn fixed_block_fits(kinds: &[ColumnKind], block: &[usize]) -> bool {
+    padding_classes(kinds, block)
         .iter()
-        .filter_map(|k| match k {
-            ColumnKind::Fixed { len, align } => Some((align.bytes(), len % MAXALIGN)),
-            ColumnKind::Varlena { .. } => None,
-        })
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
-    keys.len()
+        .map(|c| c.members.len() + 1)
+        .try_fold(SINGLETON_STATES, usize::checked_mul)
+        .is_some_and(|states| states <= FIXED_BLOCK_STATE_BUDGET)
 }
 
 /// A dominance-complete candidate space over `kinds`, or None when it exceeds `cap`.
@@ -573,39 +573,47 @@ fn generate_orders(
     }
 }
 
-/// Repack the leading fixed run of `order` to its deterministic minimum, leaving everything
-/// from the first varlena on untouched. With the suffix preserved, any prefix improvement
-/// dominates the original order (the never-negative-recovery induction), which makes this the
-/// decision policy's always-safe repair candidate.
+/// Repack the leading fixed run of `order` to its deterministic minimum (past the search budget,
+/// to the heuristic sort when that pads less), leaving everything from the first varlena on
+/// untouched. With the suffix preserved, any prefix improvement dominates the original order
+/// (the never-negative-recovery induction), which makes this the decision policy's always-safe
+/// repair candidate at any width.
 pub fn refine_leading_fixed(kinds: &[ColumnKind], order: &mut [usize]) {
     refine_fixed_block(kinds, order);
 }
 
 /// Descending-alignment sorting leaves the fixed block zero-padding for most schemas, but with
 /// two or more irregulars (timetz, macaddr, …) it can keep padding an interposed smaller column
-/// would absorb. When the sorted fixed block still pads, find the exact minimum over the block:
-/// deterministic padding depends only on (alignment, len mod MAXALIGN) classes and the running
-/// offset residue, so a memoized search over class counts is exhaustive. The varlena tail stays
-/// where the sort put it, which makes the refinement dominance-safe: with the tail sequence
-/// preserved, reducing the prefix padding reduces the total in every realization (the report
-/// layer relies on exactly this). Caps: 3 to 24 fixed columns, 12 fixed classes.
+/// would absorb. When the fixed block pads, find the exact minimum over the block: deterministic
+/// padding depends only on (alignment, len mod MAXALIGN) classes and the running offset residue,
+/// so a memoized search over class counts is exhaustive. Past [`FIXED_BLOCK_STATE_BUDGET`] the
+/// block takes the heuristic sort instead, when that pads less. The varlena tail stays where it
+/// was, which makes the refinement dominance-safe: with the tail sequence preserved, reducing the
+/// prefix padding reduces the total in every realization (the report layer relies on exactly
+/// this).
 fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
-    if !(3..=24).contains(&fixed_len) {
+    if fixed_len < 3 {
         return;
     }
-    let sorted_fixed: Vec<ColumnKind> = order[..fixed_len].iter().map(|&i| kinds[i]).collect();
-    if walk(&sorted_fixed).padding == 0 {
+    let block_padding = |block: &[usize]| walk(&block.iter().map(|&i| kinds[i]).collect::<Vec<_>>()).padding;
+    let current = block_padding(&order[..fixed_len]);
+    if current == 0 {
         return;
     }
-    let classes = padding_classes(kinds, &order[..fixed_len]);
-    if classes.len() > 12 {
+    if fixed_block_fits(kinds, &order[..fixed_len]) {
+        let classes = padding_classes(kinds, &order[..fixed_len]);
+        // An all-fixed block walks singleton states only, where deterministic and worst-case pads
+        // coincide, so either lexicographic mode reproduces the plain padding minimum.
+        let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst);
+        order[..fixed_len].copy_from_slice(&refined);
         return;
     }
-    // An all-fixed block walks singleton states only, where deterministic and worst-case pads
-    // coincide, so either lexicographic mode reproduces the plain padding minimum.
-    let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst);
-    order[..fixed_len].copy_from_slice(&refined);
+    let mut sorted = order[..fixed_len].to_vec();
+    sorted.sort_by_key(|&i| sort_key(&kinds[i], i));
+    if block_padding(&sorted) < current {
+        order[..fixed_len].copy_from_slice(&sorted);
+    }
 }
 
 /// The two lexicographic objectives the policy needs. Both components are additive per
@@ -619,50 +627,82 @@ enum LexMode {
     WorstCaseFirst,
 }
 
-/// Pack the lexicographic pair into one additive scalar. Each component is at most
-/// 24 columns × 7 bytes = 168, far under the 512 radix.
-const LEX_RADIX: u64 = 512;
+/// Pack the lexicographic pair into one additive scalar. Each component sums at most 7 bytes
+/// per column, so the radix stays above it for any table under 600 million columns.
+const LEX_RADIX: u64 = 1 << 32;
 
 fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
+    debug_assert_eq!(total, classes.iter().map(|c| c.members.len()).sum::<usize>());
     // Mixed-radix strides over the class counts: every (counts, set state) combination maps to
     // one dense memo slot, so the memo is a flat Vec of exactly the state-space bound (8 bytes
     // per state) with no hashing and no rehash growth.
+    // A fixed-only block starts at offset 0 and only ever reaches singleton residue sets.
+    let live_states = if classes.iter().all(|c| matches!(c.key, ClassKey::Fixed { .. })) {
+        SINGLETON_STATES
+    } else {
+        SET_STATES
+    };
     let mut strides = Vec::with_capacity(classes.len());
-    let mut bound = SET_STATES;
+    let mut bound = live_states;
     for class in classes {
         strides.push(bound);
         bound *= class.members.len() + 1;
     }
-    let mut dp = Dp {
-        classes,
-        mode,
-        strides,
-        memo: vec![u64::MAX; bound],
-    };
-    let mut counts: Vec<u8> = classes.iter().map(|c| c.members.len() as u8).collect();
-    let mut remaining = total;
-    let mut set = Residues::START;
+    let steps: Vec<[(u64, usize); SET_STATES]> = classes
+        .iter()
+        .map(|class| {
+            std::array::from_fn(|state| {
+                let set = SET_BY_INDEX[state];
+                (
+                    class.key.lex_cost(set, mode),
+                    set_state_index(class.key.next_set(set)) as usize,
+                )
+            })
+        })
+        .collect();
+    // memo[slot] is the cheapest packed cost of placing the counts the slot encodes from its set
+    // state. Placing a column lowers the slot, so one ascending pass fills the memo without
+    // recursion.
+    let mut memo = vec![0u64; bound];
+    let mut counts = vec![0usize; classes.len()];
+    for base in (live_states..bound).step_by(live_states) {
+        for (count, class) in counts.iter_mut().zip(classes) {
+            if *count < class.members.len() {
+                *count += 1;
+                break;
+            }
+            *count = 0;
+        }
+        for state in 0..live_states {
+            let mut best = u64::MAX;
+            for (class_index, &count) in counts.iter().enumerate() {
+                if count > 0 {
+                    let (cost, next) = steps[class_index][state];
+                    best = best.min(cost + memo[base - strides[class_index] + next]);
+                }
+            }
+            memo[base + state] = best;
+        }
+    }
+    let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
+    let mut base = bound - live_states;
+    let mut state = set_state_index(Residues::START) as usize;
     let mut queues: Vec<std::collections::VecDeque<usize>> =
         classes.iter().map(|c| c.members.iter().copied().collect()).collect();
     let mut refined = Vec::with_capacity(total);
-    while remaining > 0 {
-        let target = dp.min_lex(&mut counts, remaining, set);
-        for class_index in 0..classes.len() {
-            if counts[class_index] == 0 {
-                continue;
-            }
-            let key = classes[class_index].key;
-            let step = key.lex_cost(set, mode);
-            counts[class_index] -= 1;
-            let rest = dp.min_lex(&mut counts, remaining - 1, key.next_set(set));
-            if step + rest == target {
-                refined.push(queues[class_index].pop_front().expect("count tracked"));
-                set = key.next_set(set);
-                remaining -= 1;
-                break;
-            }
-            counts[class_index] += 1;
-        }
+    // Exactly one column per round: some class attains the optimum the memo recorded.
+    for _ in 0..total {
+        let target = memo[base + state];
+        let class_index = (0..classes.len())
+            .find(|&c| {
+                let (cost, next) = steps[c][state];
+                counts[c] > 0 && cost + memo[base - strides[c] + next] == target
+            })
+            .expect("the recorded optimum is attained by some class");
+        refined.push(queues[class_index].pop_front().expect("count tracked"));
+        counts[class_index] -= 1;
+        base -= strides[class_index];
+        state = steps[class_index][state].1;
     }
     refined
 }
@@ -749,6 +789,28 @@ impl ClassKey {
 /// and odd sets, and the full set).
 const SET_STATES: usize = 15;
 
+/// The singletons come first in [`set_state_index`] order.
+const SINGLETON_STATES: usize = 8;
+
+/// Each set state by its [`set_state_index`].
+const SET_BY_INDEX: [Residues; SET_STATES] = [
+    Residues(0b0000_0001),
+    Residues(0b0000_0010),
+    Residues(0b0000_0100),
+    Residues(0b0000_1000),
+    Residues(0b0001_0000),
+    Residues(0b0010_0000),
+    Residues(0b0100_0000),
+    Residues(0b1000_0000),
+    Residues(0b0001_0001),
+    Residues(0b0010_0010),
+    Residues(0b0100_0100),
+    Residues(0b1000_1000),
+    Residues(0b0101_0101),
+    Residues(0b1010_1010),
+    Residues(0xFF),
+];
+
 /// Dense index of a reachable set state, for the DP key: cosets only, 0..15.
 fn set_state_index(set: Residues) -> u64 {
     let mask = set.0;
@@ -775,48 +837,6 @@ fn set_state_index(set: Residues) -> u64 {
 fn pad_pow2(offset: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two());
     align.wrapping_sub(offset) & (align - 1)
-}
-
-struct Dp<'a> {
-    classes: &'a [PaddingClass],
-    mode: LexMode,
-    /// Mixed-radix strides per class; slot = set_state_index + Σ counts[i] × strides[i].
-    strides: Vec<usize>,
-    /// Dense memo over every (counts, set state) combination; u64::MAX marks unvisited. Costs
-    /// stay far below the sentinel (at most columns × 7 bytes per lexicographic component).
-    memo: Vec<u64>,
-}
-
-impl Dp<'_> {
-    /// `remaining` is the sum of `counts`, carried so the all-placed base case is O(1).
-    fn min_lex(&mut self, counts: &mut [u8], remaining: usize, set: Residues) -> u64 {
-        if remaining == 0 {
-            return 0;
-        }
-        let slot = counts
-            .iter()
-            .zip(&self.strides)
-            .fold(set_state_index(set) as usize, |acc, (&c, &stride)| {
-                acc + c as usize * stride
-            });
-        if self.memo[slot] != u64::MAX {
-            return self.memo[slot];
-        }
-        let mut best = u64::MAX;
-        for class_index in 0..self.classes.len() {
-            if counts[class_index] == 0 {
-                continue;
-            }
-            let class = self.classes[class_index].key;
-            let step = class.lex_cost(set, self.mode);
-            counts[class_index] -= 1;
-            let total = step + self.min_lex(counts, remaining - 1, class.next_set(set));
-            counts[class_index] += 1;
-            best = best.min(total);
-        }
-        self.memo[slot] = best;
-        best
-    }
 }
 
 fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
