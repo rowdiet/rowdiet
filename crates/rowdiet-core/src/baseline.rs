@@ -191,8 +191,9 @@ pub enum TableVerdict {
         /// Columns in the appended block.
         appended: usize,
     },
-    /// The layout changed in a non-append way, expiring the entry, and the table does not
-    /// meet `fail_over`. Re-accept deliberately or fix the layout in the rewriting migration.
+    /// A committed slot changed (a type change, or a table rebuilt in another order), expiring
+    /// the entry, and the table does not meet `fail_over`. Re-accept deliberately or fix the
+    /// layout in the migration that changed it.
     ModifiedSinceBaseline {
         /// Current avoidable bytes/row.
         avoidable: f64,

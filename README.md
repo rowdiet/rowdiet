@@ -75,9 +75,9 @@ rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
 rowdiet migrations/ --assume-type vector=varlena:d   # teach extension types
 rowdiet migrations/ --parser pg-exact        # parse with the real PG17 grammar (libpg_query)
-rowdiet migrations/ --baseline rowdiet-baseline.json                    # gate against accepted debt
+rowdiet migrations/ --baseline rowdiet-baseline.json                    # judge only appended blocks of applied tables
 rowdiet migrations/ --baseline rowdiet-baseline.json --fail-over 0 --update-baseline   # (re)write it
-rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # accept one table's growth
+rowdiet migrations/ --baseline rowdiet-baseline.json --accept account   # commit one table's appended block
 ```
 
 Paths can mix directories, individual files, and `-` (stdin). A directory is scanned
@@ -106,19 +106,26 @@ GitHub Actions job), the full uncapped report is also appended to the job summar
 
 ### Brownfield adoption: the baseline
 
-A zero-tolerance gate is useless on a schema that already carries debt — applied tables are
-expensive to rewrite. `--update-baseline` freezes the current state into a reviewed JSON file:
-one entry per table over the fail-over, recording its avoidable bytes and a layout signature
-(the ordered column storage kinds). From then on, `--baseline` gates **new tables** at the
-fail-over, **baselined tables** at their recorded allowance, and reports tables that improved as
-ratchet opportunities — tightening is always an explicit act, never automatic.
-
-Allowances stick to the layout, not just the name. `ADD COLUMN` appends, so an append keeps the
-allowance alive and only the added waste can fail the gate (`grown since baseline`) — accept it
-with `--accept <table>` (a one-entry, reviewable baseline diff) or reorder the columns in the
-new migration before it ships. Any other layout change (reorder, drop, type change) expires the
-allowance (`modified since baseline`): the table was rewritten anyway, so it either meets the
-fail-over or gets re-accepted deliberately.
+A zero-tolerance gate is useless on a schema whose applied tables already carry debt: reordering
+them needs a rewrite. `--update-baseline` records each analyzed table's committed layout (the
+storage kind of each attribute slot, and the column names for whoever reviews it) in a reviewed
+JSON file. From then on a committed layout is never
+judged again. What a later migration appends to it with `ADD COLUMN` is: while that migration is
+unapplied the block's order is still free, so the gate asks whether the block as written is
+dominance-optimal among orders of the block, starting from wherever the committed columns can
+leave the offset. When some block order dominates it, the gate fails with
+`block not dominance-optimal`, prints the block order to write, and points at the appending
+statements; the committed prefix is never reordered. Write the block that way, or accept it as
+written with `--accept <table>` (a one-entry, reviewable baseline diff naming the committed
+columns), after which the next migration's block is judged against the new prefix. New tables
+get the full search against `--fail-over`. `DROP COLUMN` rewrites nothing: PostgreSQL keeps the
+dropped attribute's slot, so a committed column dropped since still marks the committed prefix,
+and columns added after it are the block. Any other change to a committed column (a type
+change, or a table rebuilt in another order) expires the entry (`modified since baseline`), and
+the table then has to meet the fail-over or be re-accepted deliberately. Baseline files from
+older releases load; their per-table byte allowances are ignored, said so in the output, and
+dropped by the next write, and the first `--update-baseline` after upgrading writes an entry
+for every table.
 
 ### As a library (refinery guard, four lines)
 
