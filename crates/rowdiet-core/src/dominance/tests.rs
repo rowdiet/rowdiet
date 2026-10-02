@@ -1,5 +1,5 @@
 use super::*;
-use crate::layout::Align;
+use crate::layout::{Align, Payload};
 
 fn fixed(len: u64, align: Align) -> ColumnKind {
     ColumnKind::Fixed { len, align }
@@ -9,6 +9,7 @@ fn varlena(align: Align) -> ColumnKind {
     ColumnKind::Varlena {
         align,
         proven_short: false,
+        payload: Payload::ANY,
     }
 }
 
@@ -16,6 +17,7 @@ fn short() -> ColumnKind {
     ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
+        payload: Payload::ANY,
     }
 }
 
@@ -119,9 +121,11 @@ mod engine_agreement {
                     Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
                     Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::EVEN }),
                 ],
                 2..=6
             ),
@@ -246,8 +250,16 @@ mod independent_oracle {
         let domains: Vec<Vec<Value>> = varlenas
             .iter()
             .map(|&c| {
-                let mut domain: Vec<Value> = (0..8).map(Value::Short).collect();
-                if long_capable(kinds[c]) {
+                let ColumnKind::Varlena {
+                    proven_short, payload, ..
+                } = kinds[c]
+                else {
+                    unreachable!()
+                };
+                // Concrete uncompressed lengths the type can store: 4 + k * step bytes.
+                let step = u64::from(payload.step);
+                let mut domain: Vec<Value> = (0..8).map(|k| Value::Short((4 + k * step) % 16)).collect();
+                if !proven_short {
                     domain.extend((127..135).map(Value::Long));
                     domain.push(Value::Toast);
                 }
@@ -299,9 +311,12 @@ mod independent_oracle {
                     Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
                     Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::array(4) }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::EVEN }),
                 ],
                 2..=5
             ).prop_filter("at most 3 varlenas keeps the oracle enumerable", |kinds| {
@@ -315,6 +330,152 @@ mod independent_oracle {
             let engine = compare(&kinds, &a, &b).expect("within budget");
             let oracle = oracle_bounds(&kinds, &a, &b);
             prop_assert_eq!(engine, oracle, "kinds {:?} b {:?}", kinds, b);
+        }
+    }
+}
+
+#[test]
+fn payload_residues_follow_the_storage_format() {
+    assert_eq!(Payload::ANY.residues(), 0xFF);
+    assert_eq!(Payload::EVEN.residues(), 0b0101_0101);
+    assert_eq!(Payload::array(8).residues(), 0b0001_0000, "float8[]: payload 4 mod 8");
+    assert_eq!(Payload::array(16).residues(), 0b0001_0000, "timetz[] strides 16");
+    assert_eq!(Payload::array(4).residues(), 0b0001_0001, "int4[], text[]: 0 or 4");
+    assert_eq!(Payload::array(2).residues(), 0b0101_0101);
+    assert_eq!(Payload::array(1).residues(), 0xFF, "bool[] reaches every length");
+}
+
+#[test]
+fn pinned_array_residues_decide_the_closure_review_pair() {
+    // (smallint, float8[], float8[], macaddr): a short uncompressed float8[] always has payload
+    // 4 mod 8, and under that model (macaddr, smallint, a2, a1) dominates. Measured on
+    // PostgreSQL 16 over 3,000 rows: never worse, 5.803 to 1.454 B/row.
+    let array = ColumnKind::Varlena {
+        align: Align::Double,
+        proven_short: false,
+        payload: Payload::array(8),
+    };
+    let kinds = [fixed(2, Align::Short), array, array, fixed(6, Align::Int)];
+    let diff = compare(&kinds, &[0, 1, 2, 3], &[3, 0, 2, 1]).unwrap();
+    assert!(diff.b_dominates(), "{diff:?}");
+    let any = varlena(Align::Double);
+    let unpinned = [fixed(2, Align::Short), any, any, fixed(6, Align::Int)];
+    let loose = compare(&unpinned, &[0, 1, 2, 3], &[3, 0, 2, 1]).unwrap();
+    assert!(
+        !loose.b_dominates(),
+        "any-residue arrays leave the pair a frontier: {loose:?}"
+    );
+}
+
+mod summaries {
+    use super::*;
+    use crate::layout::walk;
+    use proptest::prelude::*;
+
+    /// Bounds and short-form mean of one order by enumerating every realization outright.
+    fn brute(kinds: &[ColumnKind], order: &[usize]) -> (u64, u64, u64) {
+        let varlenas: Vec<usize> = order.iter().copied().filter(|&i| !kinds[i].is_fixed()).collect();
+        let options: Vec<Vec<(bool, u64, bool)>> = varlenas
+            .iter()
+            .map(|&c| {
+                let domain = Domain::of(kinds[c]);
+                let ColumnKind::Varlena { payload, .. } = kinds[c] else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                for p in 0..MAXALIGN {
+                    for form_long in [false, true] {
+                        if domain.allows(form_long, p) {
+                            let short_uniform = !form_long && payload.residues() & (1 << p) != 0;
+                            out.push((form_long, p, short_uniform));
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let (mut lo, mut hi, mut sum, mut count) = (u64::MAX, 0u64, 0u64, 0u64);
+        let mut index = vec![0usize; varlenas.len()];
+        loop {
+            let mut residue = 0u64;
+            let mut total = 0u64;
+            let mut slot = 0usize;
+            let mut uniform = true;
+            for &i in order {
+                match kinds[i] {
+                    ColumnKind::Fixed { len, align } => {
+                        let p = pad(residue, align.bytes());
+                        total += p;
+                        residue = (residue + p + len) % MAXALIGN;
+                    }
+                    ColumnKind::Varlena { align, .. } => {
+                        let (form_long, payload, short_uniform) = options[slot][index[slot]];
+                        uniform &= short_uniform;
+                        let (p, next) = varlena_step(residue, align.bytes(), form_long, payload);
+                        total += p;
+                        residue = next;
+                        slot += 1;
+                    }
+                }
+            }
+            lo = lo.min(total);
+            hi = hi.max(total);
+            if uniform {
+                sum += total;
+                count += 1;
+            }
+            let mut k = 0;
+            while k < index.len() {
+                index[k] += 1;
+                if index[k] < options[k].len() {
+                    break;
+                }
+                index[k] = 0;
+                k += 1;
+            }
+            if k == index.len() {
+                break;
+            }
+        }
+        (lo, hi, sum * MAXALIGN / count)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+        #[test]
+        fn summary_matches_brute_force_and_the_walk(
+            kinds in proptest::collection::vec(
+                prop_oneof![
+                    Just(ColumnKind::Fixed { len: 1, align: Align::Char }),
+                    Just(ColumnKind::Fixed { len: 2, align: Align::Short }),
+                    Just(ColumnKind::Fixed { len: 4, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
+                    Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
+                    Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::array(4) }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::EVEN }),
+                ],
+                1..=6
+            ).prop_filter("at most 3 varlenas keeps brute force small", |kinds| {
+                kinds.iter().filter(|k| !k.is_fixed()).count() <= 3
+            })
+        ) {
+            let order: Vec<usize> = (0..kinds.len()).collect();
+            let got = summary(&kinds, &order);
+            let (lo, hi, mean) = brute(&kinds, &order);
+            prop_assert_eq!((got.min, got.max, got.short_mean_eighths), (lo, hi, mean), "{:?}", kinds);
+            let narrowed = kinds.iter().any(|k| matches!(k, ColumnKind::Varlena { payload, .. } if payload.step > 1));
+            if !narrowed {
+                let w = walk(&kinds);
+                prop_assert_eq!(
+                    (got.min, got.max, got.short_mean_eighths),
+                    (w.padding_min(), w.padding_max(), w.expected_padding_eighths()),
+                    "without narrowing the summary is the walk's: {:?}", kinds
+                );
+            }
         }
     }
 }

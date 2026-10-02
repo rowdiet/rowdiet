@@ -240,3 +240,20 @@ fn github_step_summary_carries_the_full_report() {
         "{baselined_summary}"
     );
 }
+
+#[test]
+fn an_unverified_payload_model_reads_as_found_everywhere() {
+    let analysis = analyze("CREATE TABLE i (a inet NOT NULL, b smallint NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("no dominating reorder found (payload lengths unverified for inet)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("exists"), "{rendered}");
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    assert!(summary.contains("complete (payload model unverified)"), "{summary}");
+    let json = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["analysis"]["tables"][0]["dominance_search"], "superset");
+    assert_eq!(value["analysis"]["tables"][0]["superset_types"][0], "inet");
+}

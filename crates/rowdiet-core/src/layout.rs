@@ -76,7 +76,62 @@ pub enum ColumnKind {
         /// The typmod proves every value fits the 1-byte-header short form (varchar(n)/char(n),
         /// n ≤ 31): stored unaligned, one byte counted.
         proven_short: bool,
+        /// What the type's encoding proves about its uncompressed payload lengths.
+        #[cfg_attr(feature = "serde", serde(skip))]
+        payload: Payload,
     },
+}
+
+/// The uncompressed payload lengths mod 8 a varlena type can store. A short value stores its
+/// payload uncompressed, so this narrows the short form; compression and TOAST reach the other
+/// residues and pointer shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Payload {
+    /// Uncompressed payloads are `4 + k * step` bytes mod 8 for every k: 1 for any length, 2 for
+    /// numeric's even lengths, and for an array the 2-power part of its element stride (its data
+    /// area starts MAXALIGNed after a 4-byte-aligned header).
+    pub step: u8,
+    /// The residues above are exactly what PostgreSQL stores (checked against its source). False
+    /// for types nobody checked: the model then lets them store any length, which may be more
+    /// than they can, so an absence claim over them is withheld.
+    pub verified: bool,
+}
+
+impl Payload {
+    /// Any payload length, verified: text, bytea, jsonb, unlimited varchar.
+    pub const ANY: Self = Self {
+        step: 1,
+        verified: true,
+    };
+    /// Any payload length assumed, not verified against the type's encoding.
+    pub const UNVERIFIED: Self = Self {
+        step: 1,
+        verified: false,
+    };
+    /// numeric: a 2- or 4-byte header plus 2-byte digits, so every length is even.
+    pub const EVEN: Self = Self {
+        step: 2,
+        verified: true,
+    };
+
+    /// An array's payload: its elements each take a multiple of their stride.
+    pub fn array(stride: u64) -> Self {
+        Self {
+            step: gcd(stride, MAXALIGN) as u8,
+            verified: true,
+        }
+    }
+
+    /// The storable residues as a bitmask over 0..=7.
+    pub fn residues(self) -> u8 {
+        (0..MAXALIGN as u8)
+            .filter(|r| (r + MAXALIGN as u8 - 4).is_multiple_of(self.step))
+            .fold(0, |mask, r| mask | (1 << r))
+    }
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 impl ColumnKind {
@@ -296,6 +351,7 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
             ColumnKind::Varlena {
                 align,
                 proven_short: false,
+                ..
             } => PadRange {
                 min: 0,
                 max: residues.pad_to(align.bytes()).max,
@@ -743,7 +799,9 @@ fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
                 align: align.bytes(),
                 len_mod: len % MAXALIGN,
             },
-            ColumnKind::Varlena { align, proven_short } => {
+            ColumnKind::Varlena {
+                align, proven_short, ..
+            } => {
                 if proven_short || align == Align::Char {
                     ClassKey::PadlessVarlena
                 } else {
@@ -870,10 +928,12 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
         ColumnKind::Varlena {
             align,
             proven_short: false,
+            ..
         } => (1, align_desc(*align), false, index),
         ColumnKind::Varlena {
             align,
             proven_short: true,
+            ..
         } => (2, align_desc(*align), false, index),
     }
 }

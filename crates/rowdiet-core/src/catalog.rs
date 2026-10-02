@@ -4,7 +4,7 @@
 //! documented default alignment is int4 and varlena requires at least 4 — and are flagged, never
 //! guessed at `d` (which would fabricate waste).
 
-use crate::layout::{Align, ColumnKind};
+use crate::layout::{Align, ColumnKind, Payload};
 use std::collections::BTreeMap;
 
 /// A type name as extracted from DDL: normalized lookup key, original display text, character
@@ -96,6 +96,7 @@ impl Catalog {
         let kind = ColumnKind::Varlena {
             align: Align::Double,
             proven_short: false,
+            payload: Payload::UNVERIFIED,
         };
         self.session.insert(key, SessionEntry { kind, known: true });
     }
@@ -109,6 +110,7 @@ impl Catalog {
         let kind = ColumnKind::Varlena {
             align,
             proven_short: false,
+            payload: Payload::UNVERIFIED,
         };
         self.session.insert(key, SessionEntry { kind, known });
     }
@@ -131,6 +133,7 @@ impl Catalog {
         let kind = ColumnKind::Varlena {
             align: Align::Int,
             proven_short: false,
+            payload: Payload::UNVERIFIED,
         };
         self.session.insert(key, SessionEntry { kind, known: false });
     }
@@ -158,6 +161,7 @@ impl Catalog {
             let kind = ColumnKind::Varlena {
                 align: range_align(elem.kind.align()),
                 proven_short: false,
+                payload: array_payload(elem),
             };
             return Resolved {
                 kind,
@@ -185,6 +189,7 @@ impl Catalog {
                 AssumedKind::Varlena { align } => ColumnKind::Varlena {
                     align: *align,
                     proven_short: false,
+                    payload: Payload::UNVERIFIED,
                 },
             };
             return Resolved {
@@ -199,6 +204,7 @@ impl Catalog {
                 kind: ColumnKind::Varlena {
                     align: Align::Int,
                     proven_short: false,
+                    payload: Payload::UNVERIFIED,
                 },
                 known: false,
                 implicit_not_null: false,
@@ -246,6 +252,19 @@ fn parse_align(s: &str) -> Result<Align, String> {
     }
 }
 
+/// An array's data area starts MAXALIGNed and pads every element to the element alignment
+/// (array.h, `construct_md_array`), so its payload is the 4-byte-aligned header remainder plus a
+/// multiple of the element stride. An element of unknown storage leaves the payload unverified.
+fn array_payload(elem: Resolved) -> Payload {
+    if !elem.known {
+        return Payload::UNVERIFIED;
+    }
+    match elem.kind {
+        ColumnKind::Fixed { len, align } => Payload::array(len.next_multiple_of(align.bytes())),
+        ColumnKind::Varlena { align, .. } => Payload::array(align.bytes()),
+    }
+}
+
 /// Arrays and ranges alike: d iff the element/subtype is d-aligned, else i.
 fn range_align(elem: Align) -> Align {
     if elem == Align::Double {
@@ -263,11 +282,12 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
             implicit_not_null: false,
         })
     };
-    let varlena = |align| {
+    let varlena = |align, payload| {
         Some(Resolved {
             kind: ColumnKind::Varlena {
                 align,
                 proven_short: false,
+                payload,
             },
             known: true,
             implicit_not_null: false,
@@ -302,15 +322,25 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         "macaddr8" => fixed(8, Align::Int),
         "name" => fixed(64, Align::Char),
         "point" => fixed(16, Align::Double),
-        "numeric" | "text" | "bytea" | "json" | "jsonb" | "xml" | "inet" | "cidr" | "bit" | "varbit" => {
-            varlena(Align::Int)
-        }
+        // Byte strings of any length: every payload residue is storable.
+        "text" | "bytea" | "json" | "jsonb" | "xml" | "varbit" => varlena(Align::Int, Payload::ANY),
+        // numeric.c: a 2- or 4-byte header plus 2-byte digits, so every payload is even.
+        "numeric" => varlena(Align::Int, Payload::EVEN),
+        // Fixed-size structs (inet) or typmod-sized bit strings this table does not size.
+        "inet" | "cidr" | "bit" => varlena(Align::Int, Payload::UNVERIFIED),
         // typmod can PROVE short form: n <= 31 chars is at most 4*31+1 = 125 bytes even in
-        // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned.
+        // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned. The
+        // payload reaches every residue only when even a single-byte encoding can: varchar(n)
+        // for n >= 7 or unlimited; char(n) always stores n characters.
         "varchar" | "bpchar" => Some(Resolved {
             kind: ColumnKind::Varlena {
                 align: Align::Int,
                 proven_short: char_len.is_some_and(|n| n <= 31),
+                payload: if key == "varchar" && char_len.is_none_or(|n| n >= 7) {
+                    Payload::ANY
+                } else {
+                    Payload::UNVERIFIED
+                },
             },
             known: true,
             implicit_not_null: false,
@@ -319,13 +349,13 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         "lseg" | "box" => fixed(32, Align::Double),
         "line" | "circle" => fixed(24, Align::Double),
         "pg_lsn" => fixed(8, Align::Double),
-        "path" | "polygon" => varlena(Align::Double),
-        "tsvector" | "tsquery" => varlena(Align::Int),
+        "path" | "polygon" => varlena(Align::Double, Payload::UNVERIFIED),
+        "tsvector" | "tsquery" => varlena(Align::Int, Payload::UNVERIFIED),
         "int4range" | "numrange" | "daterange" | "int4multirange" | "nummultirange" | "datemultirange" => {
-            varlena(Align::Int)
+            varlena(Align::Int, Payload::UNVERIFIED)
         }
         "int8range" | "tsrange" | "tstzrange" | "int8multirange" | "tsmultirange" | "tstzmultirange" => {
-            varlena(Align::Double)
+            varlena(Align::Double, Payload::UNVERIFIED)
         }
         // Serial pseudo-types resolve to their int type and imply NOT NULL.
         "serial" | "serial4" => serial(4, Align::Int),
@@ -337,10 +367,11 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         // int4 default — same storage class as the unknown-type assumption, verified rather than
         // assumed. The double-aligned group declares `alignment = double`, which changes where
         // these cluster among varlenas — the entries that alter numbers, not just confidence.
-        "citext" | "hstore" | "vector" | "halfvec" | "sparsevec" | "ltree" | "lquery" | "ltxtquery" => {
-            varlena(Align::Int)
+        "citext" => varlena(Align::Int, Payload::ANY),
+        "hstore" | "vector" | "halfvec" | "sparsevec" | "ltree" | "lquery" | "ltxtquery" => {
+            varlena(Align::Int, Payload::UNVERIFIED)
         }
-        "geometry" | "geography" | "cube" => varlena(Align::Double),
+        "geometry" | "geography" | "cube" => varlena(Align::Double, Payload::UNVERIFIED),
         // PostGIS box3d: fixed 52 bytes, double-aligned — irregular (52 % 8 != 0), so the
         // exact-search places it at the end of its alignment group.
         "box3d" => fixed(52, Align::Double),

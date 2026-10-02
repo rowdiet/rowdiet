@@ -1726,6 +1726,45 @@ mod closure_review {
     }
 
     #[test]
+    fn short_arrays_keep_their_storable_residues() {
+        // An uncompressed float8[] always stores payload 4 mod 8. Modeled with every residue,
+        // the engine printed "no dominating reorder exists" here while (m, s, a2, a1) measures
+        // never worse on 3,000 rows and 5.803 to 1.454 B/row on average.
+        let a = analyze_sources(
+            &[src(
+                "V1__p.sql",
+                "CREATE TABLE pin (s smallint NOT NULL, a1 float8[] NOT NULL, a2 float8[] NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, ["m", "s", "a2", "a1"]);
+        assert!(t.avoidable_bytes_per_row > 0.0);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+        assert!(t.superset_types.is_empty());
+    }
+
+    #[test]
+    fn an_unverified_payload_model_withholds_the_absence_claim() {
+        // inet stores 6 or 18 payload bytes and never the long form, which the model does not
+        // know; a sweep over the wider model cannot prove that nothing dominates.
+        let a = analyze_sources(
+            &[src(
+                "V1__i.sql",
+                "CREATE TABLE i (a inet NOT NULL, b smallint NOT NULL); CREATE TABLE t (a text NOT NULL, b smallint NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let inet = &a.tables[0];
+        assert_eq!(inet.avoidable_bytes_per_row, 0.0);
+        assert_eq!(inet.dominance_search, DominanceScope::Superset);
+        assert_eq!(inet.superset_types, ["inet"]);
+        let text = &a.tables[1];
+        assert_eq!(text.dominance_search, DominanceScope::Exhaustive);
+        assert!(text.superset_types.is_empty());
+    }
+
+    #[test]
     fn a_capped_exact_search_claims_no_exhaustiveness() {
         // Seven fixed classes of 40 columns each put both searches over budget; the heuristic
         // sort still pads, and the labels must say the search was capped.

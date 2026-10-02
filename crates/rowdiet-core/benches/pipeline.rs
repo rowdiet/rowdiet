@@ -4,7 +4,7 @@
 //! extract benches also cover libpg_query when built with `--features pg-exact`.
 
 use criterion::{Criterion, Throughput};
-use rowdiet_core::layout::{Align, ColumnKind};
+use rowdiet_core::layout::{Align, ColumnKind, Payload};
 use rowdiet_core::{
     Baseline, BaselineEntry, Config, SqlSource, analyze_sources, baseline, extract, layout, split, version,
 };
@@ -204,6 +204,7 @@ fn kinds_regular(n: usize) -> Vec<ColumnKind> {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: false,
+            payload: Payload::ANY,
         },
     ];
     (0..n).map(|i| cycle[i % cycle.len()]).collect()
@@ -291,14 +292,17 @@ fn kinds_mixed_irregular_23() -> Vec<ColumnKind> {
     kinds.push(ColumnKind::Varlena {
         align: Align::Int,
         proven_short: false,
+        payload: Payload::ANY,
     });
     kinds.push(ColumnKind::Varlena {
         align: Align::Double,
         proven_short: false,
+        payload: Payload::ANY,
     });
     kinds.push(ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
+        payload: Payload::ANY,
     });
     kinds
 }

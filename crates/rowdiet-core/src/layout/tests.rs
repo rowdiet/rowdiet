@@ -8,6 +8,7 @@ fn varlena(align: Align) -> ColumnKind {
     ColumnKind::Varlena {
         align,
         proven_short: false,
+        payload: Payload::ANY,
     }
 }
 
@@ -15,6 +16,7 @@ fn short() -> ColumnKind {
     ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
+        payload: Payload::ANY,
     }
 }
 
@@ -623,9 +625,9 @@ mod minimality_property {
                     Just(ColumnKind::Fixed { len: 6, align: Align::Int }),
                     Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false }),
-                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
                 ],
                 3..=6
             )
@@ -711,7 +713,9 @@ fn concrete_padding(kinds: &[ColumnKind], varlena_vals: &[(bool, u64)]) -> u64 {
                 total += p;
                 off += p + len;
             }
-            ColumnKind::Varlena { align, proven_short } => {
+            ColumnKind::Varlena {
+                align, proven_short, ..
+            } => {
                 let (short, payload) = varlena_vals[vi];
                 vi += 1;
                 assert!(short || !proven_short, "proven-short columns store short-form only");

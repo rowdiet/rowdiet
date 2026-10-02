@@ -10,7 +10,7 @@
 //! gate. Expected values stay as display fields under the layout module doc's stated model
 //! assumptions and decide nothing.
 
-use crate::dominance::DiffBounds;
+use crate::dominance::{DiffBounds, Summary};
 use crate::fold::{FoldedTable, Note, Origin};
 use crate::layout::{self, ColumnKind, SearchScope, Tier, Walk};
 
@@ -124,6 +124,10 @@ pub struct TableReport {
     /// Type spellings that resolved by assumption, sorted and deduplicated — the table's
     /// numbers are only as good as those assumptions.
     pub assumed_types: Vec<String>,
+    /// Varlena type spellings whose payload lengths the realization model does not narrow to
+    /// what PostgreSQL stores, sorted and deduplicated. Findings over them hold; an exhaustive
+    /// clean verdict does not (see [`DominanceScope::Superset`]).
+    pub superset_types: Vec<String>,
     /// Columns dropped across the migration series. When nonzero, every NEW row still carries
     /// a null bitmap sized by the original attribute count (Postgres keeps dropped attribute
     /// slots), and the exact-tier footprint includes that header cost.
@@ -259,6 +263,11 @@ pub enum DominanceScope {
     /// The sweep was skipped or trimmed by its budgets (order space too large, or a comparison
     /// out of the enumeration budget): a clean verdict claims only what was searched.
     Budgeted,
+    /// The sweep tested every candidate, but some column's type has unverified payload lengths
+    /// ([`TableReport::superset_types`]): the model lets it store lengths PostgreSQL may never
+    /// write, and a realization that only the model allows can hide a dominating reorder. A
+    /// clean verdict says "found".
+    Superset,
 }
 
 /// What the decision policy concluded for one estimate-tier table.
@@ -290,8 +299,8 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
     let identity: Vec<usize> = (0..n).collect();
     let mut dominating: Vec<(Vec<usize>, DiffBounds)> = Vec::new();
     let sequence_cap = SWEEP_SEQUENCE_CAP.min(SWEEP_ELEMENT_CAP / n.max(1));
-    let exhaustive = layout::order_space(kinds, sequence_cap)
-        .is_some_and(|orders| sweep(kinds, current_walk, orders, &mut dominating));
+    let exhaustive =
+        layout::order_space(kinds, sequence_cap).is_some_and(|orders| sweep(kinds, orders, &mut dominating));
     if !exhaustive {
         for candidate in fallback_candidates(kinds, search) {
             if candidate == identity || dominating.iter().any(|(order, _)| *order == candidate) {
@@ -313,9 +322,11 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
         .into_iter()
         .map(|(order, diff)| {
             let ordered: Vec<ColumnKind> = order.iter().map(|&i| kinds[i]).collect();
-            (order, diff, layout::walk(&ordered))
+            let summary = crate::dominance::summary(kinds, &order);
+            (order, diff, layout::walk(&ordered), summary)
         })
-        .min_by_key(|(_, _, w)| (w.padding_max(), w.padding, w.expected_padding_eighths()));
+        .min_by_key(|(_, _, w, summary)| (summary.max, w.padding, summary.short_mean_eighths))
+        .map(|(order, diff, w, _)| (order, diff, w));
     if let Some((order, diff, cand_walk)) = best {
         // The gate never claims more than the engine's proven maximum saving: certain pads the
         // reorder converts into smaller data-dependent ones are capped at what is attainable.
@@ -375,26 +386,19 @@ fn decide(kinds: &[ColumnKind], search: &layout::Search, current_walk: &Walk) ->
 /// whether every member was decided. The class-sequence members go first, in the order the
 /// collapsed sweep tested them, so a trimmed sweep finds at least what that sweep found; the
 /// rest follow by ascending worst case.
-fn sweep(
-    kinds: &[ColumnKind],
-    current_walk: &Walk,
-    orders: Vec<Vec<usize>>,
-    dominating: &mut Vec<(Vec<usize>, DiffBounds)>,
-) -> bool {
+fn sweep(kinds: &[ColumnKind], orders: Vec<Vec<usize>>, dominating: &mut Vec<(Vec<usize>, DiffBounds)>) -> bool {
     let identity: Vec<usize> = (0..kinds.len()).collect();
-    let passes_prunes = |candidate: &[usize]| -> Option<Walk> {
+    let current = crate::dominance::summary(kinds, &identity);
+    let passes_prunes = |candidate: &[usize]| -> Option<(Summary, u64)> {
+        // Dominance implies pointwise <=, so it implies <= on the max, the min, and the mean
+        // over any sub-distribution of realizations; the summary computes all three over the
+        // same realization model the comparison uses, so the prunes stay sound where a type
+        // narrows its payload residues.
+        let cand = crate::dominance::summary(kinds, candidate);
+        let pruned =
+            cand.max > current.max || cand.min > current.min || cand.short_mean_eighths > current.short_mean_eighths;
         let ordered: Vec<ColumnKind> = candidate.iter().map(|&i| kinds[i]).collect();
-        let cand_walk = layout::walk(&ordered);
-        // Dominance implies pointwise <=, so it implies <= on the max, the min, and the
-        // mean over any sub-distribution of realizations. expected_padding_eighths is the
-        // exact mean over "every varlena short, payloads uniform mod 8" (pinned by the
-        // enumeration oracle test), so it is a sound prune; note this makes the display
-        // expectation correctness-bearing here, so its model cannot change independently.
-        // All three prunes were brute-force-checked: no dominating candidate fails any.
-        let pruned = cand_walk.padding_max() > current_walk.padding_max()
-            || cand_walk.padding_min() > current_walk.padding_min()
-            || cand_walk.expected_padding_eighths() > current_walk.expected_padding_eighths();
-        (!pruned).then_some(cand_walk)
+        (!pruned).then(|| (cand, layout::walk(&ordered).padding))
     };
     let class_sequences = layout::class_sequence_space(kinds, orders.len()).unwrap_or_default();
     let mut rest: Vec<((u64, u64, u64), Vec<usize>)> = Vec::new();
@@ -402,13 +406,8 @@ fn sweep(
         if keeps_class_order(kinds, &candidate) {
             continue;
         }
-        if let Some(cand_walk) = passes_prunes(&candidate) {
-            let key = (
-                cand_walk.padding_max(),
-                cand_walk.padding,
-                cand_walk.expected_padding_eighths(),
-            );
-            rest.push((key, candidate));
+        if let Some((cand, certain)) = passes_prunes(&candidate) {
+            rest.push(((cand.max, certain, cand.short_mean_eighths), candidate));
         }
     }
     rest.sort();
@@ -441,9 +440,9 @@ fn sweep(
 /// representatives an earlier, collapsed candidate space held.
 fn keeps_class_order(kinds: &[ColumnKind], order: &[usize]) -> bool {
     let class = |kind: ColumnKind| match kind {
-        ColumnKind::Varlena { align, proven_short } if !proven_short && align != layout::Align::Char => {
-            Some(align.bytes())
-        }
+        ColumnKind::Varlena {
+            align, proven_short, ..
+        } if !proven_short && align != layout::Align::Char => Some(align.bytes()),
         ColumnKind::Varlena { .. } => Some(0),
         ColumnKind::Fixed { .. } => None,
     };
@@ -644,6 +643,18 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         .collect();
     assumed_types.sort();
     assumed_types.dedup();
+    let mut superset_types: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|c| matches!(c.kind, ColumnKind::Varlena { payload, .. } if !payload.verified))
+        .map(|c| c.type_display.clone())
+        .collect();
+    superset_types.sort();
+    superset_types.dedup();
+    let dominance_search = match decision.dominance_search {
+        DominanceScope::Exhaustive if !superset_types.is_empty() => DominanceScope::Superset,
+        scope => scope,
+    };
     let any_nullable = table.columns.iter().any(|c| !c.not_null);
     let layout_signature = layout_signature(&kinds);
     TableReport {
@@ -669,9 +680,10 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             decision.dominance_saving
         },
         search_scope: search.scope,
-        dominance_search: decision.dominance_search,
+        dominance_search,
         frontier,
         assumed_types,
+        superset_types,
         dropped_columns: table.dropped_count,
         layout_signature,
     }
@@ -687,7 +699,9 @@ pub fn layout_signature(kinds: &[ColumnKind]) -> String {
         .iter()
         .map(|kind| match kind {
             ColumnKind::Fixed { len, align } => format!("f{len}{}", align_letter(*align)),
-            ColumnKind::Varlena { align, proven_short } => {
+            ColumnKind::Varlena {
+                align, proven_short, ..
+            } => {
                 let p = if *proven_short { "p" } else { "" };
                 format!("v{}{p}", align_letter(*align))
             }

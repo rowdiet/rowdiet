@@ -231,11 +231,16 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
     }
 }
 
-/// The clean-table phrase: an exhaustive sweep proves absence, a budgeted one only reports it.
-fn verdict_phrase(t: &TableReport) -> &'static str {
+/// The clean-table phrase: an exhaustive sweep proves absence, a budgeted one or one over an
+/// unverified payload model only reports it.
+fn verdict_phrase(t: &TableReport) -> String {
     match t.dominance_search {
-        DominanceScope::Exhaustive => "no dominating reorder exists",
-        DominanceScope::Budgeted => "no dominating reorder found (dominance search budgeted)",
+        DominanceScope::Exhaustive => "no dominating reorder exists".to_string(),
+        DominanceScope::Budgeted => "no dominating reorder found (dominance search budgeted)".to_string(),
+        DominanceScope::Superset => format!(
+            "no dominating reorder found (payload lengths unverified for {})",
+            t.superset_types.join(", ")
+        ),
     }
 }
 
@@ -616,6 +621,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
             SearchScope::Complete => match t.dominance_search {
                 DominanceScope::Exhaustive => "complete",
                 DominanceScope::Budgeted => "complete (dominance budgeted)",
+                DominanceScope::Superset => "complete (payload model unverified)",
             },
             SearchScope::FixedPrefix => "capped: fixed prefix",
             SearchScope::SortOnly => "capped: sort only",

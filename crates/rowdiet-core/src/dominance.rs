@@ -4,10 +4,13 @@
 //! depends on the realization only through each varlena's form and its payload length mod
 //! MAXALIGN: the short form (payloads of 126 bytes or less) advances by 1 + payload with no
 //! alignment, a TOAST pointer advances by a fixed 18 bytes (the same shape as a short payload
-//! of 17), and the in-line long form aligns to typalign and advances by 4 + payload. Order A
-//! **dominates** order B when A's total padding is less than or equal to B's in every
-//! realization, and strictly less in at least one — a claim that needs no payload knowledge,
-//! which is why the gate and the recommender may act on it (see docs/design.md).
+//! of 17), and the in-line long form aligns to typalign and advances by 4 + payload. A short
+//! value is stored uncompressed, so its payload residues are the type's own
+//! ([`Payload`](crate::layout::Payload): any for text, even for numeric, `4 + k * stride` for
+//! arrays); a long value may be compressed and reaches every residue. Order A **dominates**
+//! order B when A's total padding is less than or equal to B's in every realization, and
+//! strictly less in at least one — a claim that needs no payload knowledge, which is why the
+//! gate and the recommender may act on it (see docs/design.md).
 //!
 //! Two exact engines compute the bounds of `pad(A) − pad(B)` over all realizations:
 //!
@@ -141,6 +144,46 @@ fn long_capable(kind: ColumnKind) -> bool {
     )
 }
 
+/// The payload residue a TOAST pointer advances like: 18 bytes is a short payload of 17.
+const TOAST_RESIDUE: u8 = 1 << 1;
+
+/// A varlena's realizations as payload-residue bitmasks per form: `short` stores unaligned (a
+/// 1-byte header, or a TOAST pointer), `long` aligns to typalign behind a 4-byte header.
+#[derive(Debug, Clone, Copy)]
+struct Domain {
+    short: u8,
+    long: u8,
+}
+
+impl Domain {
+    fn of(kind: ColumnKind) -> Self {
+        match kind {
+            ColumnKind::Varlena {
+                proven_short: true,
+                payload,
+                ..
+            } => Self {
+                short: payload.residues(),
+                long: 0,
+            },
+            ColumnKind::Varlena { payload, .. } => Self {
+                short: payload.residues() | TOAST_RESIDUE,
+                long: 0xFF,
+            },
+            ColumnKind::Fixed { .. } => Self { short: 0, long: 0 },
+        }
+    }
+
+    fn allows(self, form_long: bool, payload: u64) -> bool {
+        let mask = if form_long { self.long } else { self.short };
+        mask & (1 << payload) != 0
+    }
+
+    fn size(self) -> u64 {
+        u64::from(self.short.count_ones() + self.long.count_ones())
+    }
+}
+
 /// Storage forms pinned per column for band computation: listed columns are long, all other
 /// long-capable columns short/TOAST.
 struct FormPin<'a> {
@@ -148,23 +191,21 @@ struct FormPin<'a> {
 }
 
 impl FormPin<'_> {
-    /// The form domain for `column`: (short allowed, long allowed).
-    fn domain(&self, column: usize, kind: ColumnKind) -> (bool, bool) {
-        if !long_capable(kind) {
-            return (true, false);
-        }
-        if self.long.contains(&column) {
-            (false, true)
+    /// The realization domain for `column` with its form pinned.
+    fn domain(&self, column: usize, kind: ColumnKind) -> Domain {
+        let full = Domain::of(kind);
+        if long_capable(kind) && self.long.contains(&column) {
+            Domain { short: 0, ..full }
         } else {
-            (true, false)
+            Domain { long: 0, ..full }
         }
     }
 }
 
-fn form_domain(pin: Option<&FormPin<'_>>, column: usize, kind: ColumnKind) -> (bool, bool) {
+fn form_domain(pin: Option<&FormPin<'_>>, column: usize, kind: ColumnKind) -> Domain {
     match pin {
         Some(p) => p.domain(column, kind),
-        None => (true, long_capable(kind)),
+        None => Domain::of(kind),
     }
 }
 
@@ -180,10 +221,7 @@ fn varlena_sequence(kinds: &[ColumnKind], order: &[usize]) -> Vec<usize> {
 fn enumeration_states(kinds: &[ColumnKind], varlenas: &[usize], pin: Option<&FormPin<'_>>) -> u64 {
     varlenas
         .iter()
-        .map(|&c| {
-            let (short, long) = form_domain(pin, c, kinds[c]);
-            (u64::from(short) + u64::from(long)) * MAXALIGN
-        })
+        .map(|&c| form_domain(pin, c, kinds[c]).size())
         .try_fold(1u64, u64::checked_mul)
         .unwrap_or(u64::MAX)
 }
@@ -212,14 +250,14 @@ fn joint_walk(
         let ColumnKind::Varlena { align, .. } = kinds[column] else {
             unreachable!("varlena sequence holds varlenas")
         };
-        let (short, long) = form_domain(pin, column, kinds[column]);
+        let domain = form_domain(pin, column, kinds[column]);
         let mut next: [Option<DiffBounds>; 64] = [None; 64];
         for (state, bounds) in states.iter().enumerate() {
             let Some(bounds) = *bounds else { continue };
             let (ra, rb) = ((state as u64) / 8, (state as u64) % 8);
             for payload in 0..MAXALIGN {
                 for form_long in [false, true] {
-                    if (form_long && !long) || (!form_long && !short) {
+                    if !domain.allows(form_long, payload) {
                         continue;
                     }
                     let (pad_a, ra2) = varlena_step(ra, align.bytes(), form_long, payload);
@@ -248,6 +286,89 @@ fn joint_walk(
         }
     }
     out.expect("at least one realization exists")
+}
+
+/// One order's padding over the realization model: exact bounds over every realization, and the
+/// mean over the sub-distribution where every varlena stores a short uncompressed payload uniform
+/// over its type's residues. Dominance implies <= on all three, which makes them sound prunes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    /// Smallest attainable total padding, bytes.
+    pub min: u64,
+    /// Largest attainable total padding, bytes.
+    pub max: u64,
+    /// The short-form mean, eighths of a byte (uniform residues over cosets keep it exact).
+    pub short_mean_eighths: u64,
+}
+
+/// [`Summary`] of `order`: a walk over the eight offset residues for the bounds, and over one
+/// uniform coset of residues for the mean.
+pub fn summary(kinds: &[ColumnKind], order: &[usize]) -> Summary {
+    let mut states: [Option<(u64, u64)>; MAXALIGN as usize] = [None; MAXALIGN as usize];
+    states[0] = Some((0, 0));
+    let mut set: u8 = 1;
+    let mut mean_eighths = 0u64;
+    let merge = |slot: &mut Option<(u64, u64)>, lo: u64, hi: u64| {
+        *slot = Some(match *slot {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+    };
+    for &column in order {
+        let kind = kinds[column];
+        let mut next: [Option<(u64, u64)>; MAXALIGN as usize] = [None; MAXALIGN as usize];
+        let mut next_set = 0u8;
+        match kind {
+            ColumnKind::Fixed { len, align } => {
+                for (residue, bounds) in states.iter().enumerate() {
+                    let Some((lo, hi)) = *bounds else { continue };
+                    let p = pad(residue as u64, align.bytes());
+                    merge(
+                        &mut next[((residue as u64 + p + len) % MAXALIGN) as usize],
+                        lo + p,
+                        hi + p,
+                    );
+                }
+                let mut sum = 0u64;
+                for residue in (0..MAXALIGN).filter(|r| set & (1 << r) != 0) {
+                    let p = pad(residue, align.bytes());
+                    sum += p;
+                    next_set |= 1 << ((residue + p + len) % MAXALIGN);
+                }
+                let members = u64::from(set.count_ones());
+                debug_assert_eq!(sum * MAXALIGN % members, 0, "a coset keeps the mean in eighths");
+                mean_eighths += sum * MAXALIGN / members;
+            }
+            ColumnKind::Varlena { align, payload, .. } => {
+                let domain = Domain::of(kind);
+                for (residue, bounds) in states.iter().enumerate() {
+                    let Some((lo, hi)) = *bounds else { continue };
+                    for p in 0..MAXALIGN {
+                        for form_long in [false, true] {
+                            if domain.allows(form_long, p) {
+                                let (own, after) = varlena_step(residue as u64, align.bytes(), form_long, p);
+                                merge(&mut next[after as usize], lo + own, hi + own);
+                            }
+                        }
+                    }
+                }
+                let uncompressed = payload.residues();
+                for residue in (0..MAXALIGN).filter(|r| set & (1 << r) != 0) {
+                    for p in (0..MAXALIGN).filter(|p| uncompressed & (1 << p) != 0) {
+                        next_set |= 1 << ((residue + 1 + p) % MAXALIGN);
+                    }
+                }
+            }
+        }
+        states = next;
+        set = next_set;
+    }
+    let reached = states.iter().flatten();
+    Summary {
+        min: reached.clone().map(|&(lo, _)| lo).min().unwrap_or(0),
+        max: reached.map(|&(_, hi)| hi).max().unwrap_or(0),
+        short_mean_eighths: mean_eighths,
+    }
 }
 
 /// One varlena placement from a residue: (pad, residue after the value).
@@ -370,10 +491,10 @@ fn enumerate_rec(
         return;
     }
     let column = varlenas[depth];
-    let (short, long) = form_domain(pin, column, kinds[column]);
+    let domain = form_domain(pin, column, kinds[column]);
     for payload in 0..MAXALIGN {
         for form_long in [false, true] {
-            if (form_long && !long) || (!form_long && !short) {
+            if !domain.allows(form_long, payload) {
                 continue;
             }
             assignment[depth] = (form_long, payload);
