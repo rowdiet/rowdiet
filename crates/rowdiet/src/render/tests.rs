@@ -22,19 +22,16 @@ fn gate(analysis: &Analysis, fail_over: Option<f64>) -> GateOutcome {
     baseline::evaluate(analysis, fail_over, false, None)
 }
 
-fn baselined(analysis: &Analysis, entries: &[(&str, f64, &str)]) -> GateOutcome {
+fn baselined(analysis: &Analysis, entries: &[(&str, &str)]) -> GateOutcome {
     let base = Baseline {
         rowdiet: "test".into(),
         fail_over: 0.0,
         tables: entries
             .iter()
-            .map(|(name, bytes, layout)| {
+            .map(|(name, layout)| {
                 (
                     name.to_string(),
-                    BaselineEntry {
-                        bytes: *bytes,
-                        layout: layout.to_string(),
-                    },
+                    BaselineEntry::new(baseline::CommittedLayout::parse(layout).unwrap()),
                 )
             })
             .collect(),
@@ -88,31 +85,19 @@ fn partition_children_with_known_parent_render_real_analysis() {
 fn baseline_verdicts_in_text_output() {
     let analysis = sample();
     let sig = &analysis.tables[0].layout_signature;
-    let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4.0, sig)]));
+    let committed = text(&analysis, None, false, &baselined(&analysis, &[("account", sig)]));
     assert!(
-        regressed.contains("✗ regression: 8.0 B/row exceeds the baselined allowance of 4"),
-        "{regressed}"
+        !committed.contains("FAIL"),
+        "a committed layout is not judged again: {committed}"
     );
-    assert!(regressed.contains("FAIL: 1 regression(s) vs baseline"), "{regressed}");
-    let modified = text(
-        &analysis,
-        None,
-        false,
-        &baselined(&analysis, &[("account", 8.0, "f16c")]),
-    );
+    let modified = text(&analysis, None, false, &baselined(&analysis, &[("account", "f16c")]));
     assert!(modified.contains("✗ modified since baseline"), "{modified}");
     assert!(modified.contains("--accept account"), "{modified}");
-    let ratchet = text(&analysis, None, false, &baselined(&analysis, &[("account", 12.0, sig)]));
-    assert!(
-        ratchet.contains("↓ ratchet: allowance 12 can tighten to 8"),
-        "{ratchet}"
-    );
-    assert!(!ratchet.contains("FAIL"), "{ratchet}");
     let orphanish = text(
         &analysis,
         None,
         false,
-        &baselined(&analysis, &[("account", 8.0, sig), ("ghost", 1.0, "vi")]),
+        &baselined(&analysis, &[("account", sig), ("ghost", "vi")]),
     );
     assert!(
         orphanish.contains("orphaned entries (no matching table): ghost"),
@@ -120,17 +105,77 @@ fn baseline_verdicts_in_text_output() {
     );
 }
 
-#[test]
-fn grown_since_baseline_in_text_output() {
-    let analysis = analyze(
+/// (bool, bigint) appended to a committed (int, bigint): the block order is printed, the
+/// prefix stays.
+fn grown() -> Analysis {
+    analyze(
         "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
          ALTER TABLE t ADD COLUMN e boolean NOT NULL;
-         ALTER TABLE t ADD COLUMN f bigint NOT NULL;",
-    );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", 0.0, "f4i,f8d")]));
-    assert!(rendered.contains("✗ grown since baseline"), "{rendered}");
+         ALTER TABLE t ADD COLUMN f bigint NOT NULL;
+         ALTER TABLE t ADD COLUMN g boolean NOT NULL;
+         ALTER TABLE t ADD COLUMN h bigint NOT NULL;",
+    )
+}
+
+#[test]
+fn a_wasteful_block_prints_its_block_order() {
+    let analysis = grown();
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
     assert!(
-        rendered.contains("grown since baseline") && rendered.contains("FAIL:"),
+        rendered.contains(
+            "✗ appended block (V1__init.sql:2, 4 column(s) after a committed prefix of 2) is not dominance-optimal"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("block order: f, h, e, g → 8.0 B/row avoidable"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("FAIL: 1 appended block(s) not dominance-optimal"),
+        "{rendered}"
+    );
+    let accepted = text(
+        &analysis,
+        None,
+        false,
+        &baselined(&analysis, &[("t", &analysis.tables[0].layout_signature)]),
+    );
+    assert!(!accepted.contains("FAIL"), "{accepted}");
+}
+
+#[test]
+fn an_optimal_block_says_so() {
+    let analysis = analyze(
+        "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
+         ALTER TABLE t ADD COLUMN c bigint NOT NULL, ADD COLUMN d integer NOT NULL;",
+    );
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    assert!(
+        rendered.contains("✓ appended block (V1__init.sql:2, 2 column(s) after a committed prefix of 2): no dominating block order exists"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("FAIL"), "{rendered}");
+}
+
+#[test]
+fn legacy_allowances_are_reported_as_ignored() {
+    let analysis = sample();
+    let mut entry = BaselineEntry::committing(&analysis.tables[0]);
+    entry.legacy_bytes = Some(8.0);
+    let base = Baseline {
+        rowdiet: "old".into(),
+        fail_over: 0.0,
+        tables: [("account".to_string(), entry)].into_iter().collect(),
+    };
+    let rendered = text(
+        &analysis,
+        None,
+        false,
+        &baseline::evaluate(&analysis, None, false, Some(&base)),
+    );
+    assert!(
+        rendered.contains("baseline: byte allowances ignored for account"),
         "{rendered}"
     );
 }
@@ -142,12 +187,13 @@ fn github_annotations() {
     assert!(rendered.starts_with("::error file=V1__init.sql,line=1,title=rowdiet::table account"));
     let warn = github(&analysis, &gate(&analysis, None));
     assert!(warn.starts_with("::warning "));
-    let sig = &analysis.tables[0].layout_signature;
-    let regressed = github(&analysis, &baselined(&analysis, &[("account", 4.0, sig)]));
+    let grown = grown();
+    let block = github(&grown, &baselined(&grown, &[("t", "f4i,f8d")]));
     assert!(
-        regressed.starts_with("::error file=V1__init.sql,line=1,title=rowdiet regression::"),
-        "{regressed}"
+        block.starts_with("::error file=V1__init.sql,line=2,title=rowdiet block-not-dominance-optimal::table t: appended block e, f, g, h"),
+        "{block}"
     );
+    assert!(block.contains("block order: f, h, e, g"), "{block}");
 }
 
 #[test]
@@ -231,12 +277,10 @@ fn github_step_summary_carries_the_full_report() {
         summary.contains("FAIL: 13 table(s) over the fail-over gate"),
         "{summary}"
     );
-    let baselined_summary = github_step_summary(
-        &analysis,
-        &baselined(&analysis, &[("t00", 4.0, &analysis.tables[0].layout_signature)]),
-    );
+    let grown = grown();
+    let baselined_summary = github_step_summary(&grown, &baselined(&grown, &[("t", "f4i,f8d")]));
     assert!(
-        baselined_summary.contains("**regression** (allowed 4)"),
+        baselined_summary.contains("**block not dominance-optimal** (block order: f, h, e, g)"),
         "{baselined_summary}"
     );
 }
