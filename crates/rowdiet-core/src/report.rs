@@ -560,7 +560,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     let current_walk = layout::walk(&kinds);
     let search = layout::search(&kinds);
     let identity: Vec<usize> = (0..kinds.len()).collect();
-    let current = stats(tier, &current_walk, t_hoff);
+    let current = stats(tier, &kinds, &identity, &current_walk, t_hoff);
     let decision = match tier {
         // Exact tier: everything is deterministic, so the certainty pole is the exact padding
         // minimum when the search completed, and the footprint delta is the whole story
@@ -594,7 +594,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     };
     let ordered_kinds: Vec<ColumnKind> = decision.order.iter().map(|&i| kinds[i]).collect();
     let suggested_walk = layout::walk(&ordered_kinds);
-    let suggested = stats(tier, &suggested_walk, t_hoff);
+    let suggested = stats(tier, &kinds, &decision.order, &suggested_walk, t_hoff);
     // Exact-tier avoidable is the footprint delta; a reorder that does not cross an 8-byte
     // rung reports zero even when raw padding drops.
     let (avoidable_deterministic, avoidable_dominance) = match tier {
@@ -719,18 +719,20 @@ fn align_letter(align: layout::Align) -> char {
     }
 }
 
-fn stats(tier: Tier, walk: &Walk, t_hoff: u64) -> OrderStats {
+fn stats(tier: Tier, kinds: &[ColumnKind], order: &[usize], walk: &Walk, t_hoff: u64) -> OrderStats {
     // The end is known exactly iff the table has no varlena, which is exactly the exact tier;
     // the estimate tier has no footprint to claim, and the unknown tier claims nothing.
     let footprint = match (tier, walk.end) {
         (Tier::Exact, Some(end)) => Some(layout::footprint_at(t_hoff, end)),
         _ => None,
     };
+    // Bounds over the realization model, which knows the payload residues a type stores.
+    let bounds = crate::dominance::summary(kinds, order);
     OrderStats {
         padding: walk.padding,
         expected_padding: walk.expected_padding(),
-        padding_min: walk.padding_min(),
-        padding_max: walk.padding_max(),
+        padding_min: bounds.min,
+        padding_max: bounds.max,
         footprint,
         rows_per_page: footprint.map(layout::rows_per_page),
     }

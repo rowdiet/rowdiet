@@ -162,6 +162,19 @@ fn bounds(kinds: &[Kind], pins: &[Option<bool>], a: &[usize], b: &[usize]) -> (i
 
 /// True when `candidate` is never worse than `current` and better somewhere; stops at the first
 /// realization where it is worse.
+/// Padding bounds of one order over every realization.
+fn order_bounds(kinds: &[Kind], order: &[usize]) -> (i64, i64) {
+    let pins = vec![None; kinds.len()];
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    each_realization(kinds, &pins, |r| {
+        let p = padding(kinds, order, r);
+        lo = lo.min(p);
+        hi = hi.max(p);
+        true
+    });
+    (lo, hi)
+}
+
 fn dominates(kinds: &[Kind], current: &[usize], candidate: &[usize]) -> bool {
     let pins = vec![None; kinds.len()];
     let mut worse = false;
@@ -241,16 +254,10 @@ fn check(types: &[&str]) -> Result<(), String> {
     let identity: Vec<usize> = (0..n).collect();
     let free = vec![None; n];
     let table = format!("({})", types.join(", "));
-    let (mut cur_lo, mut cur_hi) = (i64::MAX, i64::MIN);
-    each_realization(&kinds, &free, |r| {
-        let p = padding(&kinds, &identity, r);
-        cur_lo = cur_lo.min(p);
-        cur_hi = cur_hi.max(p);
-        true
-    });
-    if t.current.padding_max as i64 != cur_hi || t.current.padding_min as i64 > cur_lo {
+    let (cur_lo, cur_hi) = order_bounds(&kinds, &identity);
+    if (t.current.padding_min as i64, t.current.padding_max as i64) != (cur_lo, cur_hi) {
         return Err(format!(
-            "{table}: current bounds [{}, {}] do not cover the oracle's [{cur_lo}, {cur_hi}] with an exact maximum",
+            "{table}: current bounds [{}, {}] vs the oracle's [{cur_lo}, {cur_hi}]",
             t.current.padding_min, t.current.padding_max
         ));
     }
@@ -267,7 +274,7 @@ fn check(types: &[&str]) -> Result<(), String> {
         let (lo, hi) = bounds(&kinds, &free, &identity, &suggested);
         let saving = t
             .dominance_saving
-            .ok_or(format!("{table}: a finding without a saving range"))?;
+            .ok_or_else(|| format!("{table}: a finding without a saving range"))?;
         if (saving.min as i64, saving.max as i64) != (lo, hi) {
             return Err(format!(
                 "{table}: saving {}-{} but the oracle measures {lo}-{hi}",
@@ -280,15 +287,21 @@ fn check(types: &[&str]) -> Result<(), String> {
                 t.avoidable_bytes_per_row
             ));
         }
-    } else if t.dominance_search == DominanceScope::Exhaustive {
-        if let Some(order) = distinct_orders(types, &kinds)
-            .into_iter()
-            .find(|order| *order != identity && dominates(&kinds, &identity, order))
-        {
+        let (sug_lo, sug_hi) = order_bounds(&kinds, &suggested);
+        if (t.suggested.padding_min as i64, t.suggested.padding_max as i64) != (sug_lo, sug_hi) {
             return Err(format!(
-                "{table}: \"no dominating reorder exists\", but {order:?} dominates"
+                "{table}: suggested bounds [{}, {}] vs the oracle's [{sug_lo}, {sug_hi}]",
+                t.suggested.padding_min, t.suggested.padding_max
             ));
         }
+    } else if t.dominance_search == DominanceScope::Exhaustive
+        && let Some(order) = distinct_orders(types, &kinds)
+            .into_iter()
+            .find(|order| *order != identity && dominates(&kinds, &identity, order))
+    {
+        return Err(format!(
+            "{table}: \"no dominating reorder exists\", but {order:?} dominates"
+        ));
     }
     if let Some(frontier) = &t.frontier {
         let alternative = indices(&frontier.order);
