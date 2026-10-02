@@ -377,8 +377,20 @@ fn fixtures() -> Vec<Fixture> {
                 col("m", "macaddr"),
             ],
         ),
-        // A trimmed sweep: four proven-short varchars and a text exhaust the comparison budget;
+        // A trimmed sweep: four always-short varchars and a text exhaust the comparison budget;
         // the dominating minimax pole must be recommended and measure no worse.
+        plain(
+            "orders5",
+            vec![
+                col("id", "bigint"),
+                col("country", "varchar(2)"),
+                col("currency", "varchar(3)"),
+                col("status", "varchar(5)"),
+                col("channel", "varchar(4)"),
+                col("note", "text"),
+            ],
+        ),
+        // The same shape with varchars wide enough to compress, which can then align.
         plain(
             "orders",
             vec![
