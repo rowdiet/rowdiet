@@ -17,7 +17,10 @@ fn short() -> ColumnKind {
     ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
-        payload: Payload::ANY,
+        payload: Payload {
+            compressible: false,
+            ..Payload::ANY
+        },
     }
 }
 
@@ -123,6 +126,7 @@ mod engine_agreement {
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload { compressible: false, ..Payload::ANY } }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::EVEN }),
@@ -250,16 +254,14 @@ mod independent_oracle {
         let domains: Vec<Vec<Value>> = varlenas
             .iter()
             .map(|&c| {
-                let ColumnKind::Varlena {
-                    proven_short, payload, ..
-                } = kinds[c]
-                else {
+                let ColumnKind::Varlena { payload, .. } = kinds[c] else {
                     unreachable!()
                 };
+                let short_only = kinds[c].always_short();
                 // Concrete uncompressed lengths the type can store: 4 + k * step bytes.
                 let step = u64::from(payload.step);
                 let mut domain: Vec<Value> = (0..8).map(|k| Value::Short((4 + k * step) % 16)).collect();
-                if !proven_short {
+                if !short_only {
                     domain.extend((127..135).map(Value::Long));
                     domain.push(Value::Toast);
                 }
@@ -313,6 +315,7 @@ mod independent_oracle {
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload { compressible: false, ..Payload::ANY } }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::array(4) }),
@@ -453,6 +456,7 @@ mod summaries {
                     Just(ColumnKind::Fixed { len: 8, align: Align::Double }),
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload { compressible: false, ..Payload::ANY } }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::array(8) }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::array(4) }),

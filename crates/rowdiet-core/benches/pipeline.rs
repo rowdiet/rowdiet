@@ -302,7 +302,10 @@ fn kinds_mixed_irregular_23() -> Vec<ColumnKind> {
     kinds.push(ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
-        payload: Payload::ANY,
+        payload: Payload {
+            compressible: false,
+            ..Payload::ANY
+        },
     });
     kinds
 }

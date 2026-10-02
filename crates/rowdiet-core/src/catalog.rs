@@ -329,17 +329,19 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         // Fixed-size structs (inet) or typmod-sized bit strings this table does not size.
         "inet" | "cidr" | "bit" => varlena(Align::Int, Payload::UNVERIFIED),
         // typmod can PROVE short form: n <= 31 chars is at most 4*31+1 = 125 bytes even in
-        // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned. The
-        // payload reaches every residue only when even a single-byte encoding can: varchar(n)
-        // for n >= 7 or unlimited; char(n) always stores n characters.
+        // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned when
+        // uncompressed. Past 20 payload bytes (n >= 6 in 4-byte UTF-8) the toaster may compress
+        // the value in line, aligned. Every short and long residue is storable in every encoding
+        // only for unlimited varchar or n >= 134 (a single-byte value reaches payloads 127..=134
+        // uncompressed); char(n) always stores n characters.
         "varchar" | "bpchar" => Some(Resolved {
             kind: ColumnKind::Varlena {
                 align: Align::Int,
                 proven_short: char_len.is_some_and(|n| n <= 31),
-                payload: if key == "varchar" && char_len.is_none_or(|n| n >= 7) {
-                    Payload::ANY
-                } else {
-                    Payload::UNVERIFIED
+                payload: Payload {
+                    verified: key == "varchar" && char_len.is_none_or(|n| n >= 134),
+                    compressible: char_len.is_none_or(|n| 4 * n > 20),
+                    ..Payload::ANY
                 },
             },
             known: true,

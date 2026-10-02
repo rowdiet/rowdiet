@@ -133,15 +133,10 @@ pub fn bands(kinds: &[ColumnKind], a: &[usize], b: &[usize]) -> Option<Vec<Band>
     Some(out)
 }
 
-/// True when the column can store the in-line long form at all; proven-short varlenas cannot.
+/// True when the column can store the aligned long form at all: every varlena but one proven
+/// too short to compress.
 fn long_capable(kind: ColumnKind) -> bool {
-    matches!(
-        kind,
-        ColumnKind::Varlena {
-            proven_short: false,
-            ..
-        }
-    )
+    !kind.is_fixed() && !kind.always_short()
 }
 
 /// The payload residue a TOAST pointer advances like: 18 bytes is a short payload of 17.
@@ -158,11 +153,7 @@ struct Domain {
 impl Domain {
     fn of(kind: ColumnKind) -> Self {
         match kind {
-            ColumnKind::Varlena {
-                proven_short: true,
-                payload,
-                ..
-            } => Self {
+            ColumnKind::Varlena { payload, .. } if kind.always_short() => Self {
                 short: payload.residues(),
                 long: 0,
             },

@@ -440,9 +440,9 @@ fn sweep(kinds: &[ColumnKind], orders: Vec<Vec<usize>>, dominating: &mut Vec<(Ve
 /// representatives an earlier, collapsed candidate space held.
 fn keeps_class_order(kinds: &[ColumnKind], order: &[usize]) -> bool {
     let class = |kind: ColumnKind| match kind {
-        ColumnKind::Varlena {
-            align, proven_short, ..
-        } if !proven_short && align != layout::Align::Char => Some(align.bytes()),
+        ColumnKind::Varlena { align, .. } if !kind.always_short() && align != layout::Align::Char => {
+            Some(align.bytes())
+        }
         ColumnKind::Varlena { .. } => Some(0),
         ColumnKind::Fixed { .. } => None,
     };

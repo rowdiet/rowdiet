@@ -1650,15 +1650,15 @@ mod closure_review {
 
     #[test]
     fn a_dominating_pole_is_recommended_when_the_sweep_runs_out_of_budget() {
-        // Four proven-short varchars and a text exhaust the sweep's comparison budget; the
-        // minimax pole (id, note, ...) dominates the written order and used to print as a
-        // workload-dependent frontier. Measured on PostgreSQL 16: 0.000 vs 0.736 B/row mean, no
-        // row worse.
+        // Four varchars too short to compress and a text exhaust the sweep's comparison budget;
+        // the minimax pole (id, note, ...) dominates the written order and used to print as a
+        // workload-dependent frontier. Measured on PostgreSQL 16 for the varchar(8) spelling
+        // the review used: 0.000 vs 0.736 B/row mean, no row worse.
         let a = analyze_sources(
             &[src(
                 "V1__o.sql",
                 "CREATE TABLE orders (id bigint NOT NULL, country varchar(2) NOT NULL, \
-                 currency varchar(3) NOT NULL, status varchar(16) NOT NULL, channel varchar(12) NOT NULL, note text);",
+                 currency varchar(3) NOT NULL, status varchar(5) NOT NULL, channel varchar(4) NOT NULL, note text NOT NULL);",
             )],
             &Config::default(),
         );
@@ -1668,6 +1668,35 @@ mod closure_review {
         assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 3 }));
         assert_eq!(t.suggested_order[..2], ["id".to_string(), "note".to_string()]);
         assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn varchars_that_can_compress_keep_the_aligned_form() {
+        // varchar(10) holds up to 40 bytes, and the toaster compresses an attribute over 24
+        // bytes in line behind an aligned 4-byte header (lz4 has no minimum input). Modeled as
+        // never aligned, the engine recommended (c0, c2, c3, c1) here, which PostgreSQL 16 stores
+        // 1-3 B longer than the written order in 18 of 23 measured rows.
+        let a = analyze_sources(
+            &[src(
+                "V1__w.sql",
+                "CREATE TABLE w66 (c0 timetz, c1 varchar(10) NOT NULL, c2 macaddr NOT NULL, c3 text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0.0, "{:?}", t.suggested_order);
+        assert_ne!(t.dominance_search, DominanceScope::Exhaustive);
+        let small = analyze_sources(
+            &[src(
+                "V1__s.sql",
+                "CREATE TABLE s (a smallint NOT NULL, v varchar(5) NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        assert_eq!(
+            small.tables[0].current.padding_max, 0,
+            "varchar(5) never reaches 21 bytes"
+        );
     }
 
     #[test]

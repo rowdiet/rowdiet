@@ -165,7 +165,7 @@ fn domain_and_range_session_types() {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: true,
-            payload: Payload::ANY,
+            payload: Payload::UNVERIFIED,
         }
     );
     assert_eq!(

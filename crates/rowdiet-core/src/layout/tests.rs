@@ -16,7 +16,10 @@ fn short() -> ColumnKind {
     ColumnKind::Varlena {
         align: Align::Int,
         proven_short: true,
-        payload: Payload::ANY,
+        payload: Payload {
+            compressible: false,
+            ..Payload::ANY
+        },
     }
 }
 
@@ -627,6 +630,7 @@ mod minimality_property {
                     Just(ColumnKind::Fixed { len: 12, align: Align::Double }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: false, payload: Payload::ANY }),
                     Just(ColumnKind::Varlena { align: Align::Double, proven_short: false, payload: Payload::ANY }),
+                    Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload { compressible: false, ..Payload::ANY } }),
                     Just(ColumnKind::Varlena { align: Align::Int, proven_short: true, payload: Payload::ANY }),
                 ],
                 3..=6

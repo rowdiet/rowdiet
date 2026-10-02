@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 598c176a27e1691a966e25b8a039fd359e26739211e97010656ca6bdea34eb44 # shrinks to kinds = [Varlena { align: Int, proven_short: true, payload: Payload { step: 1, verified: true, compressible: true } }, Varlena { align: Int, proven_short: false, payload: Payload { step: 1, verified: true, compressible: true } }], rotation = 8

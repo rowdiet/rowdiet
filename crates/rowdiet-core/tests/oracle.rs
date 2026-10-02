@@ -5,7 +5,8 @@
 //! header, a long payload of 128..=135 bytes aligned behind a 4-byte header, and an 18-byte TOAST
 //! pointer. Short payload lengths follow what PostgreSQL stores for the type (arrays pad their
 //! elements, numeric digits are 2 bytes), stated here from the storage format and not taken from
-//! the engine. The tool is driven through the public API only, and every claim it prints is
+//! the engine. A `varchar(n)` holding more than 20 bytes can be compressed in line, aligned, by a
+//! wide row's toaster; one of at most 20 bytes is always short. The tool is driven through the public API only, and every claim it prints is
 //! judged against the oracle: a finding must dominate with the reported saving range, an
 //! exhaustive clean verdict must have no dominating permutation, and a frontier must never be an
 //! order that dominates.
@@ -38,7 +39,8 @@ fn kind_of(ty: &str) -> Kind {
     };
     match ty {
         "text" | "jsonb" => var(4, ANY),
-        "varchar(8)" => Kind::Var {
+        "varchar(8)" => var(4, ANY),
+        "varchar(5)" => Kind::Var {
             align: 4,
             short_only: true,
             short_residues: ANY,
@@ -65,6 +67,12 @@ enum Value {
     Short(u64),
     Long(u64),
     Toast,
+}
+
+/// Types whose stored lengths do not depend on the database encoding: the tool may claim that
+/// nothing dominates only over these.
+fn verified(ty: &str) -> bool {
+    !ty.starts_with("varchar")
 }
 
 fn values(kind: Kind, band: Option<bool>) -> Vec<Value> {
@@ -261,9 +269,13 @@ fn check(types: &[&str]) -> Result<(), String> {
             t.current.padding_min, t.current.padding_max
         ));
     }
-    if t.dominance_search == DominanceScope::Superset {
+    let all_verified = types.iter().all(|t| verified(t));
+    if (t.dominance_search == DominanceScope::Superset) == all_verified
+        && t.dominance_search != DominanceScope::Budgeted
+    {
         return Err(format!(
-            "{table}: every type here is verified, yet the verdict is superset"
+            "{table}: verdict {:?} while every type verified is {all_verified}",
+            t.dominance_search
         ));
     }
     if t.avoidable_bytes_per_row > 0.0 {
@@ -346,7 +358,16 @@ fn check(types: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-const VARLENAS: [&str; 7] = ["text", "jsonb", "float8[]", "varchar(8)", "numeric", "int4[]", "text[]"];
+const VARLENAS: [&str; 8] = [
+    "text",
+    "jsonb",
+    "float8[]",
+    "varchar(8)",
+    "varchar(5)",
+    "numeric",
+    "int4[]",
+    "text[]",
+];
 const FIXED: [&str; 7] = ["smallint", "integer", "boolean", "bigint", "timetz", "macaddr", "uuid"];
 
 /// Tables of 3 to 5 columns with `varlenas` of them drawn from the varlena pool.
@@ -386,7 +407,8 @@ proptest! {
 #[test]
 fn closure_review_repros_hold_against_the_oracle() {
     for types in [
-        vec!["bigint", "varchar(8)", "varchar(8)", "varchar(8)", "varchar(8)", "text"],
+        vec!["bigint", "varchar(5)", "varchar(5)", "varchar(5)", "varchar(5)", "text"],
+        vec!["timetz", "varchar(8)", "macaddr", "text"],
         vec!["smallint", "float8[]", "float8[]", "macaddr"],
         vec!["text", "macaddr", "text", "macaddr"],
         vec!["text", "bigint", "macaddr"],

@@ -73,8 +73,9 @@ pub enum ColumnKind {
     Varlena {
         /// Alignment of the long form; the short form never aligns.
         align: Align,
-        /// The typmod proves every value fits the 1-byte-header short form (varchar(n)/char(n),
-        /// n ≤ 31): stored unaligned, one byte counted.
+        /// The typmod proves every uncompressed value fits the 1-byte-header short form
+        /// (varchar(n)/char(n), n ≤ 31). Stored unaligned unless the toaster compresses it in
+        /// line, which [`ColumnKind::always_short`] rules out for the smallest typmods.
         proven_short: bool,
         /// What the type's encoding proves about its uncompressed payload lengths.
         #[cfg_attr(feature = "serde", serde(skip))]
@@ -95,6 +96,10 @@ pub struct Payload {
     /// for types nobody checked: the model then lets them store any length, which may be more
     /// than they can, so an absence claim over them is withheld.
     pub verified: bool,
+    /// A value can exceed 20 payload bytes, so a wide row's toaster may compress it in line
+    /// behind an aligned 4-byte header (lz4 has no minimum input; the toaster considers any
+    /// attribute over 24 bytes, toast_helper.c).
+    pub compressible: bool,
 }
 
 impl Payload {
@@ -102,16 +107,19 @@ impl Payload {
     pub const ANY: Self = Self {
         step: 1,
         verified: true,
+        compressible: true,
     };
     /// Any payload length assumed, not verified against the type's encoding.
     pub const UNVERIFIED: Self = Self {
         step: 1,
         verified: false,
+        compressible: true,
     };
     /// numeric: a 2- or 4-byte header plus 2-byte digits, so every length is even.
     pub const EVEN: Self = Self {
         step: 2,
         verified: true,
+        compressible: true,
     };
 
     /// An array's payload: its elements each take a multiple of their stride.
@@ -119,6 +127,7 @@ impl Payload {
         Self {
             step: gcd(stride, MAXALIGN) as u8,
             verified: true,
+            compressible: true,
         }
     }
 
@@ -145,6 +154,11 @@ impl ColumnKind {
         match self {
             Self::Fixed { align, .. } | Self::Varlena { align, .. } => *align,
         }
+    }
+
+    /// A varlena stored unaligned in every form: proven short and too small to compress.
+    pub fn always_short(&self) -> bool {
+        matches!(self, Self::Varlena { proven_short: true, payload, .. } if !payload.compressible)
     }
 
     /// A fixed-width type whose size is not a multiple of its own alignment (timetz, macaddr):
@@ -346,13 +360,9 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
         let pad_before = match kind {
             ColumnKind::Fixed { align, .. } => residues.pad_to(align.bytes()),
             // A short varlena (1-byte header) is stored with no alignment at all (tupmacs.h).
-            ColumnKind::Varlena { proven_short: true, .. } => PadRange::certain(0),
+            ColumnKind::Varlena { .. } if kind.always_short() => PadRange::certain(0),
             // Short/TOAST forms store unaligned (expected pad 0); only the long form sets the max.
-            ColumnKind::Varlena {
-                align,
-                proven_short: false,
-                ..
-            } => PadRange {
+            ColumnKind::Varlena { align, .. } => PadRange {
                 min: 0,
                 max: residues.pad_to(align.bytes()).max,
                 expected_eighths: 0,
@@ -423,7 +433,7 @@ pub fn null_thoff(natts: usize) -> u64 {
 
 /// Suggested column order under the fixed-first heuristic: fixed before varlena; alignment
 /// descending; within a fixed alignment group regular sizes before irregulars; varlenas
-/// alignment-descending with typmod-proven-short ones last; stable by original position. The
+/// alignment-descending with always-short ones last; stable by original position. The
 /// fixed prefix is refined to its exact deterministic minimum within [`refine_fixed_block`]'s
 /// caps. This is one candidate pole; the decision policy in the report layer compares it (and
 /// the [`search`] poles) against the current order by dominance.
@@ -789,7 +799,7 @@ fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
 
 /// Group `order` into its padding-equivalence classes, heuristic order preserved (first
 /// appearance) so the search's tie-breaking keeps the familiar shape. Varlenas that never pad
-/// in any storage form (typmod-proven short, or char-aligned) form one class; the others are
+/// in any storage form (always short, or char-aligned) form one class; the others are
 /// classed by alignment, which decides their worst-case long-form pad.
 fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
     let mut classes: Vec<PaddingClass> = Vec::new();
@@ -799,10 +809,8 @@ fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
                 align: align.bytes(),
                 len_mod: len % MAXALIGN,
             },
-            ColumnKind::Varlena {
-                align, proven_short, ..
-            } => {
-                if proven_short || align == Align::Char {
+            kind @ ColumnKind::Varlena { align, .. } => {
+                if kind.always_short() || align == Align::Char {
                     ClassKey::PadlessVarlena
                 } else {
                     ClassKey::Varlena { align: align.bytes() }
@@ -837,7 +845,7 @@ enum ClassKey {
     Varlena {
         align: u64,
     },
-    /// Proven-short or char-aligned varlena: pads 0 in every storage form.
+    /// Always-short or char-aligned varlena: pads 0 in every storage form.
     PadlessVarlena,
 }
 
@@ -925,16 +933,8 @@ fn sort_key(kind: &ColumnKind, index: usize) -> (u8, u64, bool, usize) {
     let align_desc = |a: Align| MAXALIGN - a.bytes();
     match kind {
         ColumnKind::Fixed { align, .. } => (0, align_desc(*align), kind.irregular(), index),
-        ColumnKind::Varlena {
-            align,
-            proven_short: false,
-            ..
-        } => (1, align_desc(*align), false, index),
-        ColumnKind::Varlena {
-            align,
-            proven_short: true,
-            ..
-        } => (2, align_desc(*align), false, index),
+        ColumnKind::Varlena { align, .. } if kind.always_short() => (2, align_desc(*align), false, index),
+        ColumnKind::Varlena { align, .. } => (1, align_desc(*align), false, index),
     }
 }
 

@@ -75,7 +75,7 @@ fn char_and_varchar_proven_short() {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: true,
-            payload: Payload::ANY
+            payload: Payload::UNVERIFIED
         }
     );
     assert_eq!(
@@ -83,7 +83,7 @@ fn char_and_varchar_proven_short() {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: false,
-            payload: Payload::ANY
+            payload: Payload::UNVERIFIED
         }
     );
     assert_eq!(
@@ -99,7 +99,10 @@ fn char_and_varchar_proven_short() {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: true,
-            payload: Payload::UNVERIFIED
+            payload: Payload {
+                compressible: false,
+                ..Payload::UNVERIFIED
+            }
         }
     );
 }
@@ -418,7 +421,7 @@ fn session_types() {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: true,
-            payload: Payload::ANY
+            payload: Payload::UNVERIFIED
         }
     );
     c.drop_type("status");
