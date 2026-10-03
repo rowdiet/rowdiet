@@ -334,7 +334,7 @@ fn bench_gate(c: &mut Criterion) {
         .tables
         .iter()
         .step_by(2)
-        .map(|t| (t.name.clone(), BaselineEntry::new(t.layout_signature.clone())))
+        .map(|t| (t.name.clone(), BaselineEntry::committing(t)))
         .collect();
     let base = Baseline {
         rowdiet: "bench".into(),
