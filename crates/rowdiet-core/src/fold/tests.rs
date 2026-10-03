@@ -1,6 +1,6 @@
 use super::*;
 use crate::extract;
-use crate::layout::{Align, ColumnKind};
+use crate::layout::{Align, ColumnKind, Payload};
 use std::collections::BTreeMap;
 
 fn origin(line: u32) -> Origin {
@@ -164,14 +164,16 @@ fn domain_and_range_session_types() {
         tables[0].columns[0].kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: true
+            proven_short: true,
+            payload: Payload::UNVERIFIED,
         }
     );
     assert_eq!(
         tables[0].columns[1].kind,
         ColumnKind::Varlena {
             align: Align::Double,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED,
         }
     );
 }

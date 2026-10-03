@@ -4,7 +4,7 @@
 //! extract benches also cover libpg_query when built with `--features pg-exact`.
 
 use criterion::{Criterion, Throughput};
-use rowdiet_core::layout::{Align, ColumnKind};
+use rowdiet_core::layout::{Align, ColumnKind, Payload};
 use rowdiet_core::{
     Baseline, BaselineEntry, Config, SqlSource, analyze_sources, baseline, extract, layout, split, version,
 };
@@ -204,6 +204,7 @@ fn kinds_regular(n: usize) -> Vec<ColumnKind> {
         ColumnKind::Varlena {
             align: Align::Int,
             proven_short: false,
+            payload: Payload::ANY,
         },
     ];
     (0..n).map(|i| cycle[i % cycle.len()]).collect()
@@ -254,6 +255,19 @@ fn bench_layout(c: &mut Criterion) {
         },
         "irregular fixture no longer exercises the refinement search"
     );
+    // The all-fixed fixture cannot see the whole-order search (its states stay singletons and
+    // the varlena class never appears), which is how a prior perf claim went unmeasured. This
+    // fixture has both irregulars and varlenas, so `search` pays its full state space.
+    let mixed_irregular = kinds_mixed_irregular_23();
+    {
+        let s = layout::search(&mixed_irregular);
+        assert_eq!(
+            s.scope,
+            layout::SearchScope::Complete,
+            "mixed-irregular fixture must stay inside the whole-order budget"
+        );
+        assert!(s.certainty_pole.is_some());
+    }
     let mut group = c.benchmark_group("layout");
     group.bench_function("walk_100", |b| b.iter(|| layout::walk(black_box(&regular))));
     group.bench_function("suggested_order_regular_100", |b| {
@@ -262,7 +276,38 @@ fn bench_layout(c: &mut Criterion) {
     group.bench_function("suggested_order_irregular_24", |b| {
         b.iter(|| layout::suggested_order(black_box(&irregular)));
     });
+    group.bench_function("search_mixed_irregular_23", |b| {
+        b.iter(|| layout::search(black_box(&mixed_irregular)));
+    });
     group.finish();
+}
+
+/// 23 columns: 20 fixed across 6 padding classes (timetz and macaddr among them) plus three
+/// varlenas of mixed alignments — the largest such shape inside the whole-order budget, so the
+/// bench pays the search's full state space (an all-fixed fixture walks singleton states only
+/// and cannot see this cost).
+fn kinds_mixed_irregular_23() -> Vec<ColumnKind> {
+    let mut kinds = kinds_irregular_24();
+    kinds.truncate(20);
+    kinds.push(ColumnKind::Varlena {
+        align: Align::Int,
+        proven_short: false,
+        payload: Payload::ANY,
+    });
+    kinds.push(ColumnKind::Varlena {
+        align: Align::Double,
+        proven_short: false,
+        payload: Payload::ANY,
+    });
+    kinds.push(ColumnKind::Varlena {
+        align: Align::Int,
+        proven_short: true,
+        payload: Payload {
+            compressible: false,
+            ..Payload::ANY
+        },
+    });
+    kinds
 }
 
 fn bench_version(c: &mut Criterion) {
@@ -293,7 +338,7 @@ fn bench_gate(c: &mut Criterion) {
             (
                 t.name.clone(),
                 BaselineEntry {
-                    bytes: baseline::ceil_bytes(t.avoidable_bytes_per_row),
+                    bytes: t.avoidable_bytes_per_row,
                     layout: t.layout_signature.clone(),
                 },
             )
@@ -301,11 +346,11 @@ fn bench_gate(c: &mut Criterion) {
         .collect();
     let base = Baseline {
         rowdiet: "bench".into(),
-        fail_over: 0,
+        fail_over: 0.0,
         tables: entries,
     };
     c.bench_function("gate/evaluate_500", |b| {
-        b.iter(|| baseline::evaluate(black_box(&analysis), Some(0), true, Some(&base)));
+        b.iter(|| baseline::evaluate(black_box(&analysis), Some(0.0), true, Some(&base)));
     });
 }
 

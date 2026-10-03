@@ -47,6 +47,33 @@ jobs:
       - name: full verification matrix
         run: ./scripts/ci.sh
 
+  # Every guarantee rowdiet prints rests on measured tuples: check the model's claims against a
+  # real PostgreSQL 16 with pageinspect on every push. The full fixture set runs in about a minute.
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: xtask measure against the service container
+        env:
+          ROWDIET_MEASURE_CONTAINER: ${{ job.services.postgres.id }}
+          ROWDIET_MEASURE_PREFIX: ci_
+          ROWDIET_MEASURE_REQUIRE: "1"
+        run: cargo run -p xtask -- measure
+
   # Proves the declared rust-version: the workspace must check on the floor toolchain.
   msrv:
     runs-on: ubuntu-latest

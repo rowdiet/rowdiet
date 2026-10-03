@@ -13,11 +13,11 @@ WebAssembly, with draggable byte rulers; nothing leaves the page.
 
 ```
 $ rowdiet migrations/ --rows 10000000 --suggest
-■ account (V1__init.sql:1) — 6 columns — estimate — columns placed at data-dependent offsets
-  current  : 14.5 B/row expected padding (13 B deterministic, range 13–16, data-dependent)
-  suggested: 1 B padding/row → 13.5 B/row avoidable
+■ account (V1__init.sql:1) — 6 columns — estimate — gates on deterministic and dominance-proven padding; expected values are display-only (short-form, uniform-offset model)
+  current  : 14.5 B/row expected padding (13 B deterministic, range 13-16, data-dependent)
+  suggested: 0.0 B/row expected padding (0 B deterministic, range 0-1, data-dependent) → 16.0 B/row avoidable (13 B deterministic + 3 B dominance-proven; saves 12-16 B/row in every realization)
   order    : id, balance, flags, kind, active, note
-  × 10000000 rows ≈ 135.0 MB
+  × 10000000 rows ≈ 160.0 MB
   -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):
   CREATE TABLE account (
       id BIGINT NOT NULL,
@@ -51,9 +51,10 @@ column order a **pre-apply, CI-time** concern — exactly where a static linter 
 - **Migration-series aware** — folds `CREATE TABLE` + later `ALTER TABLE ADD COLUMN` (and drops,
   renames, type changes) across files in version order (`V1__`, `V1_2__`, timestamps), so it
   lints the table's *final physical order*, not one statement at a time.
-- **Two-tier reporting** — byte-exact for fixed-width tables, labeled estimates when varlena is
-  involved (see below); it never claims savings that MAXALIGN rounding or varlena
-  data-dependence can take away.
+- **Two-tier reporting** — byte-exact for fixed-width tables; with varlenas involved the gate
+  and the advice use deterministic and dominance-proven padding only (see below), so it never
+  claims savings that MAXALIGN rounding or varlena data-dependence can take away, and it hands
+  you the decision boundary when the winner genuinely depends on your payloads.
 - **Embeddable** — a pure-Rust core crate (`rowdiet-core`, wasm32-clean) with a thin CLI; a
   numeric CI gate (`--fail-over`) no other tool offers.
 - **Loud degradation** — statements the parser can't handle are skipped *visibly*, and tables
@@ -66,7 +67,7 @@ cargo install rowdiet            # or from a checkout: cargo install --path crat
 # builds on Rust 1.88+ (rust-version, verified by CI)
 cargo rowdiet migrations/        # installs a cargo subcommand too (cargo-rowdiet)
 rowdiet migrations/                          # report
-rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row
+rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row (fractions allowed)
 rowdiet migrations/ --fail-over 0 --fail-on-degraded   # also fail when statements were skipped
 rowdiet migrations/ --format github          # GitHub Actions annotations
 rowdiet migrations/ --format json | jq .     # full structured report
@@ -122,7 +123,7 @@ fail-over or gets re-accepted deliberately.
 fn migrations_are_byte_packed() {
     let analysis = rowdiet_core::fs::analyze_dir("migrations", &Default::default()).unwrap();
     assert!(analysis.notes.is_empty(), "statements were skipped: {:#?}", analysis.notes);
-    assert_eq!(analysis.worst_avoidable(), 0, "column order wastes bytes: {analysis:#?}");
+    assert_eq!(analysis.worst_avoidable(), 0.0, "column order wastes bytes: {analysis:#?}");
 }
 ```
 
@@ -157,16 +158,44 @@ rowdiet therefore reports per table:
 - **exact tier** (only fixed-width columns): the headline is the **MAXALIGN-rounded footprint
   delta** and rows-per-8kB-page. A reorder that removes padding but doesn't cross an 8-byte rung
   reports **0 avoidable bytes** by design (raw padding is still shown).
-- **estimate tier** (any varlena): every column after a varlena sits at a data-dependent offset,
-  so its padding is reported as an expected value with a min/max range (offset residues mod 8
-  taken as uniformly likely). Pads placed before the first varlena
-  stay exact. `varchar(n≤31)` is upgraded to *proven short, unaligned* (typmod bounds the
-  payload under the short-varlena limit) — that pins the header form while the payload length
-  still varies, so later columns keep data-dependent offsets.
+- **estimate tier** (any varlena): the gate and the reorder advice rest only on
+  realization-independent facts. A reorder is recommended when it **dominates** the current
+  order (total padding never worse in any storage form or payload length, strictly better in
+  at least one), and the gated number is the deterministic padding it removes plus the
+  dominance-proven worst-case waste, shown with its guaranteed-to-maximum range. When neither
+  order dominates — say a text and a `float8[]` competing for the one guaranteed-aligned slot,
+  where payload sizes decide the winner — the table shows a **frontier** instead: both orders,
+  both worst cases, and the storage-form band each one wins. Frontiers never gate. Expected
+  values and ranges are still shown for orientation: the min/max bounds hold for every storage
+  form; the expectation is a display-only figure under a stated model (varlena pads scored at
+  the short/TOAST form, which stores unaligned; offset residues taken uniform) and decides
+  nothing. `varchar(n≤5)` is *proven short, unaligned*: the typmod bounds the payload at 20
+  bytes, under both the short-varlena limit and the 24-byte size the toaster needs before it
+  compresses anything, so the header form is pinned while the payload length still varies.
+  From `varchar(6)` on, a value can pass 20 bytes in 4-byte UTF-8 and a wide row's toaster can
+  compress it in line behind an aligned 4-byte header, so it is modeled like any other varlena
+  (measured: `varchar(10)` compressed by pglz and `varchar(6)` by lz4 on PostgreSQL 16.15).
 
-The suggested order is: fixed columns before varlena, alignment descending, irregular-size types
-(`timetz`, `macaddr`) at the end of their group, varlenas alignment-descending with proven-short
-ones last. For all-regular schemas this provably yields zero padding under any NULL mask.
+The suggested order starts from: fixed columns before varlena, alignment descending,
+irregular-size types (`timetz`, `macaddr`) at the end of their group, varlenas
+alignment-descending with proven-short ones last. For all-regular schemas this yields zero
+padding in every realization under any NULL mask. When the heuristic still pads, an exact
+search minimizes deterministic padding and the worst-case bound (within budgets it names in
+the output when they bind), and a reorder is recommended only when it dominates the order you
+wrote. Where the sweep completes over types whose stored lengths are verified, the verdict is
+exhaustive: a clean table there provably has no dominating reorder. Measured on 40,733 random
+five-column tables and 6,000 random tables of 6 to 12 columns, the sweep completes for every
+table of up to six columns with at most three varlenas, and for seven-column tables with at most
+two. Budgeted tables, which say "found" and name the budget: 36% of five-column tables with four
+varlenas and all with five, any all-`text` table of five or more columns, 26% of seven-column
+tables with three varlenas, and most tables of eight or more columns of mixed fixed types (49 to
+97% at eight, 94 to 100% from nine), where the candidate space outgrows the sweep. A type whose
+stored lengths depend on the database encoding or were not checked here (`char(n)`, `varchar(n)`
+below 134 characters, `inet`, `tsvector`, ranges, composites) turns a completed sweep into
+"found" as well, and names the types. The search can beat plain fixed-first packing:
+`(text, boolean, bigint)` reorders to `(bigint, text, boolean)`, where the text sits on its
+alignment boundary in every storage form and the boolean never pads, reaching zero padding in
+every realization.
 
 Non-obvious type facts it models: `uuid` is char-aligned (16 B, never pads);
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is

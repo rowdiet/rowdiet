@@ -91,33 +91,139 @@ fn version_order_folds_alters_after_create() {
 }
 
 #[test]
-fn interleaved_varlenas_report_data_dependent_waste() {
-    // The issue-1 repro: same column multiset, opposite orders. Interleaving must surface the
-    // reorder with a fractional expected saving; grouping must pass clean.
-    let out = bin().arg(fixtures("varlena")).output().unwrap();
+fn interleaved_varlenas_report_dominance_avoidable_waste() {
+    // The issue-1 repro: same column multiset, opposite orders. Grouping dominates
+    // interleaving (never worse in any storage-form/payload realization), so the reorder is a
+    // gated finding; the control table passes clean with the expectation as display only.
+    let out = bin()
+        .arg(fixtures("varlena"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("■ interleaved"), "{stdout}");
-    assert!(
-        stdout.contains("current  : 9.5 B/row expected padding (0 B deterministic, range 0–19, data-dependent)"),
-        "{stdout}"
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tables = value["analysis"]["tables"].as_array().unwrap();
+    let interleaved = &tables[0];
+    assert_eq!(interleaved["name"], "interleaved");
+    assert_eq!(interleaved["current"]["padding"], 0);
+    assert_eq!(interleaved["current"]["expected_padding"], 5.0);
+    assert_eq!(interleaved["current"]["padding_min"], 0);
+    assert_eq!(interleaved["current"]["padding_max"], 19);
+    assert_eq!(interleaved["suggested"]["padding_max"], 12);
+    assert_eq!(interleaved["avoidable_bytes_per_row"], 11.0);
+    assert_eq!(interleaved["avoidable_deterministic"], 0);
+    assert_eq!(interleaved["avoidable_dominance"], 11);
+    assert_eq!(interleaved["dominance_saving"]["min"], 0);
+    assert_eq!(interleaved["dominance_saving"]["max"], 11);
+    assert_eq!(interleaved["search_scope"], "complete");
+    let order: Vec<&str> = interleaved["suggested_order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+    // The control table measures flat zero padding on disk; it passes with no finding and no
+    // frontier, and the long-form bound stays visible as the range.
+    let grouped = &tables[1];
+    assert_eq!(grouped["name"], "grouped");
+    assert_eq!(grouped["current"]["expected_padding"], 0.0);
+    assert_eq!(grouped["current"]["padding_max"], 12);
+    assert_eq!(grouped["avoidable_bytes_per_row"], 0.0);
+    assert!(grouped["frontier"].is_null());
+    assert_eq!(
+        grouped["dominance_search"], "budgeted",
+        "five distinct texts are past the sweep budget"
     );
-    assert!(stdout.contains("→ 3.5 B/row avoidable"), "{stdout}");
+    // Columns at data-dependent offsets claim no point placement.
+    assert!(interleaved["columns"][6]["offset"].is_null(), "{interleaved}");
+    assert!(interleaved["columns"][6]["pad_before"].is_null(), "{interleaved}");
+    assert!(value["estimate_assumptions"].as_str().unwrap().contains("display-only"));
+}
+
+#[test]
+fn varlena_text_output_states_the_policy_and_gates_fractionally() {
+    let text = bin().arg(fixtures("varlena")).output().unwrap();
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("■ interleaved"), "{stdout}");
+    assert!(stdout.contains("✓ grouped"), "{stdout}");
     assert!(
         stdout.contains("order    : score, seen, tag, a, b, c, d, e"),
         "{stdout}"
     );
-    assert!(stdout.contains("✓ grouped"), "{stdout}");
+    assert!(stdout.contains("dominance-proven"), "{stdout}");
     assert!(
-        stdout.contains("6.0 B/row expected padding (0 B deterministic, range 0–12, data-dependent)"),
+        stdout.contains("no dominating reorder found (dominance search budgeted)"),
         "{stdout}"
+    );
+    assert!(
+        stdout.contains("display-only"),
+        "the policy must be stated where the numbers are shown: {stdout}"
     );
     let gated = bin()
         .arg(fixtures("varlena"))
         .args(["--fail-over", "0"])
         .output()
         .unwrap();
-    assert_eq!(gated.status.code(), Some(1), "3.5 B/row expected must trip a zero gate");
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "11 B/row dominance-proven must trip a zero gate"
+    );
+    let fractional = bin()
+        .arg(fixtures("varlena"))
+        .args(["--fail-over", "10.5"])
+        .output()
+        .unwrap();
+    assert_eq!(fractional.status.code(), Some(1), "fail-over accepts fractions");
+}
+
+#[test]
+fn frontier_is_reported_and_never_gated() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-frontier-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__band.sql"),
+        "CREATE TABLE band_b (k int8 NOT NULL, txt text NOT NULL, arr float8[] NOT NULL);",
+    )
+    .unwrap();
+    let gated = bin().arg(&dir).args(["--fail-over", "0"]).output().unwrap();
+    assert_eq!(gated.status.code(), Some(0), "frontier findings never gate");
+    let stdout = String::from_utf8_lossy(&gated.stdout);
+    assert!(
+        stdout.contains("no dominating reorder exists"),
+        "a completed sweep may state nonexistence: {stdout}"
+    );
+    assert!(stdout.contains("frontier :"), "{stdout}");
+    assert!(stdout.contains("workload-dependent, not gated"), "{stdout}");
+    assert!(stdout.contains("wins when"), "{stdout}");
+    let json_out = bin().arg(&dir).args(["--format", "json"]).output().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    let frontier = &value["analysis"]["tables"][0]["frontier"];
+    assert!(frontier["decided"].as_bool().unwrap(), "{frontier}");
+    assert!(!frontier["bands"].as_array().unwrap().is_empty(), "{frontier}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn non_finite_fail_over_is_rejected() {
+    // f64::from_str accepts nan and inf, and `avoidable > nan` is always false: without a
+    // validator these silently disable the gate (exit 0 with no message).
+    for bad in ["nan", "inf", "1e400", "-1"] {
+        let out = bin()
+            .arg(fixtures("wasteful"))
+            .args(["--fail-over", bad])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--fail-over {bad} must be rejected");
+    }
+    let ok = bin()
+        .arg(fixtures("wasteful"))
+        .args(["--fail-over", "0.5"])
+        .output()
+        .unwrap();
+    assert_eq!(ok.status.code(), Some(1), "a fractional threshold still gates");
 }
 
 #[test]
@@ -140,6 +246,8 @@ fn cargo_subcommand_shim() {
     assert_eq!(gated.status.code(), Some(1));
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn pg_exact_parser_matches_default() {
     let default_run = bin()
@@ -272,6 +380,8 @@ fn github_step_summary_file_is_appended() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn baseline_is_portable_across_parser_backends() {
     // Reports key on the fold key, not the backend-dependent display spelling, so a baseline
@@ -363,4 +473,93 @@ fn explicit_file_arguments_keep_the_given_order() {
     assert!(!ordered_stdout.contains("unknown_table"), "{ordered_stdout}");
     assert!(ordered_stdout.contains("\"natts\": 2"), "{ordered_stdout}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lines the GitHub runner would execute: a `::` command after leading whitespace, or `##[` anywhere.
+fn workflow_commands(output: &str) -> Vec<String> {
+    output
+        .split(['\n', '\r'])
+        .filter(|line| line.trim_start().starts_with("::") || line.contains("##["))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn quoted_identifiers_cannot_inject_workflow_commands_in_text_output() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--suggest", "--fail-over", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(workflow_commands(&stdout), Vec::<String>::new(), "{stdout}");
+    for shape in ["::error", "::stop-commands::", "::add-mask::"] {
+        assert!(
+            stdout.contains(&format!(r"\n{shape}")),
+            "{shape} not shown escaped:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn github_format_keeps_its_escaping_for_hostile_identifiers() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--format", "github"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains('\r'), "{stdout}");
+    for line in stdout.lines() {
+        assert!(
+            ["::warning ", "::error ", "::notice "]
+                .iter()
+                .any(|level| line.starts_with(level)),
+            "a line is not a rowdiet annotation: {line}\n{stdout}"
+        );
+    }
+    assert!(stdout.contains("c%0A::stop-commands::tok2"), "{stdout}");
+    assert!(stdout.contains("\"evil%0A::error::TYPE-NOTE\""), "{stdout}");
+}
+
+#[test]
+fn json_output_round_trips_hostile_identifiers() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        workflow_commands(&String::from_utf8_lossy(&out.stdout)),
+        Vec::<String>::new()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&str> = value["analysis"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"evil\r\n::add-mask::secret"), "{names:?}");
+    assert!(names.contains(&"bracket ##[error]INJECTED-V1"), "{names:?}");
+}
+
+#[test]
+fn frontier_band_and_unverified_type_names_print_escaped() {
+    let out = bin().arg(fixtures("injection/V3__frontier.sql")).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(workflow_commands(&stdout), Vec::<String>::new(), "{stdout}");
+    assert!(
+        stdout.contains(r"frontier : t1\n::error::FRONTIER, v##\u{5b}error]BAND, t2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r"when v##\u{5b}error]BAND stores long form"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"payload lengths unverified for "evil\n::error::UNVERIFIED-TYPE""#),
+        "{stdout}"
+    );
 }

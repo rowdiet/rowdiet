@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rowdiet-core", "crates/rowdiet", "crates/rowdiet-wasm"]
+members = ["crates/rowdiet-core", "crates/rowdiet", "crates/rowdiet-wasm", "xtask"]
 
 [workspace.package]
 version = "0.1.4"

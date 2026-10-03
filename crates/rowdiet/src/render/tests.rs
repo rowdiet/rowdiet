@@ -18,14 +18,14 @@ fn sample() -> Analysis {
     )
 }
 
-fn gate(analysis: &Analysis, fail_over: Option<u64>) -> GateOutcome {
+fn gate(analysis: &Analysis, fail_over: Option<f64>) -> GateOutcome {
     baseline::evaluate(analysis, fail_over, false, None)
 }
 
-fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome {
+fn baselined(analysis: &Analysis, entries: &[(&str, f64, &str)]) -> GateOutcome {
     let base = Baseline {
         rowdiet: "test".into(),
-        fail_over: 0,
+        fail_over: 0.0,
         tables: entries
             .iter()
             .map(|(name, bytes, layout)| {
@@ -45,7 +45,7 @@ fn baselined(analysis: &Analysis, entries: &[(&str, u64, &str)]) -> GateOutcome 
 #[test]
 fn text_report_mentions_the_essentials() {
     let analysis = sample();
-    let rendered = text(&analysis, Some(1_000_000), true, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, Some(1_000_000), true, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("account"));
     assert!(rendered.contains("V1__init.sql:1"));
     assert!(rendered.contains("B/row avoidable"));
@@ -58,7 +58,7 @@ fn text_report_mentions_the_essentials() {
 #[test]
 fn optimal_table_is_a_checkmark_line() {
     let analysis = analyze("CREATE TABLE ok (id bigint NOT NULL, n integer NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("✓ ok"));
     assert!(rendered.contains("optimal: zero padding"));
     assert!(!rendered.contains("FAIL:"));
@@ -67,7 +67,7 @@ fn optimal_table_is_a_checkmark_line() {
 #[test]
 fn empty_modeled_tables_are_not_called_optimal() {
     let analysis = analyze("CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0)));
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("◌ c"), "{rendered}");
     assert!(rendered.contains("not analyzable"), "{rendered}");
     assert!(!rendered.contains("✓ c"), "{rendered}");
@@ -88,16 +88,21 @@ fn partition_children_with_known_parent_render_real_analysis() {
 fn baseline_verdicts_in_text_output() {
     let analysis = sample();
     let sig = &analysis.tables[0].layout_signature;
-    let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4, sig)]));
+    let regressed = text(&analysis, None, false, &baselined(&analysis, &[("account", 4.0, sig)]));
     assert!(
         regressed.contains("✗ regression: 8.0 B/row exceeds the baselined allowance of 4"),
         "{regressed}"
     );
     assert!(regressed.contains("FAIL: 1 regression(s) vs baseline"), "{regressed}");
-    let modified = text(&analysis, None, false, &baselined(&analysis, &[("account", 8, "f16c")]));
+    let modified = text(
+        &analysis,
+        None,
+        false,
+        &baselined(&analysis, &[("account", 8.0, "f16c")]),
+    );
     assert!(modified.contains("✗ modified since baseline"), "{modified}");
     assert!(modified.contains("--accept account"), "{modified}");
-    let ratchet = text(&analysis, None, false, &baselined(&analysis, &[("account", 12, sig)]));
+    let ratchet = text(&analysis, None, false, &baselined(&analysis, &[("account", 12.0, sig)]));
     assert!(
         ratchet.contains("↓ ratchet: allowance 12 can tighten to 8"),
         "{ratchet}"
@@ -107,7 +112,7 @@ fn baseline_verdicts_in_text_output() {
         &analysis,
         None,
         false,
-        &baselined(&analysis, &[("account", 8, sig), ("ghost", 1, "vi")]),
+        &baselined(&analysis, &[("account", 8.0, sig), ("ghost", 1.0, "vi")]),
     );
     assert!(
         orphanish.contains("orphaned entries (no matching table): ghost"),
@@ -122,7 +127,7 @@ fn grown_since_baseline_in_text_output() {
          ALTER TABLE t ADD COLUMN e boolean NOT NULL;
          ALTER TABLE t ADD COLUMN f bigint NOT NULL;",
     );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", 0, "f4i,f8d")]));
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", 0.0, "f4i,f8d")]));
     assert!(rendered.contains("✗ grown since baseline"), "{rendered}");
     assert!(
         rendered.contains("grown since baseline") && rendered.contains("FAIL:"),
@@ -133,12 +138,12 @@ fn grown_since_baseline_in_text_output() {
 #[test]
 fn github_annotations() {
     let analysis = sample();
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert!(rendered.starts_with("::error file=V1__init.sql,line=1,title=rowdiet::table account"));
     let warn = github(&analysis, &gate(&analysis, None));
     assert!(warn.starts_with("::warning "));
     let sig = &analysis.tables[0].layout_signature;
-    let regressed = github(&analysis, &baselined(&analysis, &[("account", 4, sig)]));
+    let regressed = github(&analysis, &baselined(&analysis, &[("account", 4.0, sig)]));
     assert!(
         regressed.starts_with("::error file=V1__init.sql,line=1,title=rowdiet regression::"),
         "{regressed}"
@@ -148,7 +153,7 @@ fn github_annotations() {
 #[test]
 fn json_shape() {
     let analysis = sample();
-    let rendered = json(&analysis, Some(0), &gate(&analysis, Some(0))).unwrap();
+    let rendered = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["gate_exceeded"], true);
     assert_eq!(value["gate"]["exceeded"], true);
@@ -171,7 +176,9 @@ fn human_units() {
 fn quoting_only_when_needed() {
     assert_eq!(maybe_quote("plain_name2"), "plain_name2");
     assert_eq!(maybe_quote("Mixed"), "\"Mixed\"");
-    assert_eq!(maybe_quote("select"), "select");
+    assert_eq!(maybe_quote("select"), "\"select\"");
+    assert_eq!(maybe_quote("user"), "\"user\"");
+    assert_eq!(maybe_quote("name"), "name");
     assert_eq!(maybe_quote("1st"), "\"1st\"");
 }
 
@@ -185,7 +192,7 @@ fn github_escapes_properties_and_messages() {
         }],
         &Config::default(),
     );
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("file=V1__a%2Cb%3Ac.sql"), "{rendered}");
     assert!(rendered.contains("we%25ird"), "{rendered}");
     assert!(!rendered.contains("we%ird "), "{rendered}");
@@ -199,7 +206,7 @@ fn github_budget_truncates_loudly() {
         })
         .collect();
     let analysis = analyze(&sql);
-    let rendered = github(&analysis, &gate(&analysis, Some(0)));
+    let rendered = github(&analysis, &gate(&analysis, Some(0.0)));
     assert_eq!(rendered.matches("::error ").count(), 10, "{rendered}");
     assert!(rendered.contains("3 annotation(s) suppressed"), "{rendered}");
     let under = github(&analysis, &gate(&analysis, None));
@@ -215,10 +222,10 @@ fn github_step_summary_carries_the_full_report() {
         })
         .collect();
     let analysis = analyze(&sql);
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0)));
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
     for i in 0..13 {
         assert!(
-            summary.contains(&format!("| t{i:02} | 8.0 | exact | **new violation** |")),
+            summary.contains(&format!("| t{i:02} | 8.0 | - | complete | exact | **new violation** |")),
             "{summary}"
         );
     }
@@ -228,10 +235,190 @@ fn github_step_summary_carries_the_full_report() {
     );
     let baselined_summary = github_step_summary(
         &analysis,
-        &baselined(&analysis, &[("t00", 4, &analysis.tables[0].layout_signature)]),
+        &baselined(&analysis, &[("t00", 4.0, &analysis.tables[0].layout_signature)]),
     );
     assert!(
         baselined_summary.contains("**regression** (allowed 4)"),
         "{baselined_summary}"
+    );
+}
+
+#[test]
+fn an_unverified_payload_model_reads_as_found_everywhere() {
+    let analysis = analyze("CREATE TABLE i (a inet NOT NULL, b smallint NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("no dominating reorder found (payload lengths unverified for inet)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("exists"), "{rendered}");
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    assert!(summary.contains("complete (payload model unverified)"), "{summary}");
+    let json = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["analysis"]["tables"][0]["dominance_search"], "superset");
+    assert_eq!(value["analysis"]["tables"][0]["superset_types"][0], "inet");
+}
+
+fn command_lines(rendered: &str) -> Vec<&str> {
+    rendered
+        .split(['\n', '\r'])
+        .filter(|line| line.trim_start().starts_with("::") || line.contains("##["))
+        .collect()
+}
+
+#[test]
+fn text_identifiers_cannot_open_workflow_commands() {
+    let analysis = analyze(concat!(
+        "CREATE TABLE \"evil\n::error file=README.md,line=1::X\" (a boolean NOT NULL, ",
+        "\"c\n::stop-commands::tok\" bigint NOT NULL, \"x\r\n::add-mask::secret\" boolean NOT NULL, ",
+        "\"y ##[error]v1\" bigint NOT NULL);\n",
+        "CREATE TABLE n (a \"t\n::error::TYPE\" NOT NULL);\n",
+        "ALTER TABLE \"ghost\r::warning::G\" ADD COLUMN z int;",
+    ));
+    let rendered = text(&analysis, None, true, &gate(&analysis, Some(0.0)));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(!rendered.contains('\r'), "{rendered}");
+    assert!(
+        rendered.contains(r#"■ "evil\n::error file=README.md,line=1::X" (V1__init.sql:1)"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r"c\n::stop-commands::tok, "), "{rendered}");
+    assert!(
+        rendered.contains(r#"U&"x\000D\000A::add-mask::secret" BOOLEAN"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r#"U&"y ##\005Berror]v1" BIGINT"#), "{rendered}");
+    assert!(
+        rendered.contains(r#"type "t\n::error::TYPE" unresolvable"#),
+        "{rendered}"
+    );
+    assert!(rendered.contains(r#"ALTER TABLE "ghost\r::warning::G""#), "{rendered}");
+}
+
+#[test]
+fn a_source_path_cannot_open_a_note_line_as_a_command() {
+    let analysis = analyze_sources(
+        &[SqlSource {
+            name: " ::error::x.sql".into(),
+            sql: "CREATE TABLE t (a mystery NOT NULL);".into(),
+        }],
+        &Config::default(),
+    );
+    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(
+        rendered.contains(r"   \u{3a}:error::x.sql:1 [unknown-type]"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn escaping_leaves_ordinary_names_alone() {
+    assert!(matches!(
+        escape_text("Mixed Case ünïcode #[x] ## [y]"),
+        Cow::Borrowed(_)
+    ));
+    assert_eq!(
+        escape_text("a\tb\u{1b}[31m\u{85}\u{2028}"),
+        r"a\tb\u{1b}[31m\u{85}\u{2028}"
+    );
+    assert_eq!(escape_text("###[x]"), r"###\u{5b}x]");
+    assert_eq!(maybe_quote("we\"ird"), "\"we\"\"ird\"");
+    assert_eq!(maybe_quote("a\\b\nc\""), r#"U&"a\\b\000Ac""""#);
+}
+
+#[test]
+fn step_summary_cells_hold_one_line() {
+    let analysis =
+        analyze("CREATE TABLE \"a\r|b\" (x int NOT NULL, y bigint NOT NULL, z int NOT NULL, w bigint NOT NULL);");
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    assert!(!summary.contains('\r'), "{summary}");
+    assert!(summary.contains(r#"| "a \|b" | 8.0 |"#), "{summary}");
+}
+
+#[test]
+fn json_keeps_names_exact_without_the_bracket_prefix() {
+    let analysis = analyze("CREATE TABLE \"t ##[error]x\n\" (a boolean NOT NULL, b bigint NOT NULL);");
+    let rendered = json(&analysis, None, &gate(&analysis, None)).unwrap();
+    assert!(!rendered.contains("##["), "{rendered}");
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(value["analysis"]["tables"][0]["name"], "t ##[error]x\n");
+}
+
+#[test]
+fn suggested_ddl_keeps_hostile_table_and_type_names() {
+    let analysis = analyze(concat!(
+        "CREATE DOMAIN \"dom\n::error::D\" AS bigint;\n",
+        "CREATE TABLE \"t\n::error::T\" (a boolean NOT NULL, b \"dom\n::error::D\" NOT NULL, ",
+        "c boolean NOT NULL, d bigint NOT NULL);",
+    ));
+    let rendered = text(&analysis, None, true, &gate(&analysis, None));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(
+        rendered.contains(r#"  CREATE TABLE U&"t\000A::error::T" ("#),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"      b U&"dom\000A::error::D" NOT NULL,"#),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_backslash_prints_doubled_so_it_never_reads_as_an_escape() {
+    let analysis = analyze("CREATE TABLE \"lit\\n\" (a int NOT NULL); CREATE TABLE \"real\n\" (a int NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    assert!(rendered.contains(r#"✓ "lit\\n" "#), "{rendered}");
+    assert!(rendered.contains(r#"✓ "real\n" "#), "{rendered}");
+}
+
+#[test]
+fn sql_spelling_quotes_only_what_needs_it() {
+    assert_eq!(sql_spelling(r#"public."A""b""#).as_deref(), Some(r#"public."A""b""#));
+    assert_eq!(sql_spelling("\"a\nb\"[]").as_deref(), Some(r#"U&"a\000Ab"[]"#));
+    assert_eq!(sql_spelling("\"x##[y\"").as_deref(), Some(r#"U&"x##\005By""#));
+    assert_eq!(sql_spelling("bare\u{2028}name"), None);
+    assert_eq!(sql_spelling("\"open"), None);
+}
+
+#[test]
+fn a_capped_search_never_prints_a_checkmark_over_certain_padding() {
+    let mut analysis = analyze("CREATE TABLE f (a boolean NOT NULL, b bigint NOT NULL);");
+    let t = &mut analysis.tables[0];
+    assert_eq!(t.current.padding, 7);
+    t.avoidable_bytes_per_row = 0.0;
+    t.search_scope = SearchScope::SortOnly;
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.starts_with("◐ f "), "{rendered}");
+    assert!(!rendered.contains("nothing to gain"), "{rendered}");
+    assert!(
+        rendered.contains("7 B padding; no order the capped search tried saves a footprint rung (search capped: heuristic orders only)"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn step_summary_cells_render_no_html_or_markdown_from_names() {
+    let sql = [
+        include_str!("../../tests/fixtures/markdown/V1__md.sql"),
+        include_str!("../../tests/fixtures/markdown/V2__img.sql"),
+        "CREATE TABLE d (a int, \"<img src=https://example.invalid/d.png>\" text);\n\
+         ALTER TABLE d DROP COLUMN \"<img src=https://example.invalid/d.png>\";",
+    ]
+    .concat();
+    let analysis = analyze(&sql);
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let unescaped = summary.replace("\\<", "");
+    for raw in ["<img", "<a ", "<b>", "```sql", "**rowdiet"] {
+        assert!(!unescaped.contains(raw), "{raw} reached the summary:\n{summary}");
+    }
+    assert!(
+        summary.contains(r"frontier: \<img src=https://example.invalid/a.png\>"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(r"column \<img src=https://example.invalid/d.png\> dropped"),
+        "{summary}"
     );
 }

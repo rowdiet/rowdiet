@@ -252,9 +252,16 @@ fn map_rename(rs: &pb::RenameStmt) -> Vec<DdlOp> {
             }]
         }
         (pb::ObjectType::ObjectTable, Some(table)) => {
+            // PostgreSQL keeps a renamed table in its schema: the new name is always bare.
+            let schema = rs.relation.as_ref().map_or("", |rv| rv.schemaname.as_str());
+            let qualified = if schema.is_empty() {
+                rs.newname.clone()
+            } else {
+                format!("{schema}.{}", rs.newname)
+            };
             let new = RawName {
-                display: rs.newname.clone(),
-                key: rs.newname.clone(),
+                display: qualified.clone(),
+                key: qualified,
             };
             vec![DdlOp::RenameTable { table, new }]
         }

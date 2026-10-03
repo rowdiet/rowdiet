@@ -283,9 +283,24 @@ fn map_column(cd: &sq::ColumnDef) -> RawColumn {
 
 fn map_alter_table(at: sq::AlterTable) -> Vec<DdlOp> {
     let table = table_name(&at.name);
+    let schema = &at.name.0[..at.name.0.len().saturating_sub(1)];
     at.operations
         .into_iter()
         .flat_map(|op| map_alter_op(&table, op))
+        .map(|op| match op {
+            // PostgreSQL keeps a renamed table in its schema: the new name is always bare.
+            DdlOp::RenameTable { table, new } if !schema.is_empty() => {
+                let schema = table_name(&sq::ObjectName(schema.to_vec()));
+                DdlOp::RenameTable {
+                    table,
+                    new: RawName {
+                        display: format!("{}.{}", schema.display, new.display),
+                        key: format!("{}.{}", schema.key, new.key),
+                    },
+                }
+            }
+            op => op,
+        })
         .collect()
 }
 

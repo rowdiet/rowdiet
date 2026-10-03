@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+description = "Repository tasks; `cargo run -p xtask -- measure` checks model claims against a live PostgreSQL"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

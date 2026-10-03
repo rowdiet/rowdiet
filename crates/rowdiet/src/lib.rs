@@ -25,9 +25,9 @@ struct Cli {
     paths: Vec<String>,
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
-    /// Exit 1 if any table's avoidable bytes/row exceed this threshold
-    #[arg(long, value_name = "BYTES")]
-    fail_over: Option<u64>,
+    /// Exit 1 if any table's avoidable bytes/row exceed this threshold (fractions allowed)
+    #[arg(long, value_name = "BYTES", value_parser = parse_fail_over)]
+    fail_over: Option<f64>,
     /// Print a reordered CREATE TABLE for each table with avoidable waste
     #[arg(long)]
     suggest: bool,
@@ -52,6 +52,17 @@ struct Cli {
     /// Also exit 1 when statements were skipped or tables are incomplete (degraded analysis)
     #[arg(long)]
     fail_on_degraded: bool,
+}
+
+/// A permissive f64 parser would accept `nan` and `inf`, both of which make every `avoidable >
+/// limit` comparison false and silently disable the gate — a templating bug that resolves an
+/// empty CI variable to `nan` must fail loudly instead.
+fn parse_fail_over(raw: &str) -> Result<f64, String> {
+    let value: f64 = raw.parse().map_err(|_| format!("`{raw}` is not a number of bytes"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("`{raw}` is not a finite, non-negative number of bytes"));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -85,7 +96,7 @@ pub fn cli_main(args: impl IntoIterator<Item = String>) -> ExitCode {
     match run(&cli) {
         Ok(code) => code,
         Err(message) => {
-            eprintln!("rowdiet: {message}");
+            eprintln!("rowdiet: {}", render::escape_text(&message));
             ExitCode::from(2)
         }
     }
@@ -185,7 +196,21 @@ fn maintain_baseline(cli: &Cli, path: &Path, analysis: &Analysis) -> Result<Exit
 
 fn load_baseline(path: &Path) -> Result<Baseline, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: bad baseline JSON: {e}", path.display()))
+    let baseline: Baseline =
+        serde_json::from_str(&text).map_err(|e| format!("{}: bad baseline JSON: {e}", path.display()))?;
+    // A hand-edited nan/inf allowance would silently disable the gate for its table.
+    if !baseline.fail_over.is_finite() || baseline.fail_over < 0.0 {
+        return Err(format!("{}: fail_over must be finite and non-negative", path.display()));
+    }
+    for (name, entry) in &baseline.tables {
+        if !entry.bytes.is_finite() || entry.bytes < 0.0 {
+            return Err(format!(
+                "{}: entry `{name}` must have a finite, non-negative allowance",
+                path.display()
+            ));
+        }
+    }
+    Ok(baseline)
 }
 
 fn write_baseline(path: &Path, baseline: &Baseline) -> Result<(), String> {

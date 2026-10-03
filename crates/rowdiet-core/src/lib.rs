@@ -22,6 +22,7 @@
 
 pub mod baseline;
 pub mod catalog;
+pub mod dominance;
 pub mod extract;
 #[cfg(feature = "pg-exact")]
 pub mod extract_pgq;

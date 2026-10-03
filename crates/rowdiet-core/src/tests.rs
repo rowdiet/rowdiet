@@ -1,3 +1,4 @@
+use crate::report::SavingRange;
 use crate::*;
 
 fn src(name: &str, sql: &str) -> SqlSource {
@@ -33,12 +34,18 @@ fn end_to_end_migration_series() {
     // full residue set on top of the 7 certain bytes.
     assert_eq!(t.current.expected_padding, 10.5);
     assert_eq!((t.current.padding_min, t.current.padding_max), (7, 14));
-    assert_eq!(t.suggested.padding, 3);
-    assert_eq!(t.suggested.expected_padding, 4.5);
-    assert_eq!(t.avoidable_bytes_per_row, 6.0);
+    // The suggestion hands note the aligned slot at offset 20 (pads zero in every storage
+    // form) and parks the boolean behind it: only meta's long-form pad can remain.
+    assert_eq!(t.suggested.padding, 0);
+    assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 3));
+    // Dominance-proven: 7 B of certain padding removed, saving 4-14 B/row in every realization.
+    assert_eq!(t.avoidable_bytes_per_row, 14.0);
+    assert_eq!(t.avoidable_deterministic, 7);
+    assert_eq!(t.avoidable_dominance, 7);
+    assert_eq!(t.dominance_saving, Some(SavingRange { min: 4, max: 14 }));
     assert_eq!(
         t.suggested_order,
-        vec!["id", "created_at", "status", "flag", "note", "meta"]
+        vec!["id", "created_at", "status", "note", "flag", "meta"]
     );
     assert_eq!(t.altered_in.len(), 1);
     assert!(t.any_nullable);
@@ -911,11 +918,11 @@ mod audit_fixes_gate {
     fn degradation_is_surfaced_and_optionally_gating() {
         let sql = "CREATE TABLE ok (a bigint NOT NULL);\nALTER TABLE ok ADD COLUMN x @@@ bad;";
         let analysis = analyze_sources(&[src("V1__b.sql", sql)], &Config::default());
-        let lenient = baseline::evaluate(&analysis, Some(0), false, None);
+        let lenient = baseline::evaluate(&analysis, Some(0.0), false, None);
         assert!(lenient.skipped_statements > 0);
         assert!(lenient.incomplete_tables > 0);
         assert!(!lenient.exceeded, "{lenient:#?}");
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert!(strict.exceeded);
     }
 }
@@ -980,7 +987,7 @@ mod postaudit_pins {
             &[src("V1__c.sql", "CREATE TABLE ok (a bigint NOT NULL);")],
             &Config::default(),
         );
-        let strict = baseline::evaluate(&analysis, Some(0), true, None);
+        let strict = baseline::evaluate(&analysis, Some(0.0), true, None);
         assert_eq!(strict.skipped_statements, 0);
         assert_eq!(strict.incomplete_tables, 0);
         assert!(!strict.exceeded, "{strict:#?}");
@@ -992,7 +999,7 @@ mod postaudit_pins {
         let analysis = analyze_sources(&[src("V1__m.sql", sql)], &Config::default());
         let mut base = baseline::Baseline {
             rowdiet: "test".into(),
-            fail_over: 0,
+            fail_over: 0.0,
             tables: std::collections::BTreeMap::new(),
         };
         baseline::accept_tables(&mut base, &analysis, &["MyTable".into()]).unwrap();
@@ -1007,6 +1014,29 @@ mod postaudit_pins {
         let analysis = analyze_sources(&[src("V1__a.sql", sql)], &Config::default());
         assert_eq!(analysis.tables.len(), 1);
         assert!(analysis.notes.is_empty(), "{:?}", analysis.notes);
+    }
+
+    #[test]
+    fn a_schema_qualified_rename_stays_in_its_schema() {
+        // ALTER TABLE s.t RENAME TO n leaves the table in s; keying it as bare n made a later
+        // CREATE TABLE n redefine it and dropped every later ALTER of s.n.
+        let sql = "CREATE TABLE rs.old (m macaddr, t text NOT NULL, s smallint NOT NULL);
+            ALTER TABLE rs.old RENAME TO new;
+            CREATE TABLE new (id bigint NOT NULL, flag boolean NOT NULL);
+            ALTER TABLE rs.new ADD COLUMN extra int4;
+            CREATE TABLE \"Q.x\".\"Old\" (a int NOT NULL);
+            ALTER TABLE \"Q.x\".\"Old\" RENAME TO \"New\";
+            ALTER TABLE \"Q.x\".\"New\" ADD COLUMN b int;";
+        #[cfg_attr(not(feature = "pg-exact"), allow(unused_mut))]
+        let mut backends = vec![crate::ParserBackend::Sqlparser];
+        #[cfg(feature = "pg-exact")]
+        backends.push(crate::ParserBackend::PgExact);
+        for backend in backends {
+            let analysis = crate::analyze_sources_with(backend, &[src("V1__r.sql", sql)], &Config::default());
+            let tables: Vec<(&str, usize)> = analysis.tables.iter().map(|t| (t.name.as_str(), t.natts)).collect();
+            assert_eq!(tables, [("rs.new", 4), ("new", 2), ("Q.x.New", 2)], "{backend:?}");
+            assert!(analysis.notes.is_empty(), "{backend:?}: {:?}", analysis.notes);
+        }
     }
 
     #[test]
@@ -1176,11 +1206,11 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert_eq!(c.tier, layout::Tier::Unknown);
     assert_eq!(c.current.footprint, None);
     assert_eq!(c.avoidable_bytes_per_row, 0.0);
-    let outcome = baseline::evaluate(&a, Some(0), false, None);
+    let outcome = baseline::evaluate(&a, Some(0.0), false, None);
     assert_eq!(outcome.verdicts["c"], baseline::TableVerdict::Incomplete);
     assert!(!outcome.exceeded, "incomplete alone does not fail the gate");
     assert!(
-        baseline::evaluate(&a, Some(0), true, None).exceeded,
+        baseline::evaluate(&a, Some(0.0), true, None).exceeded,
         "but --fail-on-degraded escalates it"
     );
     // INHERITS of an unknown parent is the same class — the unknown/incomplete path must be
@@ -1192,13 +1222,675 @@ fn incomplete_table_reports_unknown_not_a_false_pass() {
     assert!(inh.tables[0].incomplete);
     assert_eq!(inh.tables[0].tier, layout::Tier::Unknown);
     assert_eq!(
-        baseline::evaluate(&inh, Some(0), false, None).verdicts["k"],
+        baseline::evaluate(&inh, Some(0.0), false, None).verdicts["k"],
         baseline::TableVerdict::Incomplete
     );
     // A genuinely empty but complete table stays exact — the fix keys on incompleteness, not natts.
     let empty = analyze_sources(&[src("V2.sql", "CREATE TABLE e ();")], &Config::default());
     assert!(!empty.tables[0].incomplete);
     assert_eq!(empty.tables[0].tier, layout::Tier::Exact);
+}
+
+/// The decision-policy cases, each verified against pageinspect on PostgreSQL 16 (the
+/// measured numbers live in the xtask measure fixtures): the gate and the recommendation rest
+/// on deterministic pads and dominance only, and workload-dependent pairs surface as a
+/// frontier instead of a finding in either direction.
+mod decision_policy {
+    use super::src;
+    use crate::layout::SearchScope;
+    use crate::report::{BandWinner, SavingRange};
+    use crate::{Config, analyze_sources};
+
+    #[test]
+    fn short_form_varlena_alignment_is_not_charged() {
+        // (int2, text) measures flat 0 padding on disk; the long-form pin used to print a
+        // certain 2 B/row here through the unhedged branch. The swap trades bands, so it is
+        // frontier material and never a finding.
+        let a = analyze_sources(
+            &[src("V1__t.sql", "CREATE TABLE t (n int2 NOT NULL, t text NOT NULL);")],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 0);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 2));
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.columns[1].pad_before, None, "the pad depends on the storage form");
+        assert_eq!(t.columns[1].offset, None);
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["t", "n"]);
+        assert_eq!((frontier.alternative_worst, frontier.current_worst), (1, 2));
+    }
+
+    #[test]
+    fn stranded_fixed_column_is_a_dominance_finding() {
+        // (text, int4) is dominated by (int4, text): the swap is never worse in any storage
+        // form or payload length and saves up to 3 B/row. This is the rung-1 gate case.
+        let a = analyze_sources(
+            &[src("V1__t.sql", "CREATE TABLE t (t text NOT NULL, n int4 NOT NULL);")],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 3.0);
+        assert_eq!(t.avoidable_deterministic, 0);
+        assert_eq!(t.avoidable_dominance, 3);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 3 }));
+        assert_eq!(t.suggested_order, vec!["n", "t"]);
+        assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn workload_dependent_swap_is_a_frontier_and_never_gates() {
+        // (text, macaddr) vs (macaddr, text): short payloads favor macaddr-first (measured
+        // flat 0 vs a 1.5 B/row mean), long payloads with friendly residues favor text-first.
+        // Neither dominates, so neither order gates and both see the boundary.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested_order, vec!["t", "m"], "no rewrite advice without dominance");
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["m", "t"]);
+        assert!(frontier.decided);
+        let short_band = frontier.bands.iter().find(|b| b.long_form.is_empty()).unwrap();
+        assert_eq!(
+            short_band.winner,
+            BandWinner::Alternative,
+            "short payloads favor macaddr-first"
+        );
+        let long_band = frontier.bands.iter().find(|b| b.long_form == ["t"]).unwrap();
+        assert_eq!(
+            long_band.winner,
+            BandWinner::Mixed,
+            "long payloads flip with the residue"
+        );
+    }
+
+    #[test]
+    fn aligned_slot_and_char_tail_dominate() {
+        // (text, boolean, bigint): the winning order hands the text the aligned slot behind
+        // the bigint and parks the boolean last, reaching zero padding in every realization.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, b boolean NOT NULL, x bigint NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 7.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 7 }));
+        assert_eq!(t.suggested_order, vec!["x", "t", "b"]);
+        assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 0));
+    }
+
+    #[test]
+    fn d_aligned_array_first_is_kept_and_the_swap_is_not_recommended() {
+        // (float8[], int4) measures flat 0 for whole-float8 payloads; the old model demanded
+        // (int4, float8[]), which measures flat 4. Neither dominates; current order stays.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE a (arr float8[] NOT NULL, n int4 NOT NULL);
+                 CREATE TABLE b (n int4 NOT NULL, arr float8[] NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let keep = &a.tables[0];
+        assert_eq!(keep.avoidable_bytes_per_row, 0.0);
+        assert!(keep.frontier.is_none(), "array-first is already the minimax pole");
+        let swapped = &a.tables[1];
+        assert_eq!(
+            swapped.avoidable_bytes_per_row, 0.0,
+            "the 4-flat band is the reader's call"
+        );
+        let frontier = swapped.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["arr", "n"]);
+        assert_eq!((frontier.alternative_worst, frontier.current_worst), (3, 4));
+    }
+
+    #[test]
+    fn certainty_trade_is_reported_and_never_recommended() {
+        // (timetz, timetz, text): interposing the text trades a certain 4 for 0..=7, which
+        // measures 3 B/row worse on 4-byte-wide texts. The trade renders as a frontier with
+        // the current order kept.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t1 timetz NOT NULL, t2 timetz NOT NULL, v text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.suggested_order, vec!["t1", "t2", "v"]);
+        assert_eq!(t.current.padding, 4);
+        let frontier = t.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["t1", "v", "t2"]);
+        assert_eq!(frontier.alternative_deterministic, 0);
+        assert_eq!(frontier.alternative_worst, 7);
+    }
+
+    #[test]
+    fn issue_10_band_pair_reports_the_boundary_instead_of_identical_silence() {
+        // (int8, text, float8[]) vs (int8, float8[], text): which varlena receives the aligned
+        // slot is workload knowledge (issue #10's W1/W2). The text-first order shows the
+        // frontier with per-form bands; the array-first order is the minimax pole and passes.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE band_b (k int8 NOT NULL, txt text NOT NULL, arr float8[] NOT NULL);
+                 CREATE TABLE band_a (k int8 NOT NULL, arr float8[] NOT NULL, txt text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let text_first = &a.tables[0];
+        assert_eq!(text_first.avoidable_bytes_per_row, 0.0);
+        let frontier = text_first.frontier.as_ref().unwrap();
+        assert_eq!(frontier.order, vec!["k", "arr", "txt"]);
+        let arr_long = frontier.bands.iter().find(|b| b.long_form == ["arr"]).unwrap();
+        assert_eq!(
+            arr_long.winner,
+            BandWinner::Alternative,
+            "long arrays want the aligned slot"
+        );
+        let txt_long = frontier.bands.iter().find(|b| b.long_form == ["txt"]).unwrap();
+        assert_eq!(txt_long.winner, BandWinner::Current, "long texts already own it");
+        let array_first = &a.tables[1];
+        assert_eq!(array_first.avoidable_bytes_per_row, 0.0);
+    }
+
+    #[test]
+    fn capped_search_still_gates_deterministic_waste() {
+        // The 25-column false negative: with the redundant column cap dropped, the whole-order
+        // search runs (its state space fits the budget), the repack dominates, and the gate
+        // fires at the full 24 B/row (both prior PRs' review blocker).
+        let mut cols: Vec<String> = Vec::new();
+        for i in 0..4 {
+            cols.push(format!("tz{i} timetz NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("m{i} macaddr NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("b{i} bigint NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("i{i} integer NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("s{i} smallint NOT NULL"));
+        }
+        for i in 0..4 {
+            cols.push(format!("f{i} boolean NOT NULL"));
+        }
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE cliff25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__c.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 25);
+        assert_eq!(t.current.padding, 24);
+        assert_eq!(t.avoidable_bytes_per_row, 24.0);
+        assert_eq!(t.avoidable_deterministic, 24);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 24, max: 24 }));
+    }
+
+    #[test]
+    fn wide_fixed_table_keeps_its_refinement_at_25_columns() {
+        // 25 columns, few classes: a column-count cap would skip the search here (a measured
+        // false negative of an earlier revision); the state budget admits it and the repack
+        // around the smallint is dominance-proven.
+        let mut cols: Vec<String> = (0..21).map(|i| format!("b{i} bigint NOT NULL")).collect();
+        cols.push("t1 timetz NOT NULL".into());
+        cols.push("t2 timetz NOT NULL".into());
+        cols.push("s smallint NOT NULL".into());
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE wide25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__w.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 4);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.avoidable_deterministic, 2);
+        assert_eq!(t.avoidable_dominance, 2);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+    }
+
+    #[test]
+    fn dominating_reorder_outside_the_poles_is_found_by_the_sweep() {
+        // (text, bigint, macaddr): no scalar-objective pole proposes (bigint, text, macaddr),
+        // yet it dominates (measured 1.5 vs 3.5 short-heavy, 1.5 vs 3.5 long-heavy, 0 vs 0 on
+        // fixed 132-byte texts). The reviews clocked pole-only search missing 11-19% of
+        // dominating reorders on 4-5 column schemas; the exhaustive sweep closes the class.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE t (t text NOT NULL, k bigint NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, vec!["k", "t", "m"]);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 4 }));
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn headline_never_exceeds_the_proven_maximum_saving() {
+        // 23 columns of irregulars and texts: the dominating repack removes 28 B of certain
+        // padding but pays new data-dependent pads, so only 24 B is attainable. The headline
+        // must equal the proven maximum instead of the raw certain-pad delta (a measured
+        // self-contradiction in an earlier revision: 28.0 next to "saves 8-24").
+        let mut cols: Vec<String> = Vec::new();
+        for i in 0..6 {
+            cols.push(format!("tz{i} timetz NOT NULL"));
+        }
+        for i in 0..6 {
+            cols.push(format!("m{i} macaddr NOT NULL"));
+        }
+        for i in 0..5 {
+            cols.push(format!("b{i} bigint NOT NULL"));
+        }
+        for i in 0..3 {
+            cols.push(format!("s{i} smallint NOT NULL"));
+        }
+        for i in 0..3 {
+            cols.push(format!("t{i} text NOT NULL"));
+        }
+        let sql = format!("CREATE TABLE m23 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__m23.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        let saving = t.dominance_saving.unwrap();
+        assert!(
+            t.avoidable_bytes_per_row <= saving.max as f64,
+            "headline {} exceeds the proven maximum {}",
+            t.avoidable_bytes_per_row,
+            saving.max
+        );
+        assert_eq!(t.avoidable_bytes_per_row, 24.0);
+        assert_eq!((saving.min, saving.max), (8, 24));
+        assert_eq!(t.avoidable_deterministic + t.avoidable_dominance, saving.max);
+    }
+
+    #[test]
+    fn one_extra_column_no_longer_flips_a_finding_to_a_pass() {
+        // 25 columns, tiny state space: a fixed column-count cap silently passed this table at
+        // exactly 25 columns while 24 gated 7.0 (a measured cliff); the budget-only cap keeps
+        // the finding.
+        let mut cols = vec!["t text NOT NULL".to_string(), "b boolean NOT NULL".to_string()];
+        for i in 0..23 {
+            cols.push(format!("x{i} bigint NOT NULL"));
+        }
+        let sql = format!("CREATE TABLE s25 ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__s25.sql", &sql)], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 25);
+        assert_eq!(t.avoidable_bytes_per_row, 7.0);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+        assert_eq!(t.suggested_order.last().map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn same_class_varlena_identities_are_searched_individually() {
+        // (t1 text, m1 macaddr, t2 text, m2 macaddr): the dominating order (m1, t2, t1, m2)
+        // swaps the two texts relative to their written order, so a candidate space that
+        // collapses same-class varlenas never proposes it, while its class-sequence twin
+        // (m1, t1, t2, m2) measures 4 B/row worse than the current order at t1 = 132 B. The
+        // sweep must treat every varlena as its own individual.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE tmtm (t1 text NOT NULL, m1 macaddr NOT NULL, t2 text NOT NULL, m2 macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, vec!["m1", "t2", "t1", "m2"]);
+        assert_eq!(t.avoidable_bytes_per_row, 4.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 4 }));
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn many_class_table_keeps_the_fixed_prefix_win() {
+        // 10 distinct fixed padding classes (via assume-type) plus a text: the whole-order
+        // search is over budget, and the reviews' false negative was a silent clean checkmark
+        // on this shape. The fixed-prefix search must still surface the repack and gate it.
+        let mut config = Config::default();
+        for (name, spec) in [
+            ("w3c", "fixed:3:c"),
+            ("w5c", "fixed:5:c"),
+            ("w3s", "fixed:3:s"),
+            ("w5i", "fixed:5:i"),
+        ] {
+            let (key, kind) = crate::catalog::parse_assume_spec(&format!("{name}={spec}")).unwrap();
+            config.assume.insert(key, kind);
+        }
+        let types = [
+            "boolean", "smallint", "integer", "bigint", "timetz", "macaddr", "w3c", "w5c", "w3s", "w5i",
+        ];
+        let mut cols: Vec<String> = Vec::new();
+        for (i, ty) in types.iter().enumerate() {
+            cols.push(format!("c{i}a {ty} NOT NULL"));
+            cols.push(format!("c{i}b {ty} NOT NULL"));
+        }
+        cols.push("note text NOT NULL".into());
+        let sql = format!("CREATE TABLE cls ({});", cols.join(", "));
+        let a = analyze_sources(&[src("V1__cls.sql", &sql)], &config);
+        let t = &a.tables[0];
+        assert_eq!(t.natts, 21);
+        assert_eq!(t.search_scope, SearchScope::FixedPrefix, "over the whole-order budget");
+        assert!(
+            t.current.padding > 0,
+            "the as-written order pads: {}",
+            t.current.padding
+        );
+        assert!(
+            t.avoidable_deterministic > 0,
+            "a capped search must not print a silent clean verdict over deterministic waste: {t:#?}"
+        );
+        assert!(t.avoidable_bytes_per_row > 0.0);
+    }
+}
+
+/// Wide and hostile tables from the closure review of ee5844e: every one terminates within a
+/// wall-time bound, and none prints a clean verdict over a dominating reorder the engine can
+/// decide.
+mod closure_review {
+    use super::src;
+    use crate::layout::SearchScope;
+    use crate::report::{DominanceScope, SavingRange, TableReport};
+    use crate::{Config, analyze_sources};
+    use std::time::{Duration, Instant};
+
+    fn table_sql(name: &str, types: &[&str]) -> String {
+        let cols: Vec<String> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("c{i} {ty} NOT NULL"))
+            .collect();
+        format!("CREATE TABLE {name} ({});", cols.join(", "))
+    }
+
+    /// Analyze on a worker thread and fail instead of hanging when it overruns `bound`.
+    fn analyze_within(sql: String, bound: Duration) -> (TableReport, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let analysis = analyze_sources(&[src("V1__h.sql", &sql)], &Config::default());
+            let _ = tx.send((
+                analysis.tables.into_iter().next().expect("one table"),
+                started.elapsed(),
+            ));
+        });
+        rx.recv_timeout(bound).expect("analysis overran its wall-time bound")
+    }
+
+    fn repeat(ty: &'static str, n: usize) -> Vec<&'static str> {
+        vec![ty; n]
+    }
+
+    #[test]
+    fn same_class_runs_of_256_and_more_terminate() {
+        // 256 members of one padding class wrapped a u8 counter and spun the DP forever.
+        let bound = Duration::from_secs(60);
+        let (t, _) = analyze_within(table_sql("t256", &repeat("text", 256)), bound);
+        assert_eq!(t.natts, 256);
+        let mut types = repeat("timetz", 2);
+        types.extend(repeat("integer", 300));
+        let (t, _) = analyze_within(table_sql("tz_i300", &types), bound);
+        // The exact tier takes the DP's padding minimum: one int4 between the two timetz.
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn postgres_width_tables_terminate_within_the_bound() {
+        let bound = Duration::from_secs(60);
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let mut five_varlenas = repeat("integer", 1595);
+        five_varlenas.extend(["text", "text", "text", "text", "float8[]"]);
+        let mut seven_classes: Vec<&str> = (0..1595).map(|i| seven[i % 7]).collect();
+        seven_classes.extend(["text", "text", "text", "text", "float8[]"]);
+        let mut five_thousand = vec!["text"];
+        five_thousand.extend(repeat("integer", 5039));
+        for (name, types) in [
+            ("w1600_5v", five_varlenas),
+            ("w1600_7cls_5v", seven_classes),
+            ("w5040", five_thousand),
+        ] {
+            let (t, elapsed) = analyze_within(table_sql(name, &types), bound);
+            assert_eq!(t.natts, types.len(), "{name}");
+            assert!(elapsed < bound, "{name} took {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn a_dominating_pole_is_recommended_when_the_sweep_runs_out_of_budget() {
+        // Four varchars too short to compress and a text exhaust the sweep's comparison budget;
+        // the minimax pole (id, note, ...) dominates the written order and used to print as a
+        // workload-dependent frontier. Measured on PostgreSQL 16 for the varchar(8) spelling
+        // the review used: 0.000 vs 0.736 B/row mean, no row worse.
+        let a = analyze_sources(
+            &[src(
+                "V1__o.sql",
+                "CREATE TABLE orders (id bigint NOT NULL, country varchar(2) NOT NULL, \
+                 currency varchar(3) NOT NULL, status varchar(5) NOT NULL, channel varchar(4) NOT NULL, note text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.dominance_search, DominanceScope::Budgeted);
+        assert_eq!(t.avoidable_bytes_per_row, 3.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 3 }));
+        assert_eq!(t.suggested_order[..2], ["id".to_string(), "note".to_string()]);
+        assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn trimmed_sweeps_keep_the_findings_only_a_fallback_holds() {
+        // Each sweep runs out of comparison budget before it reaches a dominating order, and only
+        // the fallback candidates hold one; testing them only when the order space is too large
+        // to sweep passed these tables clean. tests/oracle.rs verifies each finding.
+        for types in [
+            [
+                "varchar(5)",
+                "text",
+                "jsonb",
+                "varchar(8)",
+                "macaddr",
+                "smallint",
+                "varchar(5)",
+            ],
+            [
+                "macaddr",
+                "jsonb",
+                "varchar(8)",
+                "text",
+                "integer",
+                "float8[]",
+                "bigint",
+            ],
+            [
+                "varchar(5)",
+                "text",
+                "integer",
+                "varchar(8)",
+                "integer",
+                "varchar(5)",
+                "varchar(8)",
+            ],
+        ] {
+            let a = analyze_sources(&[src("V1__b.sql", &table_sql("b2", &types))], &Config::default());
+            let t = &a.tables[0];
+            assert_eq!(t.dominance_search, DominanceScope::Budgeted, "{types:?}");
+            assert!(t.avoidable_bytes_per_row > 0.0, "{types:?} passed clean");
+            assert!(t.dominance_saving.is_some(), "{types:?}");
+        }
+    }
+
+    #[test]
+    fn varchars_that_can_compress_keep_the_aligned_form() {
+        // varchar(10) holds up to 40 bytes, and the toaster compresses an attribute over 24
+        // bytes in line behind an aligned 4-byte header (lz4 has no minimum input). Modeled as
+        // never aligned, the engine recommended (c0, c2, c3, c1) here, which PostgreSQL 16 stores
+        // 1-3 B longer than the written order in 18 of 23 measured rows.
+        let a = analyze_sources(
+            &[src(
+                "V1__w.sql",
+                "CREATE TABLE w66 (c0 timetz, c1 varchar(10) NOT NULL, c2 macaddr NOT NULL, c3 text NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.avoidable_bytes_per_row, 0.0, "{:?}", t.suggested_order);
+        assert_ne!(t.dominance_search, DominanceScope::Exhaustive);
+        let small = analyze_sources(
+            &[src(
+                "V1__s.sql",
+                "CREATE TABLE s (a smallint NOT NULL, v varchar(5) NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        assert_eq!(
+            small.tables[0].current.padding_max, 0,
+            "varchar(5) never reaches 21 bytes"
+        );
+    }
+
+    #[test]
+    fn fixed_waste_past_24_fixed_columns_gates() {
+        // 30 fixed columns and 6 varlenas: every pole reorders the varlenas out of the
+        // enumeration budget, and the prefix repack was a no-op past 24 fixed columns, so 100 B
+        // of deterministic padding passed clean. Measured: 100.806 vs 0.806 B/row.
+        let mut types: Vec<&str> = Vec::new();
+        for _ in 0..10 {
+            types.extend(["boolean", "bigint"]);
+        }
+        for _ in 0..5 {
+            types.extend(["smallint", "timestamptz"]);
+        }
+        types.extend(["varchar(20)", "text", "jsonb", "text", "numeric", "text[]"]);
+        let a = analyze_sources(&[src("V1__w.sql", &table_sql("wide36", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 100);
+        assert_eq!(t.avoidable_deterministic, 100);
+        assert!(t.avoidable_bytes_per_row >= 100.0, "{}", t.avoidable_bytes_per_row);
+        let saving = t.dominance_saving.expect("dominance-proven");
+        assert!(saving.min >= 97, "{saving:?}");
+    }
+
+    #[test]
+    fn fixed_waste_at_1600_columns_gates() {
+        // The same cliff at PostgreSQL's column limit: 1,590 B/row of certain padding passed
+        // clean with six varlenas.
+        let bound = Duration::from_secs(60);
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let mut types: Vec<&str> = (0..1594).map(|i| seven[i % 7]).collect();
+        types.extend(["text", "text", "jsonb", "text", "numeric", "float8[]"]);
+        let (t, _) = analyze_within(table_sql("w1600_6v", &types), bound);
+        assert_eq!(t.current.padding, 1590);
+        assert!(t.avoidable_deterministic > 0, "{}", t.avoidable_deterministic);
+        assert!(t.dominance_saving.is_some());
+    }
+
+    #[test]
+    fn exact_tier_past_24_columns_takes_the_search_minimum() {
+        // 26 fixed columns: the exact tier used the capped heuristic and printed "nothing to
+        // gain" while alternating timetz and int4 saves a MAXALIGN rung (measured 232 vs 236 B
+        // tuples, 3 vs 4 pages per 100 rows).
+        let mut types: Vec<&str> = Vec::new();
+        for _ in 0..11 {
+            types.extend(["timetz", "integer"]);
+        }
+        types.extend(["timetz", "timetz", "integer", "integer"]);
+        let a = analyze_sources(&[src("V1__e.sql", &table_sql("exact26", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.current.padding, 4);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert_eq!(t.search_scope, SearchScope::Complete);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn short_arrays_keep_their_storable_residues() {
+        // An uncompressed float8[] always stores payload 4 mod 8. Modeled with every residue,
+        // the engine printed "no dominating reorder exists" here while (m, s, a2, a1) measures
+        // never worse on 3,000 rows and 5.803 to 1.454 B/row on average.
+        let a = analyze_sources(
+            &[src(
+                "V1__p.sql",
+                "CREATE TABLE pin (s smallint NOT NULL, a1 float8[] NOT NULL, a2 float8[] NOT NULL, m macaddr NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let t = &a.tables[0];
+        assert_eq!(t.suggested_order, ["m", "s", "a2", "a1"]);
+        assert!(t.avoidable_bytes_per_row > 0.0);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+        assert!(t.superset_types.is_empty());
+    }
+
+    #[test]
+    fn an_unverified_payload_model_withholds_the_absence_claim() {
+        // inet stores 6 or 18 payload bytes and never the long form, which the model does not
+        // know; a sweep over the wider model cannot prove that nothing dominates.
+        let a = analyze_sources(
+            &[src(
+                "V1__i.sql",
+                "CREATE TABLE i (a inet NOT NULL, b smallint NOT NULL); CREATE TABLE t (a text NOT NULL, b smallint NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let inet = &a.tables[0];
+        assert_eq!(inet.avoidable_bytes_per_row, 0.0);
+        assert_eq!(inet.dominance_search, DominanceScope::Superset);
+        assert_eq!(inet.superset_types, ["inet"]);
+        let text = &a.tables[1];
+        assert_eq!(text.dominance_search, DominanceScope::Exhaustive);
+        assert!(text.superset_types.is_empty());
+    }
+
+    #[test]
+    fn a_capped_fixed_search_still_packs_the_irregulars() {
+        // 49 fixed columns in 7 classes put the block search over budget; the sort keeps every
+        // timetz and macaddr padding, and the capped table passed as "nothing to gain".
+        // Measured on PostgreSQL 16: 403 B tuples as written, 367 B hand-packed.
+        let mut types: Vec<&str> = Vec::new();
+        for ty in ["bigint", "timetz", "integer", "macaddr", "smallint"] {
+            types.extend([ty; 7]);
+        }
+        for _ in 0..7 {
+            types.extend(["boolean", "uuid"]);
+        }
+        let a = analyze_sources(&[src("V1__f.sql", &table_sql("fbs", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.search_scope, SearchScope::SortOnly);
+        assert_eq!(t.current.padding, 36);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!((t.current.footprint, t.suggested.footprint), (Some(408), Some(368)));
+        assert_eq!(t.avoidable_bytes_per_row, 40.0);
+    }
+
+    #[test]
+    fn a_capped_exact_search_claims_no_exhaustiveness() {
+        // Seven fixed classes of 40 columns each put both searches over budget; the heuristic
+        // sort still pads, and the labels must say the search was capped.
+        let seven = ["integer", "smallint", "boolean", "bigint", "timetz", "macaddr", "uuid"];
+        let types: Vec<&str> = (0..280).map(|i| seven[i % 7]).collect();
+        let a = analyze_sources(&[src("V1__c.sql", &table_sql("capped", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.search_scope, SearchScope::SortOnly);
+        assert_eq!(t.dominance_search, DominanceScope::Budgeted);
+        assert!(t.avoidable_bytes_per_row > 0.0, "the sort still beats round-robin");
+    }
 }
 
 /// The issue-1 repro: identical column multisets, opposite orders. Interleaving fixed columns
@@ -1214,27 +1906,40 @@ mod varlena_residue_uncertainty {
         a text NOT NULL, b text NOT NULL, c text NOT NULL, d text NOT NULL, e text NOT NULL);";
 
     #[test]
-    fn interleaved_reports_expected_avoidable_and_surfaces_the_reorder() {
+    fn interleaved_reports_dominance_avoidable_and_surfaces_the_reorder() {
+        // Grouping dominates interleaving here: never worse in any storage-form/payload
+        // realization, and up to 11 B/row better. The display expectation stays 5.0
+        // (pageinspect on independently varying short payloads measures a 4.5-5.1 B/row mean).
         let analysis = analyze_sources(&[src("V1__i.sql", INTERLEAVED)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.current.padding, 0, "no pad in this order is certain");
-        assert_eq!(t.current.expected_padding, 9.5);
+        assert_eq!(t.current.expected_padding, 5.0);
         assert_eq!((t.current.padding_min, t.current.padding_max), (0, 19));
-        assert_eq!(t.suggested.expected_padding, 6.0);
         assert_eq!((t.suggested.padding_min, t.suggested.padding_max), (0, 12));
-        assert_eq!(t.avoidable_bytes_per_row, 3.5);
+        assert_eq!(t.avoidable_bytes_per_row, 11.0);
+        assert_eq!(t.avoidable_deterministic, 0);
+        assert_eq!(t.avoidable_dominance, 11);
+        assert_eq!(t.dominance_saving, Some(crate::report::SavingRange { min: 0, max: 11 }));
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
     }
 
     #[test]
     fn grouped_reports_zero_avoidable() {
+        // The issue's control table: pageinspect measures it flat at zero padding, and the
+        // expectation must agree; only the long-form max (0-12) is data-dependent.
         let analysis = analyze_sources(&[src("V1__g.sql", GROUPED)], &Config::default());
         let t = &analysis.tables[0];
         assert_eq!(t.tier, Tier::Estimate);
         assert_eq!(t.avoidable_bytes_per_row, 0.0);
-        assert_eq!(t.current.expected_padding, 6.0);
+        assert_eq!(t.current.expected_padding, 0.0);
+        assert_eq!(t.current.padding, 0);
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 12));
         assert_eq!(t.suggested, t.current);
         assert_eq!(t.suggested_order, vec!["score", "seen", "tag", "a", "b", "c", "d", "e"]);
+        assert!(t.frontier.is_none(), "the control table is its own minimax pole");
+        // Five individually-distinct texts put the exhaustive sweep out of budget; the clean
+        // verdict must say so instead of claiming nonexistence.
+        assert_eq!(t.dominance_search, crate::report::DominanceScope::Budgeted);
     }
 }

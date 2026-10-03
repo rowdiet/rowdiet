@@ -60,7 +60,8 @@ fn verified_builtins() {
         cat().resolve(&t("numeric")).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::EVEN
         }
     );
     assert!(cat().resolve(&t("inet")).known);
@@ -73,28 +74,35 @@ fn char_and_varchar_proven_short() {
         cat().resolve(&tn("varchar", 31)).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: true
+            proven_short: true,
+            payload: Payload::UNVERIFIED
         }
     );
     assert_eq!(
         cat().resolve(&tn("varchar", 32)).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     assert_eq!(
         cat().resolve(&t("varchar")).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::ANY
         }
     );
     assert_eq!(
         cat().resolve(&tn("bpchar", 1)).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: true
+            proven_short: true,
+            payload: Payload {
+                compressible: false,
+                ..Payload::UNVERIFIED
+            }
         }
     );
 }
@@ -116,21 +124,24 @@ fn arrays_follow_element_alignment() {
         cat().resolve(&arr("int8", 1)).kind,
         ColumnKind::Varlena {
             align: Align::Double,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::array(8)
         }
     );
     assert_eq!(
         cat().resolve(&arr("text", 1)).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::array(4)
         }
     );
     assert_eq!(
         cat().resolve(&arr("float8", 2)).kind,
         ColumnKind::Varlena {
             align: Align::Double,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::array(8)
         }
     );
     let unknown_elem = cat().resolve(&arr("nope", 1));
@@ -138,7 +149,8 @@ fn arrays_follow_element_alignment() {
         unknown_elem.kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     assert!(!unknown_elem.known);
@@ -166,7 +178,8 @@ fn unknown_defaults_flagged() {
         r.kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     assert!(!r.known);
@@ -206,11 +219,17 @@ fn curated_extension_types_are_verified() {
         "ltxtquery",
     ] {
         let r = cat().resolve(&t(key));
+        let payload = if key == "citext" {
+            Payload::ANY
+        } else {
+            Payload::UNVERIFIED
+        };
         assert_eq!(
             r.kind,
             ColumnKind::Varlena {
                 align: Align::Int,
-                proven_short: false
+                proven_short: false,
+                payload
             },
             "{key}"
         );
@@ -222,7 +241,8 @@ fn curated_extension_types_are_verified() {
             r.kind,
             ColumnKind::Varlena {
                 align: Align::Double,
-                proven_short: false
+                proven_short: false,
+                payload: Payload::UNVERIFIED
             },
             "{key}"
         );
@@ -246,9 +266,10 @@ fn curated_extension_types_are_verified() {
 #[test]
 fn builtin_table_is_pinned_entry_by_entry() {
     let fixed = |len, align| ColumnKind::Fixed { len, align };
-    let varlena = |align| ColumnKind::Varlena {
+    let varlena = |align, payload| ColumnKind::Varlena {
         align,
         proven_short: false,
+        payload,
     };
     let expectations: &[(&str, ColumnKind)] = &[
         ("bool", fixed(1, Align::Char)),
@@ -284,45 +305,45 @@ fn builtin_table_is_pinned_entry_by_entry() {
         ("smallserial", fixed(2, Align::Short)),
         ("serial2", fixed(2, Align::Short)),
         ("box3d", fixed(52, Align::Double)),
-        ("numeric", varlena(Align::Int)),
-        ("text", varlena(Align::Int)),
-        ("bytea", varlena(Align::Int)),
-        ("json", varlena(Align::Int)),
-        ("jsonb", varlena(Align::Int)),
-        ("xml", varlena(Align::Int)),
-        ("inet", varlena(Align::Int)),
-        ("cidr", varlena(Align::Int)),
-        ("bit", varlena(Align::Int)),
-        ("varbit", varlena(Align::Int)),
-        ("varchar", varlena(Align::Int)),
-        ("bpchar", varlena(Align::Int)),
-        ("tsvector", varlena(Align::Int)),
-        ("tsquery", varlena(Align::Int)),
-        ("int4range", varlena(Align::Int)),
-        ("numrange", varlena(Align::Int)),
-        ("daterange", varlena(Align::Int)),
-        ("int4multirange", varlena(Align::Int)),
-        ("nummultirange", varlena(Align::Int)),
-        ("datemultirange", varlena(Align::Int)),
-        ("int8range", varlena(Align::Double)),
-        ("tsrange", varlena(Align::Double)),
-        ("tstzrange", varlena(Align::Double)),
-        ("int8multirange", varlena(Align::Double)),
-        ("tsmultirange", varlena(Align::Double)),
-        ("tstzmultirange", varlena(Align::Double)),
-        ("path", varlena(Align::Double)),
-        ("polygon", varlena(Align::Double)),
-        ("citext", varlena(Align::Int)),
-        ("hstore", varlena(Align::Int)),
-        ("vector", varlena(Align::Int)),
-        ("halfvec", varlena(Align::Int)),
-        ("sparsevec", varlena(Align::Int)),
-        ("ltree", varlena(Align::Int)),
-        ("lquery", varlena(Align::Int)),
-        ("ltxtquery", varlena(Align::Int)),
-        ("geometry", varlena(Align::Double)),
-        ("geography", varlena(Align::Double)),
-        ("cube", varlena(Align::Double)),
+        ("numeric", varlena(Align::Int, Payload::EVEN)),
+        ("text", varlena(Align::Int, Payload::ANY)),
+        ("bytea", varlena(Align::Int, Payload::ANY)),
+        ("json", varlena(Align::Int, Payload::ANY)),
+        ("jsonb", varlena(Align::Int, Payload::ANY)),
+        ("xml", varlena(Align::Int, Payload::ANY)),
+        ("inet", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("cidr", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("bit", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("varbit", varlena(Align::Int, Payload::ANY)),
+        ("varchar", varlena(Align::Int, Payload::ANY)),
+        ("bpchar", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("tsvector", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("tsquery", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("int4range", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("numrange", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("daterange", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("int4multirange", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("nummultirange", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("datemultirange", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("int8range", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("tsrange", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("tstzrange", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("int8multirange", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("tsmultirange", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("tstzmultirange", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("path", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("polygon", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("citext", varlena(Align::Int, Payload::ANY)),
+        ("hstore", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("vector", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("halfvec", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("sparsevec", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("ltree", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("lquery", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("ltxtquery", varlena(Align::Int, Payload::UNVERIFIED)),
+        ("geometry", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("geography", varlena(Align::Double, Payload::UNVERIFIED)),
+        ("cube", varlena(Align::Double, Payload::UNVERIFIED)),
     ];
     for (key, expected) in expectations {
         let resolved = cat().resolve(&t(key));
@@ -372,7 +393,8 @@ fn session_types() {
         c.resolve(&t("pair")).kind,
         ColumnKind::Varlena {
             align: Align::Double,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     c.define_range("bigrange".into(), Some(&t("int8")));
@@ -380,7 +402,8 @@ fn session_types() {
         c.resolve(&t("bigrange")).kind,
         ColumnKind::Varlena {
             align: Align::Double,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     c.define_range("textrange".into(), Some(&t("text")));
@@ -388,7 +411,8 @@ fn session_types() {
         c.resolve(&t("textrange")).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::UNVERIFIED
         }
     );
     c.define_domain("code".into(), &tn("varchar", 20));
@@ -396,7 +420,8 @@ fn session_types() {
         c.resolve(&t("code")).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: true
+            proven_short: true,
+            payload: Payload::UNVERIFIED
         }
     );
     c.drop_type("status");
@@ -411,7 +436,8 @@ fn enum_array_is_int_aligned_varlena() {
         c.resolve(&arr("status", 1)).kind,
         ColumnKind::Varlena {
             align: Align::Int,
-            proven_short: false
+            proven_short: false,
+            payload: Payload::array(4)
         }
     );
     assert!(c.resolve(&arr("status", 1)).known);
