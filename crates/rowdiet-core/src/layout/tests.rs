@@ -929,3 +929,59 @@ fn the_fixed_block_repack_runs_past_24_columns() {
     assert_eq!(walk(&ordered).padding, 0);
     assert_eq!(order.last(), Some(&30), "the varlena tail stays in place");
 }
+
+/// A block walked from where its prefix can end places every column exactly as the whole-table
+/// walk does, in rows that store every column; only the absolute offsets are withheld.
+mod block_walk {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn pool() -> impl Strategy<Value = ColumnKind> {
+        prop_oneof![
+            Just(fixed(1, Align::Char)),
+            Just(fixed(2, Align::Short)),
+            Just(fixed(4, Align::Int)),
+            Just(fixed(6, Align::Int)),
+            Just(fixed(8, Align::Double)),
+            Just(fixed(12, Align::Double)),
+            Just(varlena(Align::Int)),
+            Just(varlena(Align::Double)),
+            Just(short()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+        #[test]
+        fn block_pads_match_the_whole_walk(
+            prefix in proptest::collection::vec(pool(), 0..=4),
+            block in proptest::collection::vec(pool(), 1..=4),
+        ) {
+            let whole: Vec<ColumnKind> = prefix.iter().chain(&block).copied().collect();
+            let columns: Vec<Column> = prefix.iter().map(|&k| Column::nullable(k)).collect();
+            let w = walk_from(Start::after(&columns), &block);
+            let full = walk(&whole);
+            let pads: Vec<PadRange> = w.columns.iter().map(|c| c.pad_before).collect();
+            let tail: Vec<PadRange> = full.columns[prefix.len()..].iter().map(|c| c.pad_before).collect();
+            prop_assert_eq!(pads, tail, "{:?} after {:?}", block, prefix);
+            prop_assert!(w.end.is_none());
+        }
+    }
+}
+
+#[test]
+fn a_prefix_start_reaches_null_and_stored_residues() {
+    // (int8, bool NULL): rows that store the bool end at 9, rows that do not at 8.
+    let prefix = [
+        Column::not_null(fixed(8, Align::Double)),
+        Column::nullable(fixed(1, Align::Char)),
+    ];
+    let start = Start::after(&prefix);
+    assert_eq!(start.residues(false), 0b0000_0010);
+    assert_eq!(start.residues(true), 0b0000_0011);
+    assert_eq!(
+        Start::after(&[Column::not_null(varlena(Align::Int))]).residues(true),
+        0xFF
+    );
+    assert_eq!(Start::TABLE.residues(true), 1);
+}

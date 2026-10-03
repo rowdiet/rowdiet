@@ -40,13 +40,13 @@ struct Cli {
     /// Parser backend: pure-Rust sqlparser (default) or the real PG17 grammar via libpg_query
     #[arg(long, value_enum, default_value_t = ParserChoice::Sqlparser)]
     parser: ParserChoice,
-    /// Baseline file with per-table accepted-debt allowances (brownfield freeze-known-debt gating)
+    /// Baseline file recording each applied table's committed layout; columns appended after it are judged as a block
     #[arg(long, value_name = "FILE")]
     baseline: Option<PathBuf>,
-    /// Rewrite the baseline from the current analysis (entries for tables over the fail-over)
+    /// Rewrite the baseline from the current analysis, committing every analyzed table's layout
     #[arg(long, requires = "baseline", conflicts_with = "accept")]
     update_baseline: bool,
-    /// Accept one table's current state into the baseline, leaving other entries untouched; repeatable
+    /// Commit one table's current layout (its appended block as written), leaving other entries untouched; repeatable
     #[arg(long, value_name = "TABLE", requires = "baseline")]
     accept: Vec<String>,
     /// Also exit 1 when statements were skipped or tables are incomplete (degraded analysis)
@@ -193,7 +193,7 @@ fn maintain_baseline(cli: &Cli, path: &Path, analysis: &Analysis) -> Result<Exit
         updated
     };
     println!(
-        "baseline written: {} — {} table(s) with accepted debt, fail-over {}",
+        "baseline written: {}, {} committed table layout(s), fail-over {}",
         path.display(),
         written.tables.len(),
         written.fail_over
@@ -205,17 +205,9 @@ fn load_baseline(path: &Path) -> Result<Baseline, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let baseline: Baseline =
         serde_json::from_str(&text).map_err(|e| format!("{}: bad baseline JSON: {e}", path.display()))?;
-    // A hand-edited nan/inf allowance would silently disable the gate for its table.
+    // A hand-edited nan/inf fail_over would silently disable the gate.
     if !baseline.fail_over.is_finite() || baseline.fail_over < 0.0 {
         return Err(format!("{}: fail_over must be finite and non-negative", path.display()));
-    }
-    for (name, entry) in &baseline.tables {
-        if !entry.bytes.is_finite() || entry.bytes < 0.0 {
-            return Err(format!(
-                "{}: entry `{name}` must have a finite, non-negative allowance",
-                path.display()
-            ));
-        }
     }
     Ok(baseline)
 }

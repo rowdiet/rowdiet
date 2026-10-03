@@ -168,6 +168,11 @@ pub struct FoldedColumn {
     pub known_type: bool,
     /// Declared or implied NOT NULL (explicit, PRIMARY KEY, identity, serial).
     pub not_null: bool,
+    /// The statement that added the column: its CREATE TABLE or its ADD COLUMN.
+    pub origin: Origin,
+    /// Physical attribute number, 1-based: dropped columns keep theirs, so a column added after a
+    /// drop is numbered past the dropped slot, as PostgreSQL numbers it.
+    pub attnum: usize,
 }
 
 /// One table's modeled state after the replay — what [`Folder::finish`] hands to reporting.
@@ -445,6 +450,7 @@ impl Folder {
                 table.incomplete = true;
                 continue;
             }
+            column.attnum = table.columns.len() + table.dropped_count + 1;
             table.columns.push(column);
         }
         self.ghosts.remove(&name.key);
@@ -467,8 +473,9 @@ impl Folder {
             }
             return;
         }
-        let folded = self.resolve_column(column, origin);
+        let mut folded = self.resolve_column(column, origin);
         let entry = self.tables.get_mut(&table.key).expect("checked above");
+        folded.attnum = entry.columns.len() + entry.dropped_count + 1;
         entry.columns.push(folded);
         mark_altered(entry, origin);
     }
@@ -660,6 +667,8 @@ impl Folder {
             kind: resolved.kind,
             known_type: resolved.known,
             not_null: raw.not_null || resolved.implicit_not_null,
+            origin: origin.clone(),
+            attnum: 0,
         }
     }
 

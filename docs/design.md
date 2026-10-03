@@ -378,51 +378,63 @@ exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definit
 ## Baseline gate (brownfield adoption)
 
 Real schemas arrive with debt, and applied tables are exactly the ones a linter cannot ask
-anyone to rewrite. The baseline file freezes that debt per table so the gate can still be strict
-about everything new. Design points, in the order they were decided:
+anyone to rewrite. The baseline file records which layouts are committed so the gate can stay
+strict about everything still free to change. Design points, in the order they were decided:
 
 - **Core owns the gate.** The cross-implementation parity of table reports (native CLI, both
   parser backends, the wasm module and everything built on it) is the project's strongest
   correctness property; if wrappers implemented their own gate arithmetic, parity would stop
   covering the pass/fail decision itself. `baseline::evaluate` is the single implementation;
   wrappers only read and write the file.
-- **An entry overrides the fail-over; it never joins it.** The effective limit for a baselined
-  table is `entry.bytes`, full stop — not `max(fail_over, bytes)`, which would loosen every
-  allowance whenever the global gate is relaxed and silently break the ratchet promise.
-- **Allowances are pinned to a layout signature, not just a name.** A number-only ceiling is a
-  budget: drop 20 B/row of legacy columns, add 18 B/row of new sloppy ones, still "under
-  baseline" — while the same new columns would fail on any fresh table. Entries record
-  `{bytes, layout}` where `layout` is the ordered resolved-kind sequence (`f{len}{align}` per
-  fixed column, `v{align}` + `p` for proven-short varlena, comma-joined: `f8d,f4i,vi,vip`) —
-  the physical layout, so the pin expires precisely when it changes. Column names and
-  nullability are excluded on purpose: renames and `SET/DROP NOT NULL` move no stored byte, so
-  they must not expire an allowance (nullability still feeds the avoidable computation, which the
-  gate reruns with the current constraints). The signature is
-  stored as that readable string rather than a hash: a baseline diff then *shows* what changed,
-  and there is no hash-stability liability across releases.
-- **Appends keep the allowance alive (the prefix rule).** `ADD COLUMN` appends physically, so
-  after one the old signature survives as a comma-boundary prefix of the new one — structurally
-  distinguishable from reorders, drops, and type changes. Expiring the allowance there would
-  demand a full-table rewrite of an applied table, the very cost this tool exists to avoid; so
-  the allowance stays in force and only the appended waste can fail the gate, as
-  `grown since baseline` — actionable while the appending migration is still unapplied. All
-  non-prefix changes expire the entry (`modified since baseline`) and force a deliberate
-  re-accept. (Not every such change paid for a rewrite — `DROP COLUMN` and binary-coercible
-  type changes are metadata-only in Postgres — but each is a conscious layout edit, and
-  re-accepting is a one-line reviewed diff, so the expiry stays.)
-- **Improvements never auto-tighten.** A table now beating its allowance is reported as a
-  ratchet opportunity; recording the better number is an explicit maintenance act —
-  `--update-baseline` rewrites the whole file from the current analysis, `--accept <table>`
-  refreshes exactly one entry (the reviewable one-line diff for accepting one table's growth,
-  and the same mechanism prunes an entry once its table comes clean).
-- **Entries store the exact reported value, fractions included.** The gated quantity is
-  deterministic plus dominance-proven avoidable padding (whole bytes today), but entries and
-  `--fail-over` stay exact f64: fractional legacy values keep working, a fractional threshold
-  stays expressible, and rounding a stored value up would open a window where regressions pass
-  silently. Files from versions that stored whole bytes load unchanged (integers parse as the
-  same f64). `--fail-over` and loaded baseline values reject nan and non-finite numbers — a
-  templating bug that resolves an empty CI variable to `nan` would otherwise turn every
-  `avoidable > limit` comparison false and silently disable the gate.
+- **An entry is a committed layout, with no number in it (issue #13).** For an applied table
+  the physical order is fixed and reordering needs a rewrite, so a per-table byte allowance
+  only ever recorded debt and needed a ratchet to stay honest. The one order a reviewer can
+  still change is the block a migration appends with `ADD COLUMN` (issue #3), and the dominance
+  engine answers the question that matters there: given the committed columns and the offset
+  residues they can end at, is the appended block as written dominance-optimal among orders of
+  the block? The engine starts both block orders from those residues (the prefix pads the same
+  in both, so it adds nothing to the difference) and searches block orders the same way it
+  searches tables, the prefix never reordered. A block's order space is small even when the
+  table is wide, so the block sweep is exhaustive exactly where a whole-table sweep is
+  budgeted. A dominating block order fails the gate as `block_not_dominance_optimal` when its
+  saving exceeds the fail-over, with the block order to write printed; a block nothing
+  dominates passes, and a committed layout with nothing appended always passes. New tables
+  get the full search against the fail-over as before. There is no ratchet: a dominance-optimal
+  block has nothing to tighten.
+- **Entries are pinned to the physical slots, not just a name.** Entries record `layout`, one
+  slot per attribute number (`f{len}{align}` per fixed column, `v{align}` + `p` for proven-short
+  varlena, `-` for a dropped attribute, comma-joined: `f8d,f4i,-,vi,vip`), parsed on load so a
+  malformed entry fails loudly, and `columns`, the committed column names, written so a
+  reviewer can see which columns an entry commits. The gate reads only the slots: renames and
+  `SET/DROP NOT NULL` move no stored byte, so they keep the entry (nullability still feeds the
+  block judgment, which runs with the current constraints). A file that lists one table twice
+  is rejected instead of read last-wins. The signature is stored as that readable string rather
+  than a hash: a baseline diff then *shows* what changed, and there is no hash-stability
+  liability across releases.
+- **Slots define the block (the prefix rule).** `ADD COLUMN` appends a slot. `DROP COLUMN`
+  rewrites nothing: PostgreSQL keeps the attribute, marked dropped, at its number, stores NULL
+  for it in every later row, and leaves every other column where it was. So a committed slot
+  that is now `-` still belongs to the committed prefix, and the block is every column in a slot
+  past the committed ones, whatever was dropped before it. Comparing kind strings instead would
+  read drop-then-add as an append: committed `(id bigint, flag boolean, n smallint)`, then `n`
+  dropped and `(x smallint, y int, z boolean)` added, starts with the committed string, and the
+  gate judged only `(y, z)` while `(z, x, y)` saves 8 B/row (measured 48 vs 40 B page spacing).
+  Any other change to a committed slot (a type change, or a table rebuilt in another order)
+  expires the entry (`modified since baseline`, judged as a new table) and forces a deliberate
+  re-accept. The finding names every migration that appended to the block, since a block can
+  span more than one.
+- **Accepting is explicit.** `--update-baseline` commits every analyzed table's current layout;
+  `--accept <table>` commits one, which is how a block written as it is gets accepted: the next
+  migration's block is then judged against the new prefix. After upgrading from a version that
+  stored byte allowances, the first `--update-baseline` therefore writes an entry for every
+  table, not only for those over the fail-over, which is a large diff to review once.
+- **Old files keep loading.** Entries written before block gating carry a `bytes` allowance.
+  It is read, ignored, listed in the gate outcome (`ignored_allowances`) and in the text, and
+  dropped by the next write. Their layouts lack dropped slots, so an old entry for a table with
+  a dropped column no longer matches and is judged as modified until re-accepted. `--fail-over`
+  and a loaded file's `fail_over` reject nan and non-finite numbers: a templating bug that
+  resolves an empty CI variable to `nan` would otherwise turn every `avoidable > limit`
+  comparison false and silently disable the gate.
 
 The gate also carries degradation: counts of skipped statements and incomplete tables ride in
 the outcome (a bytes-only gate would stay green over an unparseable migration set), and
@@ -446,9 +458,9 @@ until it is classified — the catch-all cannot silently miss a future kind.
 Reports and baselines key on the fold key (lowercased unless quoted), which is identical across
 parser backends; the as-written spelling is carried separately as `display`. Verdicts per
 non-ignored table: `pass`, `new_violation` (no entry, over fail-over),
-`regression` (over its allowance), `grown_since_baseline`, `modified_since_baseline`,
-`ratchet_opportunity`; entries with no matching table are listed as `orphaned`, expired-but-
-passing ones as `expired`. Ignored tables stay outside both gate and baseline.
+`block_not_dominance_optimal`, `modified_since_baseline`; every grown table's block finding
+rides in `blocks`, passing or not; entries with no matching table are listed as `orphaned`,
+expired-but-passing ones as `expired`. Ignored tables stay outside both gate and baseline.
 
 ## Version ordering
 

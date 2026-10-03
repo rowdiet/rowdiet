@@ -31,8 +31,12 @@
 //! [`summary`] bounds one order alone, which decides dominance for free when one side pads
 //! zero in every realization: nothing pads less, so such an order dominates every order that
 //! pads somewhere, by exactly that order's padding.
+//!
+//! Every entry point takes a [`Start`]: the orders compared may be the appended block of a table
+//! whose leading columns are committed. Both orders then start from the same offset residue, one
+//! of those the prefix can end at, and the prefix's own padding is the same in both.
 
-use crate::layout::{Column, ColumnKind, MAXALIGN, NULL_LIKE_RESIDUE, pad};
+use crate::layout::{Column, ColumnKind, MAXALIGN, NULL_LIKE_RESIDUE, Start, pad};
 
 /// Bounds of `pad(a) − pad(b)` in bytes over every realization; both ends are attained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,21 +132,35 @@ pub const IN_FLIGHT_LIMIT: usize = 12;
 /// varlena sequence and its NULL placement, doubling per NULL bit the joint walk carries, the
 /// enumeration state count for a pair that reorders varlenas, and `u64::MAX` when [`compare`]
 /// would return None. Lets a caller ration a comparison budget before spending it.
-pub fn comparison_cost(columns: &[Column], a: &[usize], b: &[usize], nulls: Nulls, measure: Measure) -> u64 {
-    Pair::new(columns, a, b, nulls, measure).cost(None)
+pub fn comparison_cost(
+    start: Start,
+    columns: &[Column],
+    a: &[usize],
+    b: &[usize],
+    nulls: Nulls,
+    measure: Measure,
+) -> u64 {
+    Pair::new(start, columns, a, b, nulls, measure).cost(None)
 }
 
 /// Bounds of `measure(a) − measure(b)` over every realization the NULL scope allows, or None when
 /// the pair is out of budget (varlena sequences differ or too many NULL bits are in flight, and
 /// the enumeration space is too large).
-pub fn compare(columns: &[Column], a: &[usize], b: &[usize], nulls: Nulls, measure: Measure) -> Option<DiffBounds> {
-    Pair::new(columns, a, b, nulls, measure).run(None)
+pub fn compare(
+    start: Start,
+    columns: &[Column],
+    a: &[usize],
+    b: &[usize],
+    nulls: Nulls,
+    measure: Measure,
+) -> Option<DiffBounds> {
+    Pair::new(start, columns, a, b, nulls, measure).run(None)
 }
 
 /// The frontier bands for an incomparable pair: one entry per storage-form combination, in
 /// ascending order of long-form column count, each over every payload and NULL pattern. None
 /// past the band limit or budget.
-pub fn bands(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> Option<Vec<Band>> {
+pub fn bands(start: Start, columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> Option<Vec<Band>> {
     let long_capable: Vec<usize> = varlena_sequence(columns, a)
         .into_iter()
         .filter(|&c| long_capable(columns[c].kind))
@@ -150,7 +168,7 @@ pub fn bands(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> 
     if long_capable.len() > BAND_LIMIT {
         return None;
     }
-    let pair = Pair::new(columns, a, b, Nulls::Vary, measure);
+    let pair = Pair::new(start, columns, a, b, Nulls::Vary, measure);
     let mut out = Vec::with_capacity(1 << long_capable.len());
     for combo in 0u32..(1 << long_capable.len()) {
         let long_form: Vec<usize> = long_capable
@@ -276,8 +294,11 @@ fn tail(measure: Measure, residue: u64) -> u64 {
     }
 }
 
-/// One comparison: the two orders, which NULL patterns count, and what is totaled.
+/// One comparison: the two orders, where they start, which NULL patterns count, and what is
+/// totaled.
 struct Pair<'a> {
+    /// Offset residues both orders can start at (bitmask over 0..=7).
+    start: u8,
     columns: &'a [Column],
     a: &'a [usize],
     b: &'a [usize],
@@ -286,10 +307,18 @@ struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
-    fn new(columns: &'a [Column], a: &'a [usize], b: &'a [usize], nulls: Nulls, measure: Measure) -> Self {
+    fn new(
+        start: Start,
+        columns: &'a [Column],
+        a: &'a [usize],
+        b: &'a [usize],
+        nulls: Nulls,
+        measure: Measure,
+    ) -> Self {
         debug_assert_eq!(a.len(), columns.len());
         debug_assert_eq!(b.len(), columns.len());
         Self {
+            start: start.residues(nulls == Nulls::Vary),
             columns,
             a,
             b,
@@ -329,7 +358,8 @@ impl<'a> Pair<'a> {
         if va == varlena_sequence(self.columns, self.b) {
             let schedule = Schedule::build(self, &va);
             if schedule.slots <= IN_FLIGHT_LIMIT {
-                return ((schedule.moves.len() as u64).max(1) * 64) << schedule.slots;
+                return ((schedule.moves.len() as u64).max(1) * 64 * u64::from(self.start.count_ones()))
+                    << schedule.slots;
             }
         }
         let states = self.enumeration_states(&va, pin);
@@ -338,13 +368,13 @@ impl<'a> Pair<'a> {
 
     fn enumeration_states(&self, varlenas: &[usize], pin: Option<&FormPin<'_>>) -> u64 {
         let null_bits = (0..self.columns.len()).filter(|&c| self.varies(c)).count();
-        if null_bits >= 63 {
+        if null_bits >= 60 {
             return u64::MAX;
         }
         varlenas
             .iter()
             .map(|&c| self.domain(pin, c).size())
-            .try_fold(1u64 << null_bits, u64::checked_mul)
+            .try_fold(u64::from(self.start.count_ones()) << null_bits, u64::checked_mul)
             .unwrap_or(u64::MAX)
     }
 
@@ -356,8 +386,10 @@ impl<'a> Pair<'a> {
         let size = 64usize << schedule.slots;
         let mut states: Vec<Option<DiffBounds>> = vec![None; size];
         let mut next: Vec<Option<DiffBounds>> = vec![None; size];
-        states[0] = Some(DiffBounds { min: 0, max: 0 });
         let index = |bits: u64, ra: u64, rb: u64| ((bits << 6) | (ra << 3) | rb) as usize;
+        for residue in (0..MAXALIGN).filter(|r| self.start & (1 << r) != 0) {
+            states[index(0, residue, residue)] = Some(DiffBounds { min: 0, max: 0 });
+        }
         for step in &schedule.moves {
             next.iter_mut().for_each(|slot| *slot = None);
             let live = states
@@ -473,10 +505,12 @@ impl<'a> Pair<'a> {
         out: &mut Option<DiffBounds>,
     ) {
         if depth == assignment.len() {
-            let (pad_a, ra) = plans[0].pad(assignment);
-            let (pad_b, rb) = plans[1].pad(assignment);
-            let d = (pad_a + tail(self.measure, ra)) as i64 - (pad_b + tail(self.measure, rb)) as i64;
-            merge_into(out, DiffBounds { min: d, max: d });
+            for start in (0..MAXALIGN).filter(|r| self.start & (1 << r) != 0) {
+                let (pad_a, ra) = plans[0].pad(assignment, start);
+                let (pad_b, rb) = plans[1].pad(assignment, start);
+                let d = (pad_a + tail(self.measure, ra)) as i64 - (pad_b + tail(self.measure, rb)) as i64;
+                merge_into(out, DiffBounds { min: d, max: d });
+            }
             return;
         }
         let Some(&domain) = domains.get(depth) else {
@@ -552,10 +586,11 @@ impl WalkPlan {
         Self { steps }
     }
 
-    /// Padding of the order under one full realization, residues only: (padding, end residue).
-    fn pad(&self, assignment: &[Realization]) -> (u64, u64) {
+    /// Padding of the order under one full realization from a start residue, residues only:
+    /// (padding, end residue).
+    fn pad(&self, assignment: &[Realization], start: u64) -> (u64, u64) {
         let mut total = 0;
-        let mut residue = 0;
+        let mut residue = start;
         for step in &self.steps {
             match *step {
                 PlanStep::Run(ref table) => {
@@ -725,21 +760,26 @@ pub struct Summary {
     pub short_mean_eighths: u64,
 }
 
-/// [`Summary`] of `order` over the realizations the NULL scope allows. Padding walks the eight
-/// offset residues for the bounds and one uniform coset of residues for the mean. Row size also
-/// tracks the residue of the unpadded data end, and is defined for all-fixed tables only, where
-/// the mean is the cost of the row that stores every column.
-pub fn summary(columns: &[Column], order: &[usize], nulls: Nulls, measure: Measure) -> Summary {
+/// [`Summary`] of `order` from `start` over the realizations the NULL scope allows. Padding walks
+/// the eight offset residues for the bounds and one uniform coset of residues for the mean. Row
+/// size also tracks the residue the same rows would end at unpadded, and is defined for all-fixed
+/// tables only, where the mean is the cost of the row that stores every column.
+pub fn summary(start: Start, columns: &[Column], order: &[usize], nulls: Nulls, measure: Measure) -> Summary {
     match measure {
-        Measure::Padding => padding_summary(columns, order, nulls),
-        Measure::RowSize => row_size_summary(columns, order, nulls),
+        Measure::Padding => padding_summary(start, columns, order, nulls),
+        Measure::RowSize => row_size_summary(start, columns, order, nulls),
     }
 }
 
-fn padding_summary(columns: &[Column], order: &[usize], nulls: Nulls) -> Summary {
+fn padding_summary(start: Start, columns: &[Column], order: &[usize], nulls: Nulls) -> Summary {
     let mut states: [Option<(u64, u64)>; MAXALIGN as usize] = [None; MAXALIGN as usize];
-    states[0] = Some((0, 0));
-    let mut set: u8 = 1;
+    let reachable = start.residues(nulls == Nulls::Vary);
+    for (residue, state) in states.iter_mut().enumerate() {
+        if reachable & (1 << residue) != 0 {
+            *state = Some((0, 0));
+        }
+    }
+    let mut set: u8 = start.residues(false);
     let mut mean_eighths = 0u64;
     let merge = |slot: &mut Option<(u64, u64)>, lo: u64, hi: u64| {
         *slot = Some(match *slot {
@@ -808,23 +848,24 @@ fn padding_summary(columns: &[Column], order: &[usize], nulls: Nulls) -> Summary
     }
 }
 
-fn row_size_summary(columns: &[Column], order: &[usize], nulls: Nulls) -> Summary {
+fn row_size_summary(start: Start, columns: &[Column], order: &[usize], nulls: Nulls) -> Summary {
     debug_assert!(
         columns.iter().all(|c| c.kind.is_fixed()),
         "row size is summarized for all-fixed tables"
     );
-    // State: (offset residue, unpadded data residue) -> (smallest, largest) padding so far.
+    // State: (offset residue, unpadded end residue) -> (smallest, largest) padding so far. Both
+    // start where the committed prefix ends, which the two rows share.
     let mut states: [Option<(u64, u64)>; 64] = [None; 64];
-    states[0] = Some((0, 0));
+    let reachable = start.residues(nulls == Nulls::Vary);
+    for residue in (0..MAXALIGN).filter(|r| reachable & (1 << r) != 0) {
+        states[(residue * 9) as usize] = Some((0, 0));
+    }
     let merge = |slot: &mut Option<(u64, u64)>, lo: u64, hi: u64| {
         *slot = Some(match *slot {
             Some((a, b)) => (a.min(lo), b.max(hi)),
             None => (lo, hi),
         });
     };
-    let mut stored_padding = 0u64;
-    let mut stored_residue = 0u64;
-    let mut stored_data = 0u64;
     for &index in order {
         let column = columns[index];
         let ColumnKind::Fixed { len, align } = column.kind else {
@@ -843,10 +884,6 @@ fn row_size_summary(columns: &[Column], order: &[usize], nulls: Nulls) -> Summar
             }
         }
         states = next;
-        let p = pad(stored_residue, align.bytes());
-        stored_padding += p;
-        stored_residue = (stored_residue + p + len) % MAXALIGN;
-        stored_data = (stored_data + len) % MAXALIGN;
     }
     let mut min = u64::MAX;
     let mut max = 0u64;
@@ -858,12 +895,30 @@ fn row_size_summary(columns: &[Column], order: &[usize], nulls: Nulls) -> Summar
         min = min.min((lo as i64 + extra) as u64);
         max = max.max((hi as i64 + extra) as u64);
     }
-    let stored = stored_padding + pad(stored_residue, MAXALIGN) - pad(stored_data, MAXALIGN);
+    // The mean: the row that stores every column, uniform over the starts such rows reach.
+    let starts: Vec<u64> = (0..MAXALIGN)
+        .filter(|r| start.residues(false) & (1 << r) != 0)
+        .collect();
+    let stored_sum: u64 = starts.iter().map(|&r| stored_cost(columns, order, r)).sum();
     Summary {
         min,
         max,
-        short_mean_eighths: stored * MAXALIGN,
+        short_mean_eighths: stored_sum * MAXALIGN / starts.len() as u64,
     }
+}
+
+/// Row-size cost of the row that stores every column of an all-fixed `order` from `start`.
+fn stored_cost(columns: &[Column], order: &[usize], start: u64) -> u64 {
+    let (mut residue, mut data, mut padding) = (start, start, 0);
+    for &index in order {
+        if let ColumnKind::Fixed { len, align } = columns[index].kind {
+            let p = pad(residue, align.bytes());
+            padding += p;
+            residue = (residue + p + len) % MAXALIGN;
+            data = (data + len) % MAXALIGN;
+        }
+    }
+    padding + pad(residue, MAXALIGN) - pad(data, MAXALIGN)
 }
 
 #[cfg(test)]

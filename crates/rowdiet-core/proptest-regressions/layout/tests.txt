@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9b26df166eb5adf7957f07259eef89f3f3fe7a38152337c7535c9dc7afd38f82 # shrinks to kinds = [Fixed { len: 12, align: Double }, Varlena { align: Int, proven_short: false }, Fixed { len: 12, align: Double }]
+cc b37ff5d430b1a249404f0b1acd84c831330536de6e0adb3b64d981212480a050 # shrinks to prefix = [Fixed { len: 8, align: Double }], block = [Fixed { len: 1, align: Char }]
