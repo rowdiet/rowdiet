@@ -18,10 +18,13 @@
 //! compressed values and TOAST pointers as they sit on the page. Array workloads include
 //! uncompressed short and long arrays, compressed inline arrays, and TOAST pointers.
 //!
-//! Skipped (exit 0, loud) when no reachable container: the harness is for maintainers and
-//! Docker-equipped CI legs, and plain CI must not fail for lacking a database. Container/user/db
-//! come from `ROWDIET_MEASURE_CONTAINER` / `_USER` / `_DB` (defaults: condescending_tu, test,
-//! test). Every table it creates is prefixed `synb_` and dropped afterwards.
+//! Skipped (exit 0, loud) when no reachable container, unless `ROWDIET_MEASURE_REQUIRE=1` (the CI
+//! job sets it, so a missing database fails there). Container/user/db come from
+//! `ROWDIET_MEASURE_CONTAINER` / `_USER` / `_DB` (defaults: condescending_tu, test, test). Every
+//! table it creates carries the `ROWDIET_MEASURE_PREFIX` prefix (default `synb_`) and is dropped
+//! afterwards, so concurrent users of one database keep apart. The measured binary is the one
+//! cargo reports for this build, wherever `CARGO_TARGET_DIR` puts it, and the run stops if it is
+//! older than any source file.
 
 use std::io::Write as _;
 use std::process::{Command, Stdio};
@@ -105,6 +108,11 @@ struct Paired {
 struct Column {
     name: &'static str,
     sql_type: &'static str,
+}
+
+/// The table-name prefix every created table carries.
+fn prefix() -> String {
+    std::env::var("ROWDIET_MEASURE_PREFIX").unwrap_or_else(|_| "synb_".into())
 }
 
 fn is_varlena(sql_type: &str) -> bool {
@@ -482,6 +490,10 @@ fn measure() {
     };
     match pg.query("SELECT 1;") {
         Ok(_) => {}
+        Err(e) if std::env::var("ROWDIET_MEASURE_REQUIRE").is_ok_and(|v| v == "1") => {
+            eprintln!("measure: no reachable docker Postgres and ROWDIET_MEASURE_REQUIRE=1 ({e})");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("measure: skipped, no reachable docker Postgres ({e})");
             return;
@@ -497,12 +509,17 @@ fn measure() {
         run_fixture(&pg, &binary, &fixture, &mut failures);
     }
     run_report_only_checks(&binary, &mut failures);
-    pg.query("DO $$ DECLARE r record; BEGIN FOR r IN SELECT tablename FROM pg_tables WHERE tablename LIKE 'synb\\_%' LOOP EXECUTE 'DROP TABLE ' || quote_ident(r.tablename); END LOOP; END $$;")
-        .expect("cleanup");
+    let pattern = format!("{}%", prefix().replace('_', "\\_"));
+    pg.query(&format!(
+        "DO $$ DECLARE r record; BEGIN FOR r IN SELECT tablename FROM pg_tables WHERE tablename LIKE '{pattern}' LOOP EXECUTE 'DROP TABLE ' || quote_ident(r.tablename); END LOOP; END $$;"
+    ))
+    .expect("cleanup");
     let remaining = pg
-        .query("SELECT count(*) FROM pg_tables WHERE tablename LIKE 'synb\\_%';")
+        .query(&format!(
+            "SELECT count(*) FROM pg_tables WHERE tablename LIKE '{pattern}';"
+        ))
         .expect("count");
-    assert_eq!(remaining.trim(), "0", "synb_ tables must all be dropped");
+    assert_eq!(remaining.trim(), "0", "{} tables must all be dropped", prefix());
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rowdiet-xtask-{}", std::process::id())));
     if failures.is_empty() {
         println!("\nmeasure: all model claims hold against real tuples");
@@ -515,17 +532,43 @@ fn measure() {
     }
 }
 
+/// Build the release binary and return the path cargo reports for it, so `CARGO_TARGET_DIR` and
+/// build config cannot point the run at another checkout's binary. Stops when that binary is
+/// older than a source file.
 fn build_binary() -> std::path::PathBuf {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = Command::new(&cargo)
-        .args(["build", "--release", "-p", "rowdiet"])
-        .status()
+    let out = Command::new(&cargo)
+        .args(["build", "--release", "-p", "rowdiet", "--message-format=json"])
+        .stderr(Stdio::inherit())
+        .output()
         .expect("cargo build");
-    assert!(status.success(), "release build failed");
-    let root = std::env::var("CARGO_MANIFEST_DIR")
-        .map(std::path::PathBuf::from)
-        .expect("manifest dir");
-    root.parent().expect("workspace root").join("target/release/rowdiet")
+    assert!(out.status.success(), "release build failed");
+    let binary = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|msg| msg["reason"] == "compiler-artifact" && msg["target"]["name"] == "rowdiet")
+        .find_map(|msg| msg["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("cargo reported no rowdiet executable");
+    let built = std::fs::metadata(&binary)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("{}: {e}", binary.display()));
+    // Cargo's dep-info names every source the binary was built from.
+    let dep_info = binary.with_extension("d");
+    let deps = std::fs::read_to_string(&dep_info).unwrap_or_else(|e| panic!("{}: {e}", dep_info.display()));
+    let sources = deps
+        .split_once(": ")
+        .map_or("", |(_, rest)| rest)
+        .replace("\\ ", "\u{0}");
+    for source in sources.split_whitespace().map(|s| s.replace('\u{0}', " ")) {
+        let modified = std::fs::metadata(&source).and_then(|m| m.modified());
+        if modified.is_ok_and(|time| time > built) {
+            panic!(
+                "{} is older than {source}: the measured binary would not be this checkout's",
+                binary.display()
+            );
+        }
+    }
+    binary
 }
 
 /// Analyze `sql` with the built binary and return the parsed JSON envelope.
@@ -554,7 +597,7 @@ fn create_table_sql(table: &str, columns: &[(&str, &str)]) -> String {
 #[allow(clippy::too_many_lines)]
 fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &mut Vec<String>) {
     let current: Vec<(&str, &str)> = fixture.columns.iter().map(|c| (c.name, c.sql_type)).collect();
-    let cur_table = format!("synb_{}", fixture.name);
+    let cur_table = format!("{}{}", prefix(), fixture.name);
     let report = analyze(binary, &create_table_sql(&cur_table, &current), &[]);
     let table_report = &report["analysis"]["tables"][0];
     let avoidable = table_report["avoidable_bytes_per_row"].as_f64().expect("avoidable");
@@ -591,7 +634,7 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
             .map(|n| current.iter().copied().find(|(c, _)| c == n).expect("known column"))
             .collect()
     });
-    let alt_table = format!("synb_{}_alt", fixture.name);
+    let alt_table = format!("{}{}_alt", prefix(), fixture.name);
     let mut combined = create_table_sql(&cur_table, &current);
     if let Some(alt) = &alt {
         combined.push('\n');
@@ -955,7 +998,7 @@ fn run_report_only_checks(binary: &std::path::Path, failures: &mut Vec<String>) 
         cols.push(format!("c{i}b {ty} NOT NULL"));
     }
     cols.push("note text NOT NULL".into());
-    let sql = format!("CREATE TABLE synb_cls ({});", cols.join(", "));
+    let sql = format!("CREATE TABLE {}cls ({});", prefix(), cols.join(", "));
     let value = analyze(
         binary,
         &sql,
