@@ -305,6 +305,39 @@ values, can therefore realize differently in two orders of the same table (measu
 here is per realization, and the measurement harness compares only rows both orders stored the
 same way and reports the rest.
 
+Fourth, storage strategies. `heap_fill_tuple` makes the 1-byte header only for an attribute
+whose strategy is not PLAIN (`VARLENA_ATT_IS_PACKABLE`), so under PLAIN a value that arrives with
+the 4-byte header keeps it, aligned, at any length: a `COPY` or an `UPDATE` stores it so, while a
+plain `INSERT` of a literal arrives short and stays short (measured on PostgreSQL 16.15, a PLAIN
+`varchar(5)`: `(c, s)` pads 0.500 B/row, `(s, c)` 2.000, on rows loaded by `COPY` and by
+`UPDATE`). A PLAIN column also never moves a value out of line. The fold records each column's
+strategy and whether any row since the last rewrite was written under PLAIN (`plain_rows`) or
+under a strategy that toasts (`toasted_rows`), since `SET STORAGE` changes only the rows written
+afterwards; `ALTER COLUMN ... TYPE` resets the strategy to the type's own, as PostgreSQL does, and
+keeps the history, since a binary-coercible change leaves the rows in place. A column with PLAIN
+rows is modeled long-capable whatever its typmod proves, and without the TOAST pointer when every
+row was written under PLAIN. pg-exact reads `STORAGE` on column definitions and in
+`SET STORAGE`; sqlparser does not parse the clause, so the statement is skipped loudly and the
+table makes no claim. The layout signature keeps the declared kinds, so a strategy change
+expires no baseline entry.
+
+**The settling query.** A frontier's winner turns on payload lengths, storage forms and NULLs,
+and all of them are on the heap page. Every frontier carries one read-only `SELECT` (`query.sql`
+in the JSON, printed under the frontier in the text, in a fenced block in the step summary)
+that reads each stored row with pageinspect (`heap_page_item_attrs`), replays the written order
+from the attributes (checking the replay against the tuple's own length), lays the same
+attributes out in the alternative order the way `heap_fill_tuple` places them (a 1-byte header
+or a TOAST pointer unaligned, a 4-byte header and every fixed-width value aligned, a NULL
+nowhere), and returns the rows each order stores smaller and the bytes the switch saves, in
+padding at the estimate tier and in row size at the exact tier. Every row is decided, whatever
+band it sits in, which earlier band-by-band counts could not do for a quarter of frontiers. The
+statement names the table by a string literal (`U&'...'` with escapes when the name holds a
+backslash or a line break) looked up in `pg_class`, and every column by its attribute number,
+so no identifier spelling can make it read anything else. It needs the pageinspect extension
+and superuser, reads every page, and counts dead row versions until VACUUM. The harness runs
+every printed query on its workloads and holds the answer to the paired measurement: the same
+rows, no replay mismatch, the same bytes saved.
+
 ## Suggested order
 
 Sort key of the heuristic pole: `(fixed=0 | varlena=1 | always-short=2, alignment desc,
