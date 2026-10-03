@@ -341,6 +341,25 @@ fn a_file_that_lists_a_table_twice_is_rejected() {
     assert!(serde_json::from_str::<Baseline>(garbage).is_err());
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn an_entry_whose_names_do_not_match_its_layout_is_rejected() {
+    // The delta review's lie2.json: five committed slots naming two columns silenced a block.
+    let lie = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,f1c,f4i,f2s,f1c", "columns": ["id", "flag"]}}}"#;
+    let err = serde_json::from_str::<Baseline>(lie).unwrap_err().to_string();
+    assert!(err.contains("commits 5 live column(s) but `columns` names 2"), "{err}");
+    let dropped = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,-,f4i", "columns": ["id", "x"]}}}"#;
+    assert!(
+        serde_json::from_str::<Baseline>(dropped).is_ok(),
+        "a dropped slot has no name"
+    );
+    let unnamed = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,f4i"}}}"#;
+    assert!(
+        serde_json::from_str::<Baseline>(unnamed).is_ok(),
+        "older entries carry no names"
+    );
+}
+
 #[test]
 fn drop_then_add_is_judged_as_the_appended_block() {
     // The stack review's D3-1: (id, flag, n) committed, then n dropped and (x, y, z) added.

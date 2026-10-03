@@ -35,18 +35,55 @@ pub struct Baseline {
 
 /// One table's committed layout.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "EntryOnDisk")
+)]
 pub struct BaselineEntry {
     /// The table's physical layout when it was accepted ([`crate::report::layout_signature`]).
     pub layout: CommittedLayout,
-    /// The committed columns' names in physical order, written for whoever reviews the file. The
-    /// gate reads only `layout`, so renaming a committed column keeps the entry.
+    /// The committed columns' names in physical order, written for whoever reviews the file. A
+    /// file whose names do not match the layout's live slots one for one is rejected; beyond
+    /// that the gate reads only `layout`, so renaming a committed column keeps the entry.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub columns: Vec<String>,
     /// The per-table byte allowance older files carry. It is read so those files keep loading,
     /// never written, and ignored by the gate; [`GateOutcome::ignored_allowances`] lists it.
     #[cfg_attr(feature = "serde", serde(rename = "bytes", default, skip_serializing))]
     pub legacy_bytes: Option<f64>,
+}
+
+/// An entry as read from disk, before its column names are held to its layout.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct EntryOnDisk {
+    layout: CommittedLayout,
+    #[serde(default)]
+    columns: Vec<String>,
+    #[serde(rename = "bytes", default)]
+    legacy_bytes: Option<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<EntryOnDisk> for BaselineEntry {
+    type Error = String;
+
+    fn try_from(entry: EntryOnDisk) -> Result<Self, String> {
+        let live = entry.layout.slots().iter().filter(|slot| *slot != "-").count();
+        if !entry.columns.is_empty() && entry.columns.len() != live {
+            return Err(format!(
+                "layout `{}` commits {live} live column(s) but `columns` names {}",
+                entry.layout,
+                entry.columns.len()
+            ));
+        }
+        Ok(Self {
+            layout: entry.layout,
+            columns: entry.columns,
+            legacy_bytes: entry.legacy_bytes,
+        })
+    }
 }
 
 impl BaselineEntry {

@@ -329,6 +329,7 @@ fn baseline_lifecycle() {
     );
     // Not a comma-boundary prefix of the real signature: a true non-append change.
     value["tables"]["account"]["layout"] = "f16c".into();
+    value["tables"]["account"]["columns"] = serde_json::json!(["id"]);
     std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
     let modified = gate(&[]);
     assert_eq!(modified.status.code(), Some(1));
