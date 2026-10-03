@@ -110,6 +110,8 @@ fn cargo_subcommand_shim() {
     assert_eq!(gated.status.code(), Some(1));
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn pg_exact_parser_matches_default() {
     let default_run = bin()
@@ -242,6 +244,8 @@ fn github_step_summary_file_is_appended() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// Both drive `--parser pg-exact`, which a build without the feature rejects.
+#[cfg(feature = "pg-exact")]
 #[test]
 fn baseline_is_portable_across_parser_backends() {
     // Reports key on the fold key, not the backend-dependent display spelling, so a baseline
@@ -333,4 +337,74 @@ fn explicit_file_arguments_keep_the_given_order() {
     assert!(!ordered_stdout.contains("unknown_table"), "{ordered_stdout}");
     assert!(ordered_stdout.contains("\"natts\": 2"), "{ordered_stdout}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Lines the GitHub runner would execute: a `::` command after leading whitespace, or `##[` anywhere.
+fn workflow_commands(output: &str) -> Vec<String> {
+    output
+        .split(['\n', '\r'])
+        .filter(|line| line.trim_start().starts_with("::") || line.contains("##["))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn quoted_identifiers_cannot_inject_workflow_commands_in_text_output() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--suggest", "--fail-over", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(workflow_commands(&stdout), Vec::<String>::new(), "{stdout}");
+    for shape in ["::error", "::stop-commands::", "::add-mask::"] {
+        assert!(
+            stdout.contains(&format!(r"\n{shape}")),
+            "{shape} not shown escaped:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn github_format_keeps_its_escaping_for_hostile_identifiers() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--format", "github"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains('\r'), "{stdout}");
+    for line in stdout.lines() {
+        assert!(
+            ["::warning ", "::error ", "::notice "]
+                .iter()
+                .any(|level| line.starts_with(level)),
+            "a line is not a rowdiet annotation: {line}\n{stdout}"
+        );
+    }
+    assert!(stdout.contains("c%0A::stop-commands::tok2"), "{stdout}");
+    assert!(stdout.contains("\"evil%0A::error::TYPE-NOTE\""), "{stdout}");
+}
+
+#[test]
+fn json_output_round_trips_hostile_identifiers() {
+    let out = bin()
+        .arg(fixtures("injection"))
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        workflow_commands(&String::from_utf8_lossy(&out.stdout)),
+        Vec::<String>::new()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&str> = value["analysis"]["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"evil\r\n::add-mask::secret"), "{names:?}");
+    assert!(names.contains(&"bracket ##[error]INJECTED-V1"), "{names:?}");
 }
