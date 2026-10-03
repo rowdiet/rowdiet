@@ -403,11 +403,71 @@ impl Walk {
     }
 }
 
+/// Where an order starts: the offset residues a committed prefix can end at, in rows that store
+/// every column and over every realization. A whole table starts at offset 0; an appended block
+/// starts wherever the columns before it can leave the offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Start {
+    stored: Residues,
+    any: Residues,
+}
+
+impl Start {
+    /// A whole table: offset 0 exactly.
+    pub const TABLE: Self = Self {
+        stored: Residues::START,
+        any: Residues::START,
+    };
+
+    /// The residues `prefix` can end at, storage forms, payload lengths, and NULLs included.
+    pub fn after(prefix: &[Column]) -> Self {
+        let mut start = Self::TABLE;
+        for column in prefix {
+            match column.kind {
+                ColumnKind::Fixed { len, align } => {
+                    let stored = start.any.aligned(align.bytes()).shifted(len);
+                    start = Self {
+                        stored: start.stored.aligned(align.bytes()).shifted(len),
+                        any: if column.nullable {
+                            Residues(start.any.0 | stored.0)
+                        } else {
+                            stored
+                        },
+                    };
+                }
+                ColumnKind::Varlena { .. } => {
+                    start = Self {
+                        stored: Residues::FULL,
+                        any: Residues::FULL,
+                    }
+                }
+            }
+        }
+        start
+    }
+
+    /// The reachable residues as a bitmask over 0..=7: over every realization when `nulls`, else
+    /// in rows that store every column.
+    pub fn residues(self, nulls: bool) -> u8 {
+        if nulls { self.any.0 } else { self.stored.0 }
+    }
+}
+
 /// Place `kinds` in the given order and total the padding (every column non-NULL; pads placed
 /// after the first varlena are min/max/expected ranges over the possible offset residues).
 pub fn walk(kinds: &[ColumnKind]) -> Walk {
-    let mut residues = Residues::START;
-    let mut end = Some(0u64);
+    walk_at(Start::TABLE, Some(0), kinds)
+}
+
+/// [`walk`] for an order that starts after a committed prefix, in rows that store every column.
+/// The absolute start is unknown, so no offset or end is claimed.
+pub fn walk_from(start: Start, kinds: &[ColumnKind]) -> Walk {
+    walk_at(start, None, kinds)
+}
+
+fn walk_at(start: Start, offset: Option<u64>, kinds: &[ColumnKind]) -> Walk {
+    let mut residues = start.stored;
+    let mut end = offset;
     let mut padding = 0u64;
     let mut uncertain_min = 0u64;
     let mut uncertain_max = 0u64;
@@ -463,8 +523,8 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
 /// value no payload length, storage form, or earlier NULL can change. Equals [`Walk::padding`]
 /// when no fixed column is nullable; a nullable fixed column widens the residues later columns
 /// can start at, so a pad behind one stays certain only if an alignment restores it.
-pub fn certain_padding(columns: &[Column], order: &[usize]) -> u64 {
-    let mut any = Residues::START;
+pub fn certain_padding(start: Start, columns: &[Column], order: &[usize]) -> u64 {
+    let mut any = start.any;
     let mut total = 0;
     for &index in order {
         let column = columns[index];
@@ -570,7 +630,7 @@ pub fn null_thoff(natts: usize) -> u64 {
 pub fn suggested_order(kinds: &[ColumnKind]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..kinds.len()).collect();
     order.sort_by_key(|&i| sort_key(&kinds[i], i));
-    refine_fixed_block(kinds, &mut order);
+    refine_fixed_block(kinds, &mut order, Start::TABLE);
     order
 }
 
@@ -616,10 +676,16 @@ const WHOLE_ORDER_STATE_BUDGET: usize = 1 << 20;
 /// achieves zero deterministic and zero worst-case padding is the global minimum of both
 /// objectives, so the search is complete without running.
 pub fn search(kinds: &[ColumnKind]) -> Search {
+    search_from(Start::TABLE, kinds)
+}
+
+/// [`search`] for an order that starts after a committed prefix, over the rows that store every
+/// column.
+pub fn search_from(start: Start, kinds: &[ColumnKind]) -> Search {
     let mut heuristic: Vec<usize> = (0..kinds.len()).collect();
     heuristic.sort_by_key(|&i| sort_key(&kinds[i], i));
     let heuristic_kinds: Vec<ColumnKind> = heuristic.iter().map(|&i| kinds[i]).collect();
-    let hw = walk(&heuristic_kinds);
+    let hw = walk_from(start, &heuristic_kinds);
     if hw.padding == 0 && hw.padding_max() == 0 {
         return Search {
             certainty_pole: Some(heuristic.clone()),
@@ -635,10 +701,10 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
         .try_fold(SET_STATES, usize::checked_mul)
         .unwrap_or(usize::MAX);
     if states <= WHOLE_ORDER_STATE_BUDGET {
-        let certainty = run_dp(&classes, kinds.len(), LexMode::CertaintyFirst);
-        let minimax = run_dp(&classes, kinds.len(), LexMode::WorstCaseFirst);
+        let certainty = run_dp(&classes, kinds.len(), LexMode::CertaintyFirst, start.stored);
+        let minimax = run_dp(&classes, kinds.len(), LexMode::WorstCaseFirst, start.stored);
         // The heuristic pole keeps the fixed-prefix refinement so it stays a usable candidate.
-        refine_fixed_block(kinds, &mut heuristic);
+        refine_fixed_block(kinds, &mut heuristic, start);
         return Search {
             heuristic,
             certainty_pole: Some(certainty),
@@ -647,8 +713,8 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
         };
     }
     let fixed_len = heuristic.iter().take_while(|&&i| kinds[i].is_fixed()).count();
-    let fixed_refinable = fixed_block_fits(kinds, &heuristic[..fixed_len]);
-    refine_fixed_block(kinds, &mut heuristic);
+    let fixed_refinable = fixed_block_fits(kinds, &heuristic[..fixed_len], start);
+    refine_fixed_block(kinds, &mut heuristic, start);
     let scope = if fixed_refinable && fixed_len == kinds.len() {
         // All-fixed: the fixed prefix is the whole order, so the block search is complete.
         SearchScope::Complete
@@ -665,17 +731,28 @@ pub fn search(kinds: &[ColumnKind]) -> Search {
     }
 }
 
-/// Memo bound of the fixed-block search: Π(class count + 1) × the 8 singleton residue states,
-/// at most 8M states (64 MB of memo). The bound caps cost at any column count.
+/// Memo bound of the fixed-block search: Π(class count + 1) × the residue states it can reach (8
+/// singletons from an exact start, 15 cosets after a prefix that ends anywhere), at most 8M
+/// states (64 MB of memo). The bound caps cost at any column count.
 const FIXED_BLOCK_STATE_BUDGET: usize = 1 << 23;
 
 /// Whether [`refine_fixed_block`] searches `block` (a fixed run) exactly.
-fn fixed_block_fits(kinds: &[ColumnKind], block: &[usize]) -> bool {
+fn fixed_block_fits(kinds: &[ColumnKind], block: &[usize], start: Start) -> bool {
     padding_classes(kinds, block)
         .iter()
         .map(|c| c.members.len() + 1)
-        .try_fold(SINGLETON_STATES, usize::checked_mul)
+        .try_fold(live_states(true, start.stored), usize::checked_mul)
         .is_some_and(|states| states <= FIXED_BLOCK_STATE_BUDGET)
+}
+
+/// The residue-set states a search can reach: singletons only for a fixed block from an exact
+/// start, every coset otherwise.
+fn live_states(fixed_only: bool, start: Residues) -> usize {
+    if fixed_only && start.0.count_ones() == 1 {
+        SINGLETON_STATES
+    } else {
+        SET_STATES
+    }
 }
 
 /// A dominance-complete candidate space over `columns`, or None when it exceeds `cap`.
@@ -835,7 +912,12 @@ fn generate_orders(
 /// (the never-negative-recovery induction), which makes this the decision policy's always-safe
 /// repair candidate at any width.
 pub fn refine_leading_fixed(kinds: &[ColumnKind], order: &mut [usize]) {
-    refine_fixed_block(kinds, order);
+    refine_fixed_block(kinds, order, Start::TABLE);
+}
+
+/// [`refine_leading_fixed`] for an order that starts after a committed prefix.
+pub fn refine_leading_fixed_from(start: Start, kinds: &[ColumnKind], order: &mut [usize]) {
+    refine_fixed_block(kinds, order, start);
 }
 
 /// Descending-alignment sorting leaves the fixed block zero-padding for most schemas, but with
@@ -848,21 +930,25 @@ pub fn refine_leading_fixed(kinds: &[ColumnKind], order: &mut [usize]) {
 /// was, which makes the refinement dominance-safe: with the tail sequence preserved, reducing the
 /// prefix padding reduces the total in every realization (the report layer relies on exactly
 /// this).
-fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
+fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize], start: Start) {
     let fixed_len = order.iter().take_while(|&&i| kinds[i].is_fixed()).count();
     if fixed_len < 3 {
         return;
     }
-    let block_padding = |block: &[usize]| walk(&block.iter().map(|&i| kinds[i]).collect::<Vec<_>>()).padding;
+    let block_padding = |block: &[usize]| {
+        let w = walk_from(start, &block.iter().map(|&i| kinds[i]).collect::<Vec<_>>());
+        (w.padding, w.padding_max())
+    };
     let current = block_padding(&order[..fixed_len]);
-    if current == 0 {
+    if current == (0, 0) {
         return;
     }
-    if fixed_block_fits(kinds, &order[..fixed_len]) {
+    if fixed_block_fits(kinds, &order[..fixed_len], start) {
         let classes = padding_classes(kinds, &order[..fixed_len]);
-        // An all-fixed block walks singleton states only, where deterministic and worst-case pads
-        // coincide, so either lexicographic mode reproduces the plain padding minimum.
-        let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst);
+        // From an exact start an all-fixed block walks singleton states only, where deterministic
+        // and worst-case pads coincide, so either lexicographic mode reproduces the plain padding
+        // minimum.
+        let refined = run_dp(&classes, fixed_len, LexMode::CertaintyFirst, start.stored);
         order[..fixed_len].copy_from_slice(&refined);
         return;
     }
@@ -920,17 +1006,12 @@ enum LexMode {
 /// per column, so the radix stays above it for any table under 600 million columns.
 const LEX_RADIX: u64 = 1 << 32;
 
-fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
+fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode, start: Residues) -> Vec<usize> {
     debug_assert_eq!(total, classes.iter().map(|c| c.members.len()).sum::<usize>());
     // Mixed-radix strides over the class counts: every (counts, set state) combination maps to
     // one dense memo slot, so the memo is a flat Vec of exactly the state-space bound (8 bytes
     // per state) with no hashing and no rehash growth.
-    // A fixed-only block starts at offset 0 and only ever reaches singleton residue sets.
-    let live_states = if classes.iter().all(|c| matches!(c.key, ClassKey::Fixed { .. })) {
-        SINGLETON_STATES
-    } else {
-        SET_STATES
-    };
+    let live_states = live_states(classes.iter().all(|c| matches!(c.key, ClassKey::Fixed { .. })), start);
     let mut strides = Vec::with_capacity(classes.len());
     let mut bound = live_states;
     for class in classes {
@@ -975,7 +1056,7 @@ fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
     }
     let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
     let mut base = bound - live_states;
-    let mut state = set_state_index(Residues::START) as usize;
+    let mut state = set_state_index(start) as usize;
     let mut queues: Vec<std::collections::VecDeque<usize>> =
         classes.iter().map(|c| c.members.iter().copied().collect()).collect();
     let mut refined = Vec::with_capacity(total);
