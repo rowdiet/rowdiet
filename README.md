@@ -13,11 +13,11 @@ WebAssembly, with draggable byte rulers; nothing leaves the page.
 
 ```
 $ rowdiet migrations/ --rows 10000000 --suggest
-■ account (V1__init.sql:1) — 6 columns — estimate — gates on deterministic and dominance-proven padding; expected values are display-only (short-form, uniform-offset model)
+■ account (V1__init.sql:1) — 6 columns — estimate — gates on deterministic and dominance-proven padding over every storage form, payload length, and NULL; expected values are display-only (short-form, uniform-offset, no-NULL model)
   current  : 14.5 B/row expected padding (13 B deterministic, range 13-16, data-dependent)
   suggested: 0.0 B/row expected padding (0 B deterministic, range 0-1, data-dependent) → 16.0 B/row avoidable (13 B deterministic + 3 B dominance-proven; saves 12-16 B/row in every realization)
   order    : id, balance, flags, kind, active, note
-  × 10000000 rows ≈ 160.0 MB
+  × 10000000 rows ≈ 120.0 MB to 160.0 MB
   -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):
   CREATE TABLE account (
       id BIGINT NOT NULL,
@@ -69,6 +69,7 @@ cargo rowdiet migrations/        # installs a cargo subcommand too (cargo-rowdie
 rowdiet migrations/                          # report
 rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row (fractions allowed)
 rowdiet migrations/ --fail-over 0 --fail-on-degraded   # also fail when statements were skipped
+rowdiet migrations/ --fail-over 0 --fail-on-budgeted   # also fail when a dominance search hit its budget
 rowdiet migrations/ --format github          # GitHub Actions annotations
 rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
@@ -93,7 +94,10 @@ a `-- rowdiet:ignore` comment inside the `CREATE TABLE` statement — the marker
 comments (never in string literals), and a marker that ends up attached to no statement gets a
 note instead of vanishing. Skipped statements, incomplete tables, and empty scans are reported
 in the gate summary either way; `--fail-on-degraded` turns them into a failure (recommended
-under `--parser pg-exact`, where skips should be zero).
+under `--parser pg-exact`, where skips should be zero). Tables whose dominance search hit its
+budget are counted too: their findings stand, but a clean verdict there covers only the orders
+searched, and `--fail-on-budgeted` turns them into a failure. Budgets bind on many ordinary
+tables of eight or more columns, which is why that flag is separate.
 
 `--format github` emits runner-safe annotations: property values and messages are
 workflow-command-escaped, and output respects the runner's 10-annotations-per-severity cap with
@@ -157,11 +161,13 @@ rowdiet therefore reports per table:
 
 - **exact tier** (only fixed-width columns): the headline is the **MAXALIGN-rounded footprint
   delta** and rows-per-8kB-page. A reorder that removes padding but doesn't cross an 8-byte rung
-  reports **0 avoidable bytes** by design (raw padding is still shown).
+  reports **0 avoidable bytes** by design (raw padding is still shown). With nullable columns
+  the tier is exact per NULL pattern, and a reorder is recommended only when no row of any NULL
+  pattern gets larger.
 - **estimate tier** (any varlena): the gate and the reorder advice rest only on
   realization-independent facts. A reorder is recommended when it **dominates** the current
-  order (total padding never worse in any storage form or payload length, strictly better in
-  at least one), and the gated number is the deterministic padding it removes plus the
+  order (total padding never worse in any storage form, payload length, or NULL pattern,
+  strictly better in at least one), and the gated number is the deterministic padding it removes plus the
   dominance-proven worst-case waste, shown with its guaranteed-to-maximum range. When neither
   order dominates — say a text and a `float8[]` competing for the one guaranteed-aligned slot,
   where payload sizes decide the winner — the table shows a **frontier** instead: both orders,
@@ -175,6 +181,18 @@ rowdiet therefore reports per table:
   From `varchar(6)` on, a value can pass 20 bytes in 4-byte UTF-8 and a wide row's toaster can
   compress it in line behind an aligned 4-byte header, so it is modeled like any other varlena
   (measured: `varchar(10)` compressed by pglz and `varchar(6)` by lz4 on PostgreSQL 16.15).
+
+NULLs count as realizations too. A row that holds NULL in a nullable column stores neither the
+value nor its pad, so every later column starts somewhere else in that row: a reorder that is
+better when every column is stored can lose bytes in rows with NULLs, and a layout that pads
+nothing when every column is stored can pad in them. rowdiet compares orders over every NULL
+pattern, prints the rows without NULLs beside the range where they differ, and names the
+columns whose NULLs move later offsets; `NOT NULL` removes such a variable, which can turn a
+frontier into a proven reorder. A NULL text is a 7-byte text as far as offsets go, so nullable
+texts add nothing here; a NULL `numeric` or array is a step no stored value of those types
+takes, so they are listed. Fixed-width tables with nullable columns report the row size of
+NULL-carrying rows separately, header included: past eight columns the null bitmap takes the
+header from 24 to 32 bytes.
 
 The suggested order starts from: fixed columns before varlena, alignment descending,
 irregular-size types (`timetz`, `macaddr`) at the end of their group, varlenas
