@@ -2074,6 +2074,24 @@ mod null_masks {
     }
 
     #[test]
+    fn zero_cost_candidates_spend_no_sweep_budget() {
+        // Seven nullable or irregular fixed columns: comparing every member of the order space
+        // with NULL bits in flight exhausts the sweep's work budget, but the orders that cost
+        // nothing in row size under every NULL pattern are proven without a comparison, which
+        // keeps the sweep, and so the verdict, exhaustive.
+        for sql in [
+            "CREATE TABLE t (c0 integer NOT NULL, c1 timetz NOT NULL, c2 uuid, c3 timetz NOT NULL, \
+             c4 smallint NOT NULL, c5 integer, c6 uuid NOT NULL);",
+            "CREATE TABLE t (c0 macaddr, c1 integer, c2 uuid NOT NULL, c3 integer, c4 boolean NOT NULL, c5 bigint);",
+        ] {
+            let t = one(sql);
+            assert_eq!(t.tier, Tier::Exact);
+            assert_eq!(t.avoidable_bytes_per_row, 8.0, "{sql}");
+            assert_eq!(t.dominance_search, DominanceScope::Exhaustive, "{sql}");
+        }
+    }
+
+    #[test]
     fn wide_nullable_tables_keep_the_finding_past_every_budget() {
         // 24 and 30 nullable regular columns written in a padding order: the pair comparison is
         // out of every budget (more NULL bits in flight than the joint walk holds), but the
