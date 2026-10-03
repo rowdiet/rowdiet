@@ -80,6 +80,8 @@ pub struct TableReport {
     pub incomplete: bool,
     /// How solid the numbers are; see [`Tier`].
     pub tier: Tier,
+    /// The relation's name parts, schema first, as SQL addresses it.
+    pub relation: Vec<String>,
     /// Live column count (dropped attribute slots are in `dropped_columns`).
     pub natts: usize,
     /// Some column is nullable: rows holding a NULL carry a null bitmap in their header.
@@ -279,6 +281,8 @@ pub struct Frontier {
     /// The comparison in rows that store every column, over every storage form and payload,
     /// when it differs from the comparison over every NULL pattern.
     pub without_nulls: Option<NullFreeComparison>,
+    /// The SQL that settles this frontier on real rows, and how to read its answer.
+    pub query: Option<crate::resolve::FrontierQuery>,
 }
 
 /// A frontier's verdict in rows without NULLs.
@@ -717,6 +721,7 @@ fn frontier_report(
         decided,
         bands,
         without_nulls,
+        query: None,
     }
 }
 
@@ -820,7 +825,22 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     };
     let frontier = decision.frontier_order.as_ref().map(|alternative| {
         let names: Vec<String> = table.columns.iter().map(|c| c.display.clone()).collect();
-        frontier_report(Start::TABLE, &columns, &names, &current_walk, alternative, measure)
+        let mut frontier = frontier_report(Start::TABLE, &columns, &names, &current_walk, alternative, measure);
+        let query_columns: Vec<crate::resolve::QueryColumn> = table
+            .columns
+            .iter()
+            .zip(&kinds)
+            .map(|(c, &kind)| crate::resolve::QueryColumn { attnum: c.attnum, kind })
+            .collect();
+        let written: Vec<usize> = (0..kinds.len()).collect();
+        frontier.query = Some(crate::resolve::query(
+            &table.relation,
+            &query_columns,
+            &written,
+            alternative,
+            measure,
+        ));
+        frontier
     });
     let suggested_order = final_order.iter().map(|&i| table.columns[i].display.clone()).collect();
     let null_variables = table
@@ -883,6 +903,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         ignored: table.ignored,
         incomplete: table.incomplete,
         tier,
+        relation: table.relation.clone(),
         natts: kinds.len(),
         any_nullable,
         null_variables,
@@ -1017,10 +1038,29 @@ pub fn block_finding(table: &TableReport, committed_slots: usize) -> Option<Bloc
     } else {
         decision.order
     };
-    let frontier = decision
-        .frontier_order
-        .as_ref()
-        .map(|alternative| frontier_report(start, block, &names, &walk, alternative, measure));
+    let frontier = decision.frontier_order.as_ref().map(|alternative| {
+        let mut frontier = frontier_report(start, block, &names, &walk, alternative, measure);
+        let query_columns: Vec<crate::resolve::QueryColumn> = table
+            .columns
+            .iter()
+            .map(|c| crate::resolve::QueryColumn {
+                attnum: c.attnum,
+                kind: c.kind,
+            })
+            .collect();
+        let current: Vec<usize> = (0..table.columns.len()).collect();
+        let whole: Vec<usize> = (0..prefix_columns)
+            .chain(alternative.iter().map(|&i| prefix_columns + i))
+            .collect();
+        frontier.query = Some(crate::resolve::query(
+            &table.relation,
+            &query_columns,
+            &current,
+            &whole,
+            measure,
+        ));
+        frontier
+    });
     let mut origins: Vec<Origin> = Vec::new();
     for column in &table.columns[prefix_columns..] {
         if !origins.contains(&column.added_in) {

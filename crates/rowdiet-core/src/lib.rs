@@ -31,6 +31,7 @@ pub mod fold;
 pub mod fs;
 pub mod layout;
 pub mod report;
+pub mod resolve;
 pub mod split;
 pub mod version;
 

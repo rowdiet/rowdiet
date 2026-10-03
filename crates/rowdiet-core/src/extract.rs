@@ -16,6 +16,10 @@ pub struct RawName {
     /// Identity: unquoted parts case-folded. Tables keep their qualification (`a.things`);
     /// type names are keyed by their last component.
     pub key: String,
+    /// A table name's folded parts, schema first: the key joins them with `.`, which a quoted
+    /// part can contain too, so SQL that names the relation needs them apart. Empty for other
+    /// names.
+    pub parts: Vec<String>,
 }
 
 /// One column definition as parsed from `CREATE TABLE` / `ADD COLUMN`.
@@ -235,6 +239,7 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
                 new: RawName {
                     display: rename.new_name.value.clone(),
                     key: ident_key(&rename.new_name),
+                    parts: Vec::new(),
                 },
             }],
             _ => vec![DdlOp::Irrelevant],
@@ -338,6 +343,7 @@ fn map_alter_table(at: sq::AlterTable) -> Vec<DdlOp> {
                     new: RawName {
                         display: format!("{}.{}", schema.display, new.display),
                         key: format!("{}.{}", schema.key, new.key),
+                        parts: schema.parts.into_iter().chain(new.parts).collect(),
                     },
                 }
             }
@@ -451,10 +457,11 @@ fn map_create_type(name: &sq::ObjectName, representation: Option<sq::UserDefined
     }
 }
 
-/// Postgres folds unquoted identifiers to lowercase; quoted ones are verbatim.
+/// Postgres folds unquoted identifiers to lowercase, ASCII letters only; quoted ones are
+/// verbatim.
 fn ident_key(id: &sq::Ident) -> String {
     match id.quote_style {
-        None => id.value.to_lowercase(),
+        None => id.value.to_ascii_lowercase(),
         Some(_) => id.value.clone(),
     }
 }
@@ -472,6 +479,7 @@ fn raw_name(name: &sq::ObjectName) -> RawName {
     RawName {
         display: name.to_string(),
         key,
+        parts: Vec::new(),
     }
 }
 
@@ -496,6 +504,7 @@ fn table_name(name: &sq::ObjectName) -> RawName {
     RawName {
         display: name.to_string(),
         key,
+        parts,
     }
 }
 
