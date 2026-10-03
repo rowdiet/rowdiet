@@ -565,3 +565,71 @@ fn null_variable_names_print_escaped() {
         "{rendered}"
     );
 }
+
+#[test]
+fn block_lines_print_no_workflow_command() {
+    // The stack review's D2-3b/c: a block column and a baseline key that each carry a newline
+    // and a workflow command.
+    let analysis = analyze(
+        "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
+         ALTER TABLE t ADD COLUMN \"x\n::error file=x.sql,line=1::rowdiet passed\" boolean NOT NULL;
+         ALTER TABLE t ADD COLUMN f bigint NOT NULL;
+         ALTER TABLE t ADD COLUMN g boolean NOT NULL;
+         ALTER TABLE t ADD COLUMN h bigint NOT NULL;",
+    );
+    let mut base = Baseline {
+        rowdiet: "test".into(),
+        fail_over: 0.0,
+        tables: [(
+            "t".to_string(),
+            BaselineEntry::new(baseline::CommittedLayout::parse("f4i,f8d").unwrap()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let mut ghost = BaselineEntry::new(baseline::CommittedLayout::parse("f8d").unwrap());
+    ghost.legacy_bytes = Some(1.0);
+    base.tables
+        .insert("ghost\n::warning file=y.sql,line=1::injected".to_string(), ghost);
+    let outcome = baseline::evaluate(&analysis, None, false, Some(&base));
+    let rendered = text(&analysis, None, false, &outcome);
+    assert!(rendered.contains("block order: f, h, x\\n::error"), "{rendered}");
+    assert!(rendered.contains("ghost\\n::warning"), "{rendered}");
+    let commands = rendered.lines().filter(|l| l.trim_start().starts_with("::")).count();
+    assert_eq!(commands, 0, "{rendered}");
+}
+
+#[test]
+fn a_block_from_two_migrations_names_both() {
+    let analysis = analyze_sources(
+        &[
+            SqlSource::new("V1__t.sql", "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);"),
+            SqlSource::new("V2__u.sql", "ALTER TABLE t ADD COLUMN e boolean NOT NULL;"),
+            SqlSource::new("V3__w.sql", "ALTER TABLE t ADD COLUMN f bigint NOT NULL;"),
+        ],
+        &Config::default(),
+    );
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    assert!(
+        rendered.contains("appended block (V2__u.sql:1, V3__w.sql:1, 2 column(s) after a committed prefix of 2)"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn drop_then_add_reports_the_block_behind_the_dropped_slot() {
+    let analysis = analyze(
+        "CREATE TABLE t (id bigint NOT NULL, flag boolean NOT NULL, n smallint NOT NULL);
+         ALTER TABLE t DROP COLUMN n;
+         ALTER TABLE t ADD COLUMN x smallint NOT NULL, ADD COLUMN y integer NOT NULL, ADD COLUMN z boolean NOT NULL;",
+    );
+    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f8d,f1c,f2s")]));
+    assert!(
+        rendered.contains("3 column(s) after a committed prefix of 2 and 1 dropped slot(s)) is not dominance-optimal"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("block order: z, x, y → 8.0 B/row avoidable"),
+        "{rendered}"
+    );
+}
