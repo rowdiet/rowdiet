@@ -192,6 +192,8 @@ pub struct FoldedTable {
     /// Fold key: case-folded, qualification kept — the identity ALTERs address and baselines
     /// key on.
     pub key: String,
+    /// The relation's folded name parts, schema first, as SQL addresses it.
+    pub relation: Vec<String>,
     /// The statement that created the table (the latest CREATE when redefined).
     pub origin: Origin,
     /// Statements that changed the table after creation (consecutive duplicates collapsed).
@@ -431,9 +433,15 @@ impl Folder {
                 incomplete = true;
             }
         }
+        let relation = if name.parts.is_empty() {
+            vec![name.key.clone()]
+        } else {
+            name.parts.clone()
+        };
         let mut table = FoldedTable {
             display: name.display,
             key: name.key.clone(),
+            relation,
             origin: origin.clone(),
             altered_in: Vec::new(),
             ignored: ignore_marker,
@@ -548,6 +556,10 @@ impl Folder {
             self.order.retain(|key| key != &new.key);
         }
         let mut entry = self.tables.remove(&table.key).expect("checked above");
+        // RENAME TO names the relation only; it stays in its schema.
+        if let Some(last) = entry.relation.last_mut() {
+            last.clone_from(new.parts.last().unwrap_or(&new.key));
+        }
         entry.key.clone_from(&new.key);
         entry.display = new.display;
         mark_altered(&mut entry, origin);
