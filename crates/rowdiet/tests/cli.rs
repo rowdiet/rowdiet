@@ -563,3 +563,25 @@ fn frontier_band_and_unverified_type_names_print_escaped() {
         "{stdout}"
     );
 }
+
+#[test]
+fn budgeted_searches_gate_only_under_fail_on_budgeted() {
+    let dir = std::env::temp_dir().join(format!("rowdiet-cli-test-{}-budgeted", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cols: Vec<String> = (0..12).map(|i| format!("t{i} text, i{i} integer NOT NULL")).collect();
+    std::fs::write(
+        dir.join("V1__wide.sql"),
+        format!("CREATE TABLE wide ({});", cols.join(", ")),
+    )
+    .unwrap();
+    let lenient = bin().arg(&dir).args(["--fail-over", "1000"]).output().unwrap();
+    assert_eq!(lenient.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&lenient.stdout).contains("budgeted: 1 table(s)"));
+    let strict = bin()
+        .arg(&dir)
+        .args(["--fail-over", "1000", "--fail-on-budgeted"])
+        .output()
+        .unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

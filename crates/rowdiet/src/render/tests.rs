@@ -467,7 +467,7 @@ fn estimate_line_shows_the_no_null_range_when_it_differs() {
 }
 
 #[test]
-fn a_budgeted_search_is_reported_as_degraded() {
+fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
     let cols: Vec<String> = (0..12).map(|i| format!("t{i} text, i{i} integer NOT NULL")).collect();
     let analysis = analyze(&format!("CREATE TABLE wide ({});", cols.join(", ")));
     assert!(
@@ -475,16 +475,17 @@ fn a_budgeted_search_is_reported_as_degraded() {
         "{:?}",
         analysis.tables[0].dominance_search
     );
-    let outcome = gate(&analysis, Some(1000.0));
+    let mut outcome = gate(&analysis, Some(1000.0));
     assert_eq!(outcome.budgeted_tables, 1);
-    assert!(outcome.degraded());
+    assert!(!outcome.degraded(), "a budget is not a parse degradation");
     let rendered = text(&analysis, None, false, &outcome);
     assert!(
-        rendered.contains("1 table(s) with a budgeted dominance search"),
+        rendered.contains("budgeted: 1 table(s) where the dominance search hit its budget"),
         "{rendered}"
     );
-    let strict = baseline::evaluate(&analysis, Some(1000.0), true, None);
-    assert!(strict.exceeded, "--fail-on-degraded fails on a budgeted search");
+    assert!(!outcome.exceeded);
+    outcome.fail_on_budgeted();
+    assert!(outcome.exceeded, "--fail-on-budgeted fails on a budgeted search");
 }
 
 #[test]

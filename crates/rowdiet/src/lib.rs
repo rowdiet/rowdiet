@@ -52,6 +52,10 @@ struct Cli {
     /// Also exit 1 when statements were skipped or tables are incomplete (degraded analysis)
     #[arg(long)]
     fail_on_degraded: bool,
+    /// Also exit 1 when some table's dominance search hit its budget, where a clean verdict
+    /// covers only the searched candidates
+    #[arg(long)]
+    fail_on_budgeted: bool,
 }
 
 /// A permissive f64 parser would accept `nan` and `inf`, both of which make every `avoidable >
@@ -118,7 +122,10 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         Some(path) => Some(load_baseline(path)?),
         None => None,
     };
-    let gate = baseline::evaluate(&analysis, cli.fail_over, cli.fail_on_degraded, loaded.as_ref());
+    let mut gate = baseline::evaluate(&analysis, cli.fail_over, cli.fail_on_degraded, loaded.as_ref());
+    if cli.fail_on_budgeted {
+        gate.fail_on_budgeted();
+    }
     let shown_fail_over = cli.fail_over.or_else(|| loaded.as_ref().map(|b| b.fail_over));
     let output = match cli.format {
         Format::Text => render::text(&analysis, cli.rows, cli.suggest, &gate),

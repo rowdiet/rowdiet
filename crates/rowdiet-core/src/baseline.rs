@@ -141,8 +141,9 @@ pub struct GateOutcome {
     pub skipped_statements: usize,
     /// Non-ignored tables marked incomplete (skipped or unexpanded DDL touched them).
     pub incomplete_tables: usize,
-    /// Non-ignored complete tables whose dominance search ran out of budget: a clean verdict
-    /// there says only that the searched candidates hold no dominating reorder.
+    /// Non-ignored complete tables whose dominance search ran out of budget: findings there
+    /// stand, but a clean verdict says only that the searched candidates hold no dominating
+    /// reorder. [`fail_on_budgeted`](Self::fail_on_budgeted) turns them into a failure.
     pub budgeted_tables: usize,
     /// Scanned paths that matched no SQL files at all — a typo'd migrations directory would
     /// otherwise gate green forever having analyzed nothing.
@@ -157,20 +158,26 @@ pub struct GateOutcome {
 }
 
 impl GateOutcome {
-    /// True when the analysis degraded: statements were skipped, tables are incomplete, a
-    /// table's dominance search was budgeted, or a scanned path matched no SQL files. This is
-    /// exactly the condition `fail_on_degraded` escalates to a failure; without that flag it stays
-    /// visible here while the gate stays green.
+    /// True when the analysis degraded: statements were skipped, tables are incomplete, or a
+    /// scanned path matched no SQL files. This is exactly the condition `fail_on_degraded`
+    /// escalates to a failure; without that flag it stays visible here while the gate stays
+    /// green.
     pub fn degraded(&self) -> bool {
-        self.skipped_statements > 0 || self.incomplete_tables > 0 || self.budgeted_tables > 0 || self.empty_scans > 0
+        self.skipped_statements > 0 || self.incomplete_tables > 0 || self.empty_scans > 0
+    }
+
+    /// Fail the gate when some table's dominance search was budgeted. Separate from
+    /// `fail_on_degraded` because a budget binds on ordinary tables (42% of a 3,000-table corpus
+    /// of 4 to 8 realistic columns), while a parser skip is rare and fixable.
+    pub fn fail_on_budgeted(&mut self) {
+        self.exceeded |= self.budgeted_tables > 0;
     }
 }
 
 /// Gate an analysis. An explicit `fail_over` wins over the baseline file's recorded one; with
 /// neither present nothing can fail. Ignored tables are outside both gate and baseline.
 /// `fail_on_degraded` additionally fails the gate when statements were skipped, tables are
-/// incomplete, a dominance search was budgeted, or a scanned path matched no SQL files — without
-/// it those are surfaced in the
+/// incomplete, or a scanned path matched no SQL files — without it those are surfaced in the
 /// outcome but stay green (a sqlparser user cannot always fix a parser gap; under pg-exact
 /// skips should be zero, so strict is cheap).
 pub fn evaluate(

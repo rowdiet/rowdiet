@@ -65,8 +65,15 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
     if gate.degraded() {
         let _ = writeln!(
             out,
-            "degraded: {} statement(s) skipped, {} table(s) incomplete, {} table(s) with a budgeted dominance search, {} path(s) matched no SQL files — pass --fail-on-degraded to gate on this",
-            gate.skipped_statements, gate.incomplete_tables, gate.budgeted_tables, gate.empty_scans
+            "degraded: {} statement(s) skipped, {} table(s) incomplete, {} path(s) matched no SQL files — pass --fail-on-degraded to gate on this",
+            gate.skipped_statements, gate.incomplete_tables, gate.empty_scans
+        );
+    }
+    if gate.budgeted_tables > 0 {
+        let _ = writeln!(
+            out,
+            "budgeted: {} table(s) where the dominance search hit its budget; findings there stand, clean verdicts cover the searched candidates only — pass --fail-on-budgeted to gate on this",
+            gate.budgeted_tables
         );
     }
     if gate.exceeded {
