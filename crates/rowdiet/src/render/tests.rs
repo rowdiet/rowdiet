@@ -343,3 +343,39 @@ fn json_keeps_names_exact_without_the_bracket_prefix() {
     let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(value["analysis"]["tables"][0]["name"], "t ##[error]x\n");
 }
+
+#[test]
+fn suggested_ddl_keeps_hostile_table_and_type_names() {
+    let analysis = analyze(concat!(
+        "CREATE DOMAIN \"dom\n::error::D\" AS bigint;\n",
+        "CREATE TABLE \"t\n::error::T\" (a boolean NOT NULL, b \"dom\n::error::D\" NOT NULL, ",
+        "c boolean NOT NULL, d bigint NOT NULL);",
+    ));
+    let rendered = text(&analysis, None, true, &gate(&analysis, None));
+    assert!(command_lines(&rendered).is_empty(), "{rendered}");
+    assert!(
+        rendered.contains(r#"  CREATE TABLE U&"t\000A::error::T" ("#),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"      b U&"dom\000A::error::D" NOT NULL,"#),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_backslash_prints_doubled_so_it_never_reads_as_an_escape() {
+    let analysis = analyze("CREATE TABLE \"lit\\n\" (a int NOT NULL); CREATE TABLE \"real\n\" (a int NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    assert!(rendered.contains(r#"✓ "lit\\n" "#), "{rendered}");
+    assert!(rendered.contains(r#"✓ "real\n" "#), "{rendered}");
+}
+
+#[test]
+fn sql_spelling_quotes_only_what_needs_it() {
+    assert_eq!(sql_spelling(r#"public."A""b""#).as_deref(), Some(r#"public."A""b""#));
+    assert_eq!(sql_spelling("\"a\nb\"[]").as_deref(), Some(r#"U&"a\000Ab"[]"#));
+    assert_eq!(sql_spelling("\"x##[y\"").as_deref(), Some(r#"U&"x##\005By""#));
+    assert_eq!(sql_spelling("bare\u{2028}name"), None);
+    assert_eq!(sql_spelling("\"open"), None);
+}

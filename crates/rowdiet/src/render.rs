@@ -372,22 +372,58 @@ fn render_suggestion(out: &mut String, t: &TableReport) {
         out,
         "  -- rowdiet suggestion (column order only — re-attach defaults/constraints/options):"
     );
-    let _ = writeln!(out, "  CREATE TABLE {} (", escape_text(&t.display));
     let by_name: BTreeMap<&str, &ColumnReport> = t.columns.iter().map(|c| (c.name.as_str(), c)).collect();
-    let last = t.suggested_order.len().saturating_sub(1);
-    for (i, name) in t.suggested_order.iter().enumerate() {
-        if let Some(col) = by_name.get(name.as_str()) {
-            let not_null = if col.not_null { " NOT NULL" } else { "" };
-            let comma = if i == last { "" } else { "," };
-            let _ = writeln!(
-                out,
-                "      {} {}{not_null}{comma}",
-                maybe_quote(name),
-                escape_text(&col.type_display)
-            );
-        }
+    let columns: Option<Vec<(String, String, bool)>> = t
+        .suggested_order
+        .iter()
+        .filter_map(|name| by_name.get(name.as_str()))
+        .map(|col| sql_spelling(&col.type_display).map(|ty| (maybe_quote(&col.name), ty, col.not_null)))
+        .collect();
+    let (Some(table), Some(columns)) = (sql_spelling(&t.display), columns) else {
+        let _ = writeln!(
+            out,
+            "  -- withheld: a table or type name here has characters a log line cannot carry; see the order line"
+        );
+        return;
+    };
+    let _ = writeln!(out, "  CREATE TABLE {table} (");
+    let last = columns.len().saturating_sub(1);
+    for (i, (name, ty, not_null)) in columns.iter().enumerate() {
+        let not_null = if *not_null { " NOT NULL" } else { "" };
+        let comma = if i == last { "" } else { "," };
+        let _ = writeln!(out, "      {name} {ty}{not_null}{comma}");
     }
     let _ = writeln!(out, "  );");
+}
+
+/// A name or type spelling as SQL that names the same object on one log line: every quoted
+/// identifier needing escapes becomes `U&"..."`. None when an escape would fall outside quotes.
+fn sql_spelling(spelling: &str) -> Option<String> {
+    let mut out = String::with_capacity(spelling.len());
+    let mut chars = spelling.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        let mut ident = String::new();
+        loop {
+            match chars.next()? {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    ident.push('"');
+                }
+                '"' => break,
+                c => ident.push(c),
+            }
+        }
+        if matches!(escape_text(&ident), Cow::Owned(_)) {
+            out.push_str(&unicode_quote(&ident));
+        } else {
+            let _ = write!(out, "\"{}\"", ident.replace('"', "\"\""));
+        }
+    }
+    matches!(escape_text(&out.replace('\\', "")), Cow::Borrowed(_)).then_some(out)
 }
 
 fn maybe_quote(ident: &str) -> String {
@@ -423,14 +459,16 @@ fn unicode_quote(ident: &str) -> String {
     out
 }
 
-/// One log line with no workflow command in it: control characters and `##[` print as escapes.
+/// One log line with no workflow command in it: control characters and `##[` print as escapes,
+/// and a backslash doubles so an escape never reads like a name's own text.
 pub(crate) fn escape_text(s: &str) -> Cow<'_, str> {
-    if !s.chars().any(is_line_hazard) && !s.contains("##[") {
+    if !s.chars().any(|c| c == '\\' || is_line_hazard(c)) && !s.contains("##[") {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
+            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
