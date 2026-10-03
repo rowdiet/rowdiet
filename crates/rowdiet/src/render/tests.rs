@@ -514,6 +514,25 @@ fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
     assert!(!outcome.exceeded);
     outcome.fail_on_budgeted();
     assert!(outcome.exceeded, "--fail-on-budgeted fails on a budgeted search");
+    let rendered = text(&analysis, None, false, &outcome);
+    assert!(
+        rendered.contains("FAIL: 1 table(s) with a budgeted dominance search (--fail-on-budgeted)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("--fail-on-degraded)"), "{rendered}");
+}
+
+#[test]
+fn a_budgeted_clean_table_that_can_pad_is_not_checked_off() {
+    // Certain padding left behind a budgeted dominance search, as behind a capped order search.
+    let analysis = analyze(
+        "CREATE TABLE g990 (c0 int2, c1 varchar(20) NOT NULL, c2 int8, c3 text, c4 timestamptz, \
+         c5 uuid, c6 int2, c7 int4);",
+    );
+    let t = &analysis.tables[0];
+    assert!(t.budgeted() && t.avoidable_bytes_per_row == 0.0 && t.current.padding > 0);
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.starts_with("◐ g990"), "{rendered}");
 }
 
 #[test]

@@ -90,8 +90,14 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         if modified > 0 {
             parts.push(format!("{modified} modified since baseline"));
         }
-        if parts.is_empty() {
+        if gate.failed_on_degraded {
             parts.push("degraded analysis (--fail-on-degraded)".to_string());
+        }
+        if gate.failed_on_budgeted {
+            parts.push(format!(
+                "{} table(s) with a budgeted dominance search (--fail-on-budgeted)",
+                gate.budgeted_tables
+            ));
         }
         let _ = writeln!(out, "FAIL: {}", parts.join(", "));
     }
@@ -138,8 +144,10 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         return;
     }
     if t.avoidable_bytes_per_row == 0.0 {
-        // Certain padding a capped search left in place is not a clean result.
-        let capped_waste = t.search_scope != SearchScope::Complete && t.current.padding > 0;
+        // Certain padding a capped search left in place is not a clean result, and neither is
+        // padding a budgeted dominance search could not rule out.
+        let capped_waste = t.current.padding > 0
+            && (t.search_scope != SearchScope::Complete || t.dominance_search == DominanceScope::Budgeted);
         let detail = match (t.tier, t.current.padding) {
             (Tier::Estimate, _) => format!("{}, {}{}", stats_line(&t.current), verdict_phrase(t), scope_note(t)),
             (Tier::Exact, _) if t.current.with_nulls.is_some() && t.current.padding_max == 0 => {
