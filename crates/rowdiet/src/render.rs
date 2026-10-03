@@ -246,7 +246,7 @@ fn verdict_phrase(t: &TableReport) -> String {
         DominanceScope::Budgeted => "no dominating reorder found (dominance search budgeted)".to_string(),
         DominanceScope::Superset => format!(
             "no dominating reorder found (payload lengths unverified for {})",
-            t.superset_types.join(", ")
+            escape_text(&t.superset_types.join(", "))
         ),
     }
 }
@@ -268,7 +268,7 @@ fn render_frontier(out: &mut String, t: &TableReport) {
     let _ = writeln!(
         out,
         "  frontier : {} — worst case {} B/row vs current {} B/row (workload-dependent, not gated)",
-        frontier.order.join(", "),
+        escape_text(&frontier.order.join(", ")),
         frontier.alternative_worst,
         frontier.current_worst
     );
@@ -294,8 +294,8 @@ fn render_frontier(out: &mut String, t: &TableReport) {
         }
         let condition = match band.long_form.as_slice() {
             [] => "when every varlena stays short or TOAST".to_string(),
-            [one] => format!("when {one} stores long form"),
-            many => format!("when {} store long form", many.join(", ")),
+            [one] => format!("when {} stores long form", escape_text(one)),
+            many => format!("when {} store long form", escape_text(&many.join(", "))),
         };
         let line = match band.winner {
             BandWinner::Alternative => Some(format!(

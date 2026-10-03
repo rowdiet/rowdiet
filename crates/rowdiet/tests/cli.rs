@@ -544,3 +544,22 @@ fn json_output_round_trips_hostile_identifiers() {
     assert!(names.contains(&"evil\r\n::add-mask::secret"), "{names:?}");
     assert!(names.contains(&"bracket ##[error]INJECTED-V1"), "{names:?}");
 }
+
+#[test]
+fn frontier_band_and_unverified_type_names_print_escaped() {
+    let out = bin().arg(fixtures("injection/V3__frontier.sql")).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(workflow_commands(&stdout), Vec::<String>::new(), "{stdout}");
+    assert!(
+        stdout.contains(r"frontier : t1\n::error::FRONTIER, v##\u{5b}error]BAND, t2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r"when v##\u{5b}error]BAND stores long form"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#"payload lengths unverified for "evil\n::error::UNVERIFIED-TYPE""#),
+        "{stdout}"
+    );
+}
