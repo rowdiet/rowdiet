@@ -9,7 +9,7 @@
 //! ([`Payload`](crate::layout::Payload): any for text, even for numeric, `4 + k * stride` for
 //! arrays); a long value may be compressed and reaches every residue. Order A **dominates**
 //! order B when A's total padding is less than or equal to B's in every realization, and
-//! strictly less in at least one — a claim that needs no payload knowledge, which is why the
+//! strictly less in at least one: a claim that needs no payload knowledge, which is why the
 //! gate and the recommender may act on it (see docs/design.md).
 //!
 //! Two exact engines compute the bounds of `pad(A) − pad(B)` over all realizations:

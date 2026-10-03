@@ -329,7 +329,7 @@ fn builtin(key: &str, char_len: Option<u64>) -> Option<Resolved> {
         // Fixed-size structs (inet) or typmod-sized bit strings this table does not size.
         "inet" | "cidr" | "bit" => varlena(Align::Int, Payload::UNVERIFIED),
         // typmod can PROVE short form: n <= 31 chars is at most 4*31+1 = 125 bytes even in
-        // worst-case UTF-8, under the 127-byte short-varlena limit — stored unaligned when
+        // worst-case UTF-8, under the 127-byte short-varlena limit, so stored unaligned when
         // uncompressed. Past 20 payload bytes (n >= 6 in 4-byte UTF-8) the toaster may compress
         // the value in line, aligned. Every short and long residue is storable in every encoding
         // only for unlimited varchar or n >= 134 (a single-byte value reaches payloads 127..=134

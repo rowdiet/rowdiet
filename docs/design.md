@@ -153,7 +153,7 @@ prints without band detail) and reuse the same engines.
 class are pointwise interchangeable (they carry no realization variable, and their pads depend
 only on (alignment, len mod 8) and the offset residue), so one representative arrangement stands
 for all of them. Varlenas get no such collapse: a realization assigns each varlena column its
-own payload, so swapping two same-class varlena columns changes padding pointwise — in
+own payload, so swapping two same-class varlena columns changes padding pointwise: in
 `(t1, m1, t2, m2)` the order `(m1, t2, t1, m2)` dominates while its class-sequence twin
 `(m1, t1, t2, m2)` measures 4 B/row worse at t1 = 132 B. `layout::order_space` therefore
 collapses fixed classes only and keeps every varlena an individual, which makes it
