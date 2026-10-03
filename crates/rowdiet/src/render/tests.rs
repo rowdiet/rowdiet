@@ -702,3 +702,59 @@ fn a_block_order_cell_renders_names_as_text() {
         .expect("a block row");
     assert!(cell.contains("\\<img src=x\\>"), "{cell}");
 }
+
+#[test]
+fn a_frontier_prints_the_query_that_settles_it() {
+    let analysis = analyze("CREATE TABLE t (t text NOT NULL, m macaddr NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("settle it on rows like yours (pageinspect, superuser):"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("               WITH RECURSIVE rel AS ("),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("bytes_saved totals current minus alternative"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_table_name_cannot_close_the_summary_fence() {
+    // The stack review's D2-1: a name with a newline and a fence line rendered HTML outside the
+    // code block.
+    let analysis = analyze(
+        "CREATE TABLE \"x\n```\n<img src=https://example.invalid/p.png>\" (t text NOT NULL, m macaddr NOT NULL);",
+    );
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let section = &summary[summary.find("### Settling").expect("a settling section")..];
+    assert!(section.contains("\\<img"), "the heading escapes the name: {section}");
+    let fences: Vec<&str> = section.lines().filter(|l| l.starts_with("```")).collect();
+    assert_eq!(
+        fences,
+        vec!["````sql", "````"],
+        "a fence longer than the name's backticks: {section}"
+    );
+    let open = section.find("````sql").unwrap();
+    let close = section[open + 7..].find("\n````").unwrap() + open + 7;
+    let outside = format!("{}{}", &section[..open], &section[close..]);
+    assert!(!outside.replace("\\<", "").contains("<img"), "{outside}");
+}
+
+#[test]
+fn a_settling_query_prints_no_workflow_command() {
+    let analysis =
+        analyze("CREATE TABLE \"q\n::error::QUERY ##[error]BRACKET\" (t text NOT NULL, m macaddr NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("c.relname = U&'q\\000A::error::QUERY ##\\005Berror]BRACKET'"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("##["), "{rendered}");
+    assert!(
+        !rendered.lines().any(|l| l.trim_start().starts_with("::")),
+        "{rendered}"
+    );
+}
