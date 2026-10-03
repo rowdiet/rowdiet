@@ -76,3 +76,21 @@ fn a_hostile_table_name_stays_one_literal_on_one_line() {
         "the statement end and the two inside the literal"
     );
 }
+
+#[test]
+fn the_walk_places_values_the_way_heap_fill_tuple_does() {
+    let q = query(&["t".to_string()], &columns(), &[0, 1], &[1, 0], Measure::Padding);
+    for clause in [
+        "WHERE h.lp_flags = 1",
+        "h.lp_len - h.t_hoff AS stored",
+        "CASE WHEN v IS NULL THEN w.o",
+        "WHEN s.varlena AND get_byte(v, 0) & 1 = 1 THEN w.o + length(v)",
+        "ELSE (w.o + s.align - 1) / s.align * s.align + length(v) END",
+        "count(*) FILTER (WHERE a.o < c.o) AS alternative_smaller",
+        "count(*) FILTER (WHERE a.o > c.o) AS current_smaller",
+        "coalesce(sum(c.o - a.o), 0) AS bytes_saved",
+        "count(*) FILTER (WHERE c.o <> t.stored) AS replay_mismatches",
+    ] {
+        assert!(q.sql.contains(clause), "{clause}\n{}", q.sql);
+    }
+}
