@@ -2115,6 +2115,21 @@ mod null_masks {
     }
 
     #[test]
+    fn a_trimmed_sweep_still_tries_every_order_of_the_written_varlena_sequence() {
+        // The delta review's rev_g534: the order space is out of the sweep's reach, and no
+        // fallback pole dominates. Moving only fixed columns, the joint walk proves
+        // (c0, c2, c3, c5, c1, c4, c6, c7) never worse, which measures 21,884 B smaller over 4,000
+        // rows on PostgreSQL 16 and never larger on any row.
+        let t = one(
+            "CREATE TABLE rev_g534 (c0 timestamptz, c1 jsonb NOT NULL, c2 timestamptz NOT NULL, \
+             c3 timestamptz NOT NULL, c4 jsonb NOT NULL, c5 timestamptz NOT NULL, c6 int2, c7 int2 NOT NULL);",
+        );
+        assert_eq!(t.dominance_search, DominanceScope::Budgeted);
+        assert_eq!(t.suggested_order, vec!["c0", "c2", "c3", "c5", "c1", "c4", "c6", "c7"]);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 14 }));
+    }
+
+    #[test]
     fn wide_nullable_tables_keep_the_finding_past_every_budget() {
         // 24 and 30 nullable regular columns written in a padding order: the pair comparison is
         // out of every budget (more NULL bits in flight than the joint walk holds), but the

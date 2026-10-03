@@ -715,6 +715,41 @@ pub fn order_space(columns: &[Column], cap: usize) -> Option<Vec<Vec<usize>>> {
     generate_space(&classes, columns.len(), cap)
 }
 
+/// The orders that keep every varlena where it is in the written sequence and move only fixed
+/// columns, `NOT NULL` ones collapsed by padding class as in [`order_space`]: pointwise-complete
+/// among the orders with the written varlena sequence, which the joint walk decides exactly. None
+/// when it exceeds `cap`.
+pub fn sequence_space(columns: &[Column], cap: usize) -> Option<Vec<Vec<usize>>> {
+    let mut classes: Vec<PaddingClass> = Vec::new();
+    let mut collapsed: Vec<(ClassKey, usize)> = Vec::new();
+    let mut varlenas: Option<usize> = None;
+    for (index, &column) in columns.iter().enumerate() {
+        let key = class_key(column.kind);
+        let slot = if !column.kind.is_fixed() {
+            varlenas
+        } else if column.nullable {
+            None
+        } else {
+            collapsed.iter().find(|(k, _)| *k == key).map(|&(_, class)| class)
+        };
+        match slot {
+            Some(class) => classes[class].members.push(index),
+            None => {
+                if !column.kind.is_fixed() {
+                    varlenas = Some(classes.len());
+                } else if !column.nullable {
+                    collapsed.push((key, classes.len()));
+                }
+                classes.push(PaddingClass {
+                    key,
+                    members: vec![index],
+                });
+            }
+        }
+    }
+    generate_space(&classes, columns.len(), cap)
+}
+
 /// The members of [`order_space`] that keep [`keeps_class_order`]: same-class varlenas and
 /// same-class nullable fixed columns in written order, generated over padding classes. This is
 /// the candidate space an earlier, collapsed sweep tested, in the order it tested them. None

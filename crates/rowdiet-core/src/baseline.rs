@@ -145,6 +145,11 @@ pub struct GateOutcome {
     /// stand, but a clean verdict says only that the searched candidates hold no dominating
     /// reorder. [`fail_on_budgeted`](Self::fail_on_budgeted) turns them into a failure.
     pub budgeted_tables: usize,
+    /// The gate failed because the analysis degraded under `fail_on_degraded`.
+    pub failed_on_degraded: bool,
+    /// The gate failed because a dominance search was budgeted, under
+    /// [`fail_on_budgeted`](Self::fail_on_budgeted).
+    pub failed_on_budgeted: bool,
     /// Scanned paths that matched no SQL files at all — a typo'd migrations directory would
     /// otherwise gate green forever having analyzed nothing.
     pub empty_scans: usize,
@@ -170,7 +175,8 @@ impl GateOutcome {
     /// `fail_on_degraded` because a budget binds on ordinary tables (42% of a 3,000-table corpus
     /// of 4 to 8 realistic columns), while a parser skip is rare and fixable.
     pub fn fail_on_budgeted(&mut self) {
-        self.exceeded |= self.budgeted_tables > 0;
+        self.failed_on_budgeted = self.budgeted_tables > 0;
+        self.exceeded |= self.failed_on_budgeted;
     }
 }
 
@@ -223,12 +229,15 @@ pub fn evaluate(
         skipped_statements,
         incomplete_tables,
         budgeted_tables,
+        failed_on_degraded: false,
+        failed_on_budgeted: false,
         empty_scans,
         verdicts,
         orphaned,
         expired,
     };
-    outcome.exceeded = outcome.verdicts.values().any(|v| v.failing()) || (fail_on_degraded && outcome.degraded());
+    outcome.failed_on_degraded = fail_on_degraded && outcome.degraded();
+    outcome.exceeded = outcome.verdicts.values().any(|v| v.failing()) || outcome.failed_on_degraded;
     outcome
 }
 
