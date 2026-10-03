@@ -1671,6 +1671,48 @@ mod closure_review {
     }
 
     #[test]
+    fn trimmed_sweeps_keep_the_findings_only_a_fallback_holds() {
+        // Each sweep runs out of comparison budget before it reaches a dominating order, and only
+        // the fallback candidates hold one; testing them only when the order space is too large
+        // to sweep passed these tables clean. tests/oracle.rs verifies each finding.
+        for types in [
+            [
+                "varchar(5)",
+                "text",
+                "jsonb",
+                "varchar(8)",
+                "macaddr",
+                "smallint",
+                "varchar(5)",
+            ],
+            [
+                "macaddr",
+                "jsonb",
+                "varchar(8)",
+                "text",
+                "integer",
+                "float8[]",
+                "bigint",
+            ],
+            [
+                "varchar(5)",
+                "text",
+                "integer",
+                "varchar(8)",
+                "integer",
+                "varchar(5)",
+                "varchar(8)",
+            ],
+        ] {
+            let a = analyze_sources(&[src("V1__b.sql", &table_sql("b2", &types))], &Config::default());
+            let t = &a.tables[0];
+            assert_eq!(t.dominance_search, DominanceScope::Budgeted, "{types:?}");
+            assert!(t.avoidable_bytes_per_row > 0.0, "{types:?} passed clean");
+            assert!(t.dominance_saving.is_some(), "{types:?}");
+        }
+    }
+
+    #[test]
     fn varchars_that_can_compress_keep_the_aligned_form() {
         // varchar(10) holds up to 40 bytes, and the toaster compresses an attribute over 24
         // bytes in line behind an aligned 4-byte header (lz4 has no minimum input). Modeled as
