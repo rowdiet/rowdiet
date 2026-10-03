@@ -1943,3 +1943,176 @@ mod varlena_residue_uncertainty {
         assert_eq!(t.dominance_search, crate::report::DominanceScope::Budgeted);
     }
 }
+
+/// NULL presence as a realization variable: a NULL stores nothing, so a nullable column moves
+/// later offsets differently in rows that hold it, and the gate and the recommendation quantify
+/// over NULL patterns too.
+mod null_masks {
+    use super::src;
+    use crate::report::{BandWinner, DominanceScope, NullRows, PaddingBounds, SavingRange};
+    use crate::{Config, Tier, analyze_sources};
+
+    fn one(sql: &str) -> crate::TableReport {
+        let a = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        a.tables.into_iter().next().expect("one table")
+    }
+
+    #[test]
+    fn a_recommendation_that_loses_in_a_null_row_is_withdrawn() {
+        // (m macaddr, t text NOT NULL, s smallint NOT NULL): without NULLs (m, s, t) is never
+        // worse and the NULL-blind engine recommended it ("saves 0-3 in every realization"). In
+        // a row where m is NULL the smallint takes offset 0 and a long text pads 2 behind it,
+        // while the written order pads at most 1, so the swap is a frontier.
+        let t = one("CREATE TABLE t (m macaddr, t text NOT NULL, s smallint NOT NULL);");
+        assert_eq!(t.avoidable_bytes_per_row, 0.0);
+        assert_eq!(t.null_variables, vec!["m"]);
+        let frontier = t.frontier.as_ref().expect("the swap is reported, not recommended");
+        assert_eq!(frontier.order, vec!["m", "s", "t"]);
+        let rows = frontier.without_nulls.as_ref().expect("NULLs change the verdict");
+        assert_eq!(rows.winner, BandWinner::Alternative);
+        assert_eq!((rows.min_saving, rows.max_saving), (0, 3));
+        // NOT NULL removes the variable and the reorder is proven again.
+        let nn = one("CREATE TABLE t (m macaddr NOT NULL, t text NOT NULL, s smallint NOT NULL);");
+        assert_eq!(nn.avoidable_bytes_per_row, 3.0);
+        assert_eq!(nn.suggested_order, vec!["m", "s", "t"]);
+        assert!(nn.null_variables.is_empty());
+    }
+
+    #[test]
+    fn waste_that_only_null_rows_carry_is_found() {
+        // (s int2, n int2 NULL, i int4, t text) pads zero when every column is stored, which
+        // the NULL-blind engine reported as clean; rows with n NULL pad 2 before i.
+        let t = one("CREATE TABLE t (s smallint NOT NULL, n smallint, i integer NOT NULL, t text NOT NULL);");
+        assert_eq!(t.current.without_nulls, Some(PaddingBounds { min: 0, max: 0 }));
+        assert_eq!((t.current.padding_min, t.current.padding_max), (0, 2));
+        assert_eq!(t.avoidable_bytes_per_row, 2.0);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 2 }));
+        assert_eq!(t.suggested_order, vec!["i", "s", "n", "t"]);
+        assert_eq!(t.dominance_search, DominanceScope::Exhaustive);
+    }
+
+    #[test]
+    fn exact_tier_reports_both_null_scenarios_and_the_bitmap_header() {
+        // Issue #4's cols9: rows holding a NULL carry a 32-byte header, so a one-NULL row keeps
+        // the full 96 bytes; cols8 still fits its bitmap in 24.
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE cols9 (c1 int8,c2 int8,c3 int8,c4 int8,c5 int8,c6 int8,c7 int8,c8 int8,c9 int8);
+                 CREATE TABLE cols8 (c1 int8,c2 int8,c3 int8,c4 int8,c5 int8,c6 int8,c7 int8,c8 int8);",
+            )],
+            &Config::default(),
+        );
+        let cols9 = &a.tables[0];
+        assert_eq!(cols9.tier, Tier::Exact);
+        assert_eq!(cols9.current.footprint, Some(96));
+        assert_eq!(
+            cols9.current.with_nulls,
+            Some(NullRows {
+                t_hoff: 32,
+                footprint_min: 32,
+                footprint_max: 96
+            })
+        );
+        assert_eq!(cols9.avoidable_bytes_per_row, 0.0);
+        assert_eq!(cols9.dominance_search, DominanceScope::Exhaustive);
+        let cols8 = &a.tables[1];
+        assert_eq!(
+            cols8.current.with_nulls.map(|r| (r.t_hoff, r.footprint_max)),
+            Some((24, 80))
+        );
+    }
+
+    #[test]
+    fn exact_tier_gates_on_the_row_size_saving_over_null_patterns() {
+        // (b1 bool, b2 bool, n int4 NULL, z timetz): every-column rows round to 48 bytes in both
+        // orders, but rows with n NULL shrink from 48 to 40 under (z, n, b1, b2).
+        let t = one("CREATE TABLE t (b1 boolean NOT NULL, b2 boolean NOT NULL, n integer, z timetz NOT NULL);");
+        assert_eq!(t.tier, Tier::Exact);
+        assert_eq!(
+            t.current.footprint, t.suggested.footprint,
+            "no rung crossed without NULLs"
+        );
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert_eq!(t.avoidable_deterministic, 0);
+        assert_eq!(t.avoidable_dominance, 8);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 8 }));
+        assert_eq!(t.suggested_order, vec!["z", "n", "b1", "b2"]);
+    }
+
+    #[test]
+    fn exact_tier_finds_an_order_that_wins_only_in_row_size() {
+        // (c0 timetz NULL, c1 int2 NOT NULL, c2 timetz NULL): (c0, c2, c1) pads 2 more in rows
+        // without NULLs, which round to 56 bytes either way, and saves 8 in rows where c0 is NULL
+        // (48 vs 40 B measured on PostgreSQL 16). A padding search never finds it; a row-size
+        // search recommends it.
+        let t = one("CREATE TABLE t (c0 timetz, c1 smallint NOT NULL, c2 timetz);");
+        assert_eq!(t.tier, Tier::Exact);
+        assert_eq!(t.suggested_order, vec!["c0", "c2", "c1"]);
+        assert_eq!(t.dominance_saving, Some(SavingRange { min: 0, max: 8 }));
+        assert_eq!(t.avoidable_bytes_per_row, 8.0);
+        assert!(t.frontier.is_none());
+    }
+
+    #[test]
+    fn not_null_restores_deterministic_padding() {
+        let sql = |nn: &str| format!("CREATE TABLE t (f boolean{nn}, x bigint NOT NULL, v text NOT NULL);");
+        let t = one(&sql(""));
+        assert_eq!(t.current.padding, 7, "rows that store every column pad 7 before x");
+        assert_eq!(t.current.without_nulls, Some(PaddingBounds { min: 7, max: 7 }));
+        assert_eq!(
+            t.avoidable_deterministic, 0,
+            "a NULL f moves x to offset 0, so the 7 is not certain"
+        );
+        assert_eq!(t.avoidable_bytes_per_row, 7.0);
+        let c = one(&sql(" NOT NULL"));
+        assert_eq!(c.current.padding, 7);
+        assert_eq!(c.avoidable_deterministic, 7);
+        assert_eq!(c.current.without_nulls, None);
+    }
+
+    #[test]
+    fn a_nullable_text_adds_nothing_and_a_nullable_array_does() {
+        // A NULL text advances 0 bytes mod 8, like a 7-byte text, so nullability there changes
+        // nothing. A NULL float8[] advances 0 where every stored short array advances 5, so it is
+        // a realization of its own and the array is listed (the engine-level witness is in
+        // dominance/tests.rs).
+        let a = analyze_sources(
+            &[src(
+                "V1__t.sql",
+                "CREATE TABLE a (k int8 NOT NULL, txt text, b int4 NOT NULL);
+                 CREATE TABLE b (k int8 NOT NULL, txt text NOT NULL, b int4 NOT NULL);
+                 CREATE TABLE c (i int4 NOT NULL, a float8[], n numeric, s int2 NOT NULL);",
+            )],
+            &Config::default(),
+        );
+        let [a, b, c] = &a.tables[..] else {
+            panic!("three tables")
+        };
+        assert!(a.null_variables.is_empty());
+        assert_eq!(a.current, b.current);
+        assert_eq!(a.suggested_order, b.suggested_order);
+        assert_eq!(a.avoidable_bytes_per_row, b.avoidable_bytes_per_row);
+        assert_eq!(c.null_variables, vec!["a", "n"]);
+    }
+
+    #[test]
+    fn wide_nullable_tables_keep_the_finding_past_every_budget() {
+        // 24 and 30 nullable regular columns written in a padding order: the pair comparison is
+        // out of every budget (more NULL bits in flight than the joint walk holds), but the
+        // sorted order pads zero in every NULL pattern, which proves it dominates for free.
+        // Measured on PostgreSQL 16 for the 24-column table over 400 NULL patterns: the sorted
+        // order is never larger and is smaller in 397.
+        for width in [24, 30] {
+            let types = ["boolean", "bigint", "smallint", "integer"];
+            let cols: Vec<String> = (0..width).map(|i| format!("c{i} {}", types[i % 4])).collect();
+            let t = one(&format!("CREATE TABLE r ({});", cols.join(", ")));
+            assert_eq!(t.tier, Tier::Exact);
+            assert_eq!(t.dominance_search, DominanceScope::Budgeted, "{width}");
+            let saving = t.dominance_saving.expect("a proven saving");
+            assert!(saving.max > 0, "{width}: {saving:?}");
+            assert_eq!(t.avoidable_bytes_per_row, saving.max as f64);
+            assert_eq!(t.suggested.with_nulls.map(|r| r.footprint_min), Some(32), "{width}");
+        }
+    }
+}
