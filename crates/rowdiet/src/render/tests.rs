@@ -176,7 +176,9 @@ fn human_units() {
 fn quoting_only_when_needed() {
     assert_eq!(maybe_quote("plain_name2"), "plain_name2");
     assert_eq!(maybe_quote("Mixed"), "\"Mixed\"");
-    assert_eq!(maybe_quote("select"), "select");
+    assert_eq!(maybe_quote("select"), "\"select\"");
+    assert_eq!(maybe_quote("user"), "\"user\"");
+    assert_eq!(maybe_quote("name"), "name");
     assert_eq!(maybe_quote("1st"), "\"1st\"");
 }
 
