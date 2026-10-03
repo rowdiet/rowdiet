@@ -46,8 +46,7 @@ impl Analysis {
     }
 
     /// True when the analysis is degraded in a way rowdiet recognizes: a statement was skipped, a
-    /// gated table is incomplete or its dominance search was budgeted, or a scanned path held no
-    /// SQL. The analysis-level twin of
+    /// gated table is incomplete, or a scanned path held no SQL. The analysis-level twin of
     /// [`GateOutcome::degraded`](crate::baseline::GateOutcome::degraded), which it always agrees
     /// with (pinned by a test).
     ///
@@ -56,8 +55,7 @@ impl Analysis {
     /// but it also silently misses any degradation kind a later release adds, which this method,
     /// kept current by rowdiet, does not.
     pub fn degraded(&self) -> bool {
-        self.notes.iter().any(|note| note.kind.is_degradation())
-            || self.gated_tables().any(|table| table.incomplete || table.budgeted())
+        self.notes.iter().any(|note| note.kind.is_degradation()) || self.gated_tables().any(|table| table.incomplete)
     }
 }
 
