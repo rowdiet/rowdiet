@@ -14,7 +14,7 @@
 
 use crate::dominance::{DiffBounds, Measure, Nulls, Summary};
 use crate::fold::{FoldedTable, Note, Origin};
-use crate::layout::{self, Column, ColumnKind, SearchScope, Tier, Walk};
+use crate::layout::{self, Column, ColumnKind, SearchScope, Start, Tier, Walk};
 
 /// The complete result of one analysis run — what renderers, gates, and adapters consume.
 #[derive(Debug, Clone, PartialEq)]
@@ -362,10 +362,16 @@ const SWEEP_WORK_BUDGET: u64 = 1 << 22;
 /// its budgets still tests the search poles and the safe repacks, so a budget never hides a
 /// dominating order those candidates hold. A candidate that costs nothing in any realization
 /// dominates without a pair comparison, so no budget hides it either.
-fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, measure: Measure) -> Decision {
+fn decide(
+    start: Start,
+    columns: &[Column],
+    search: &layout::Search,
+    current_walk: &Walk,
+    measure: Measure,
+) -> Decision {
     let n = columns.len();
     let identity: Vec<usize> = (0..n).collect();
-    let current = crate::dominance::summary(columns, &identity, Nulls::Vary, measure);
+    let current = crate::dominance::summary(start, columns, &identity, Nulls::Vary, measure);
     // Nothing costs less than zero in any realization, so nothing dominates a zero-cost order.
     if current.max == 0 {
         return Decision {
@@ -380,17 +386,17 @@ fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, meas
     let mut dominating: Vec<(Vec<usize>, DiffBounds)> = Vec::new();
     let sequence_cap = SWEEP_SEQUENCE_CAP.min(SWEEP_ELEMENT_CAP / n.max(1));
     let exhaustive = layout::order_space(columns, sequence_cap)
-        .is_some_and(|orders| sweep(columns, orders, measure, current, &mut dominating));
+        .is_some_and(|orders| sweep(start, columns, orders, measure, current, &mut dominating));
     if !exhaustive {
-        for candidate in fallback_candidates(columns, search) {
+        for candidate in fallback_candidates(start, columns, search) {
             if candidate == identity || dominating.iter().any(|(order, _)| *order == candidate) {
                 continue;
             }
-            let cand = crate::dominance::summary(columns, &candidate, Nulls::Vary, measure);
+            let cand = crate::dominance::summary(start, columns, &candidate, Nulls::Vary, measure);
             let diff = if cand.max == 0 {
                 Some(free_proof(current))
             } else {
-                crate::dominance::compare(columns, &identity, &candidate, Nulls::Vary, measure)
+                crate::dominance::compare(start, columns, &identity, &candidate, Nulls::Vary, measure)
             };
             if let Some(diff) = diff
                 && diff.b_dominates()
@@ -398,7 +404,7 @@ fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, meas
                 dominating.push((candidate, diff));
             }
         }
-        sequence_sweep(columns, measure, current, &mut dominating);
+        sequence_sweep(start, columns, measure, current, &mut dominating);
     }
     let dominance_search = if exhaustive {
         DominanceScope::Exhaustive
@@ -408,8 +414,8 @@ fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, meas
     let best = dominating
         .into_iter()
         .map(|(order, diff)| {
-            let summary = crate::dominance::summary(columns, &order, Nulls::Vary, measure);
-            let walk = layout::walk(&kinds_in(columns, &order));
+            let summary = crate::dominance::summary(start, columns, &order, Nulls::Vary, measure);
+            let walk = layout::walk_from(start, &kinds_in(columns, &order));
             (order, diff, walk, summary)
         })
         .min_by_key(|(_, _, w, summary)| (summary.max, w.padding, summary.short_mean_eighths))
@@ -420,8 +426,8 @@ fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, meas
             // The gate never claims more than the engine's proven maximum saving: certain pads
             // the reorder converts into smaller data-dependent ones are capped at what is
             // attainable. Certain means certain over every NULL pattern too.
-            Measure::Padding => layout::certain_padding(columns, &identity)
-                .saturating_sub(layout::certain_padding(columns, &order))
+            Measure::Padding => layout::certain_padding(start, columns, &identity)
+                .saturating_sub(layout::certain_padding(start, columns, &order))
                 .min(max_saving),
             // Row sizes are exact per NULL pattern: what every row saves is the floor.
             Measure::RowSize => diff.min as u64,
@@ -453,11 +459,11 @@ fn decide(columns: &[Column], search: &layout::Search, current_walk: &Walk, meas
         if *candidate == identity || frontier_pick.is_some() {
             continue;
         }
-        let cand = crate::dominance::summary(columns, candidate, Nulls::Vary, measure);
-        let cand_walk = layout::walk(&kinds_in(columns, candidate));
+        let cand = crate::dominance::summary(start, columns, candidate, Nulls::Vary, measure);
+        let cand_walk = layout::walk_from(start, &kinds_in(columns, candidate));
         let better_summary = cand.max < current.max || cand_walk.padding < current_walk.padding;
         // Every pole was tested above or by the exhaustive sweep, so none of them dominates.
-        let wins_somewhere = crate::dominance::compare(columns, &identity, candidate, Nulls::Vary, measure)
+        let wins_somewhere = crate::dominance::compare(start, columns, &identity, candidate, Nulls::Vary, measure)
             .is_some_and(|diff| {
                 debug_assert!(!diff.b_dominates(), "a dominating pole must be recommended");
                 diff.max > 0
@@ -494,6 +500,7 @@ fn kinds_in(columns: &[Column], order: &[usize]) -> Vec<ColumnKind> {
 /// collapsed sweep tested them, so a trimmed sweep finds at least what that sweep found; the
 /// rest follow by ascending worst case.
 fn sweep(
+    start: Start,
     columns: &[Column],
     orders: Vec<Vec<usize>>,
     measure: Measure,
@@ -506,10 +513,10 @@ fn sweep(
         // over any sub-distribution of realizations; the summary computes all three over the
         // same realization model the comparison uses, so the prunes stay sound where a type
         // narrows its payload residues or a column holds NULL.
-        let cand = crate::dominance::summary(columns, candidate, Nulls::Vary, measure);
+        let cand = crate::dominance::summary(start, columns, candidate, Nulls::Vary, measure);
         let pruned =
             cand.max > current.max || cand.min > current.min || cand.short_mean_eighths > current.short_mean_eighths;
-        (!pruned).then(|| (cand, layout::walk(&kinds_in(columns, candidate)).padding))
+        (!pruned).then(|| (cand, layout::walk_from(start, &kinds_in(columns, candidate)).padding))
     };
     let class_sequences = layout::class_sequence_space(columns, orders.len()).unwrap_or_default();
     let mut rest: Vec<((u64, u64, u64), Vec<usize>)> = Vec::new();
@@ -536,13 +543,13 @@ fn sweep(
             dominating.push((candidate, free_proof(current)));
             continue;
         }
-        let cost = crate::dominance::comparison_cost(columns, &identity, &candidate, Nulls::Vary, measure);
+        let cost = crate::dominance::comparison_cost(start, columns, &identity, &candidate, Nulls::Vary, measure);
         if cost > budget {
             complete = false;
             continue;
         }
         budget -= cost;
-        match crate::dominance::compare(columns, &identity, &candidate, Nulls::Vary, measure) {
+        match crate::dominance::compare(start, columns, &identity, &candidate, Nulls::Vary, measure) {
             Some(diff) if diff.b_dominates() => dominating.push((candidate, diff)),
             Some(_) => {}
             None => complete = false,
@@ -560,6 +567,7 @@ const SEQUENCE_SWEEP_CAP: usize = 40_320;
 /// tables whose whole order space is out of reach. Measured on 3,000 realistic tables of 4 to 8
 /// columns, 229 of 378 that the fallback candidates left clean have a dominating order here.
 fn sequence_sweep(
+    start: Start,
     columns: &[Column],
     measure: Measure,
     current: Summary,
@@ -575,11 +583,11 @@ fn sequence_sweep(
         if candidate == identity || dominating.iter().any(|(order, _)| *order == candidate) {
             continue;
         }
-        let cand = crate::dominance::summary(columns, &candidate, Nulls::Vary, measure);
+        let cand = crate::dominance::summary(start, columns, &candidate, Nulls::Vary, measure);
         if cand.max > current.max || cand.min > current.min || cand.short_mean_eighths > current.short_mean_eighths {
             continue;
         }
-        let certain = layout::walk(&kinds_in(columns, &candidate)).padding;
+        let certain = layout::walk_from(start, &kinds_in(columns, &candidate)).padding;
         ranked.push(((cand.max, certain, cand.short_mean_eighths), candidate));
     }
     ranked.sort();
@@ -589,12 +597,12 @@ fn sequence_sweep(
             dominating.push((candidate, free_proof(current)));
             continue;
         }
-        let cost = crate::dominance::comparison_cost(columns, &identity, &candidate, Nulls::Vary, measure);
+        let cost = crate::dominance::comparison_cost(start, columns, &identity, &candidate, Nulls::Vary, measure);
         if cost > budget {
             continue;
         }
         budget -= cost;
-        if let Some(diff) = crate::dominance::compare(columns, &identity, &candidate, Nulls::Vary, measure)
+        if let Some(diff) = crate::dominance::compare(start, columns, &identity, &candidate, Nulls::Vary, measure)
             && diff.b_dominates()
         {
             dominating.push((candidate, diff));
@@ -606,7 +614,7 @@ fn sequence_sweep(
 /// its leading fixed run repacked, and every fixed column first with the varlenas in written
 /// order. The last two keep the varlena sequence, so the dominance engine decides them exactly
 /// at any width while few enough NULL bits are in flight.
-fn fallback_candidates(columns: &[Column], search: &layout::Search) -> Vec<Vec<usize>> {
+fn fallback_candidates(start: Start, columns: &[Column], search: &layout::Search) -> Vec<Vec<usize>> {
     let mut fixed_first: Vec<usize> = search
         .heuristic
         .iter()
@@ -619,7 +627,7 @@ fn fallback_candidates(columns: &[Column], search: &layout::Search) -> Vec<Vec<u
         search.minimax_pole.clone(),
         search.certainty_pole.clone(),
         Some(search.heuristic.clone()),
-        Some(current_prefix_repack(columns)),
+        Some(current_prefix_repack(start, columns)),
         Some(fixed_first),
     ]
     .into_iter()
@@ -635,10 +643,10 @@ fn fallback_candidates(columns: &[Column], search: &layout::Search) -> Vec<Vec<u
 /// The current order with its leading fixed run repacked to the deterministic minimum and the
 /// suffix untouched: dominance-safe by construction when the run is NOT NULL, verified like any
 /// candidate otherwise, and free at any table size.
-fn current_prefix_repack(columns: &[Column]) -> Vec<usize> {
+fn current_prefix_repack(start: Start, columns: &[Column]) -> Vec<usize> {
     let kinds: Vec<ColumnKind> = columns.iter().map(|c| c.kind).collect();
     let mut order: Vec<usize> = (0..columns.len()).collect();
-    layout::refine_leading_fixed(&kinds, &mut order);
+    layout::refine_leading_fixed_from(start, &kinds, &mut order);
     order
 }
 
@@ -655,30 +663,31 @@ fn band_winner(diff: DiffBounds) -> BandWinner {
 }
 
 fn frontier_report(
+    start: Start,
     columns: &[Column],
-    folded: &[crate::fold::FoldedColumn],
+    names: &[String],
     current_walk: &Walk,
     alternative: &[usize],
     measure: Measure,
 ) -> Frontier {
     let identity: Vec<usize> = (0..columns.len()).collect();
-    let alt_walk = layout::walk(&kinds_in(columns, alternative));
-    let worst = |order: &[usize]| crate::dominance::summary(columns, order, Nulls::Vary, Measure::Padding).max;
-    let bands = crate::dominance::bands(columns, &identity, alternative, measure);
+    let alt_walk = layout::walk_from(start, &kinds_in(columns, alternative));
+    let worst = |order: &[usize]| crate::dominance::summary(start, columns, order, Nulls::Vary, Measure::Padding).max;
+    let bands = crate::dominance::bands(start, columns, &identity, alternative, measure);
     let decided = bands.is_some();
     let bands = bands
         .unwrap_or_default()
         .into_iter()
         .map(|band| FrontierBand {
-            long_form: band.long_form.iter().map(|&i| folded[i].display.clone()).collect(),
+            long_form: band.long_form.iter().map(|&i| names[i].clone()).collect(),
             winner: band_winner(band.diff),
             min_saving: band.diff.min,
             max_saving: band.diff.max,
         })
         .collect();
     let without_nulls = if columns.iter().any(Column::null_varies) {
-        let overall = crate::dominance::compare(columns, &identity, alternative, Nulls::Vary, measure);
-        let stored = crate::dominance::compare(columns, &identity, alternative, Nulls::Stored, measure);
+        let overall = crate::dominance::compare(start, columns, &identity, alternative, Nulls::Vary, measure);
+        let stored = crate::dominance::compare(start, columns, &identity, alternative, Nulls::Stored, measure);
         match (overall, stored) {
             (Some(overall), Some(stored)) if overall != stored => Some(NullFreeComparison {
                 winner: band_winner(stored),
@@ -691,7 +700,7 @@ fn frontier_report(
         None
     };
     Frontier {
-        order: alternative.iter().map(|&i| folded[i].display.clone()).collect(),
+        order: alternative.iter().map(|&i| names[i].clone()).collect(),
         measure,
         current_worst: worst(&identity),
         alternative_worst: worst(alternative),
@@ -756,8 +765,8 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         },
         // Exact per NULL pattern: decided, searched, and reported in row size, which varies by
         // pattern.
-        Tier::Exact => decide(&columns, &search, &current_walk, Measure::RowSize),
-        Tier::Estimate => decide(&columns, &search, &current_walk, Measure::Padding),
+        Tier::Exact => decide(Start::TABLE, &columns, &search, &current_walk, Measure::RowSize),
+        Tier::Estimate => decide(Start::TABLE, &columns, &search, &current_walk, Measure::Padding),
         // Columns unknown: no avoidable waste can be claimed, nothing was searched, and the
         // incomplete verdict carries the "not analyzed" signal.
         Tier::Unknown => Decision {
@@ -799,10 +808,10 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     } else {
         Measure::Padding
     };
-    let frontier = decision
-        .frontier_order
-        .as_ref()
-        .map(|alternative| frontier_report(&columns, &table.columns, &current_walk, alternative, measure));
+    let frontier = decision.frontier_order.as_ref().map(|alternative| {
+        let names: Vec<String> = table.columns.iter().map(|c| c.display.clone()).collect();
+        frontier_report(Start::TABLE, &columns, &names, &current_walk, alternative, measure)
+    });
     let suggested_order = final_order.iter().map(|&i| table.columns[i].display.clone()).collect();
     let null_variables = table
         .columns
@@ -930,8 +939,8 @@ fn stats(tier: Tier, columns: &[Column], order: &[usize], walk: &Walk, t_hoff: u
     };
     // Bounds over the realization model, which knows the payload residues a type stores and
     // which columns may hold NULL.
-    let bounds = crate::dominance::summary(columns, order, Nulls::Vary, Measure::Padding);
-    let stored = crate::dominance::summary(columns, order, Nulls::Stored, Measure::Padding);
+    let bounds = crate::dominance::summary(Start::TABLE, columns, order, Nulls::Vary, Measure::Padding);
+    let stored = crate::dominance::summary(Start::TABLE, columns, order, Nulls::Stored, Measure::Padding);
     let without_nulls = ((stored.min, stored.max) != (bounds.min, bounds.max)).then_some(PaddingBounds {
         min: stored.min,
         max: stored.max,
