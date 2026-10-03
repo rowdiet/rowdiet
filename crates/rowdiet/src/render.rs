@@ -1,5 +1,6 @@
 //! Output renderers: human text, GitHub Actions annotations, JSON.
 
+use rowdiet_core::dominance::Measure;
 use rowdiet_core::layout::SearchScope;
 use rowdiet_core::report::{BandWinner, DominanceScope, Frontier};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
@@ -61,11 +62,11 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
             TableVerdict::Pass | TableVerdict::Incomplete => {}
         }
     }
-    if gate.skipped_statements > 0 || gate.incomplete_tables > 0 || gate.empty_scans > 0 {
+    if gate.degraded() {
         let _ = writeln!(
             out,
-            "degraded: {} statement(s) skipped, {} table(s) incomplete, {} path(s) matched no SQL files — pass --fail-on-degraded to gate on this",
-            gate.skipped_statements, gate.incomplete_tables, gate.empty_scans
+            "degraded: {} statement(s) skipped, {} table(s) incomplete, {} table(s) with a budgeted dominance search, {} path(s) matched no SQL files — pass --fail-on-degraded to gate on this",
+            gate.skipped_statements, gate.incomplete_tables, gate.budgeted_tables, gate.empty_scans
         );
     }
     if gate.exceeded {
@@ -134,6 +135,16 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         let capped_waste = t.search_scope != SearchScope::Complete && t.current.padding > 0;
         let detail = match (t.tier, t.current.padding) {
             (Tier::Estimate, _) => format!("{}, {}{}", stats_line(&t.current), verdict_phrase(t), scope_note(t)),
+            (Tier::Exact, _) if t.current.with_nulls.is_some() && t.current.padding_max == 0 => {
+                format!(
+                    "optimal: zero padding in every NULL pattern{}; {}",
+                    scope_note(t),
+                    stats_line(&t.current)
+                )
+            }
+            (Tier::Exact, _) if t.current.with_nulls.is_some() => {
+                format!("{}, {}{}", stats_line(&t.current), verdict_phrase(t), scope_note(t))
+            }
             (Tier::Exact, 0) => format!("optimal: zero padding{}", scope_note(t)),
             (Tier::Exact, p) if capped_waste => {
                 format!(
@@ -151,7 +162,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
             (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
         let mark = if capped_waste { "◐" } else { "✓" };
-        let _ = writeln!(out, "{mark} {display} ({loc}) — {detail} [{}]", tier_label(t.tier));
+        let _ = writeln!(out, "{mark} {display} ({loc}) — {detail} [{}]", tier_label(t));
         render_frontier(out, t);
         render_flags(out, t);
         render_verdict(out, t, verdict);
@@ -161,7 +172,7 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         out,
         "■ {display} ({loc}) — {} columns — {}{}",
         t.natts,
-        tier_label(t.tier),
+        tier_label(t),
         scope_note(t)
     );
     let _ = writeln!(out, "  current  : {}", stats_line(&t.current));
@@ -297,26 +308,38 @@ fn render_frontier(out: &mut String, t: &TableReport) {
     }
     let printable = frontier.bands.iter().filter(|b| b.winner != BandWinner::Tie).count();
     let mut printed = 0usize;
+    let has_varlena = t.columns.iter().any(|c| !c.kind.is_fixed());
+    // What a mixed band's winner turns on: payload lengths, NULLs, or both.
+    let varies = match (has_varlena, t.null_variables.is_empty()) {
+        (true, true) => "payload lengths mod 8",
+        (true, false) => "payload lengths mod 8 and which columns hold NULL",
+        (false, _) => "which columns hold NULL",
+    };
+    let unit = match frontier.measure {
+        Measure::Padding => "",
+        Measure::RowSize => " in row size",
+    };
     for band in &frontier.bands {
         if printed >= FRONTIER_BAND_LINE_CAP {
             break;
         }
         let condition = match band.long_form.as_slice() {
-            [] => "when every varlena stays short or TOAST".to_string(),
-            [one] => format!("when {} stores long form", escape_text(one)),
-            many => format!("when {} store long form", escape_text(&many.join(", "))),
+            [] if has_varlena => " when every varlena stays short or TOAST".to_string(),
+            [] => String::new(),
+            [one] => format!(" when {} stores long form", escape_text(one)),
+            many => format!(" when {} store long form", escape_text(&many.join(", "))),
         };
         let line = match band.winner {
             BandWinner::Alternative => Some(format!(
-                "alternative wins {condition} (saves {}-{} B/row)",
+                "alternative wins{unit}{condition} (saves {}-{} B/row)",
                 band.min_saving, band.max_saving
             )),
             BandWinner::Current => Some(format!(
-                "current wins {condition} (by {}-{} B/row)",
+                "current wins{unit}{condition} (by {}-{} B/row)",
                 -band.max_saving, -band.min_saving
             )),
             BandWinner::Mixed => Some(format!(
-                "winner depends on payload lengths mod 8 {condition} ({} to {} B/row)",
+                "winner{unit} depends on {varies}{condition} ({} to {} B/row)",
                 band.min_saving, band.max_saving
             )),
             BandWinner::Tie => None,
@@ -332,6 +355,27 @@ fn render_frontier(out: &mut String, t: &TableReport) {
             "             ... {} further band(s) elided (all bands are in --format json)",
             printable - printed
         );
+    }
+    if let Some(rows) = &frontier.without_nulls {
+        let line = match rows.winner {
+            BandWinner::Alternative => format!(
+                "in rows without NULLs the alternative wins{unit} (saves {}-{} B/row)",
+                rows.min_saving, rows.max_saving
+            ),
+            BandWinner::Current => format!(
+                "in rows without NULLs the current order wins{unit} (by {}-{} B/row)",
+                -rows.max_saving, -rows.min_saving
+            ),
+            BandWinner::Mixed => format!(
+                "in rows without NULLs the winner{unit} depends on payload lengths mod 8 ({} to {} B/row)",
+                rows.min_saving, rows.max_saving
+            ),
+            BandWinner::Tie => match frontier.measure {
+                Measure::Padding => "rows without NULLs pad identically in both orders".to_string(),
+                Measure::RowSize => "rows without NULLs are the same size in both orders".to_string(),
+            },
+        };
+        let _ = writeln!(out, "             {line}");
     }
     let _ = render_frontier_assumption_free(out, frontier);
 }
@@ -350,12 +394,38 @@ fn render_frontier_assumption_free(out: &mut String, frontier: &Frontier) -> std
 
 fn stats_line(s: &OrderStats) -> String {
     match (s.footprint, s.rows_per_page) {
-        (Some(fp), Some(rp)) => format!("{} B padding, {fp} B/row footprint, {rp} rows/8kB page", s.padding),
+        (Some(fp), Some(rp)) => {
+            let Some(rows) = s.with_nulls else {
+                return format!("{} B padding, {fp} B/row footprint, {rp} rows/8kB page", s.padding);
+            };
+            // Rows without NULLs are byte-exact; rows with one carry the bitmap header.
+            let padding = if s.padding_min == s.padding_max {
+                format!("{} B padding", s.padding_min)
+            } else {
+                format!("{}-{} B padding", s.padding_min, s.padding_max)
+            };
+            let footprint = if rows.footprint_min == rows.footprint_max {
+                rows.footprint_min.to_string()
+            } else {
+                format!("{}-{}", rows.footprint_min, rows.footprint_max)
+            };
+            format!(
+                "{} B padding, {fp} B/row footprint, {rp} rows/8kB page without NULLs; \
+                 {padding}, {footprint} B/row with NULLs ({} B header)",
+                s.padding, rows.t_hoff
+            )
+        }
         _ if s.padding_min == s.padding_max => format!("{} B padding/row", s.padding),
-        _ => format!(
-            "{:.1} B/row expected padding ({} B deterministic, range {}-{}, data-dependent)",
-            s.expected_padding, s.padding, s.padding_min, s.padding_max
-        ),
+        _ => {
+            let without = match s.without_nulls {
+                Some(b) => format!(", {}-{} without NULLs", b.min, b.max),
+                None => String::new(),
+            };
+            format!(
+                "{:.1} B/row expected padding ({} B deterministic, range {}-{}{without}, data-dependent)",
+                s.expected_padding, s.padding, s.padding_min, s.padding_max
+            )
+        }
     }
 }
 
@@ -372,6 +442,13 @@ fn render_flags(out: &mut String, t: &TableReport) {
             out,
             "  ⚠ assumed varlena/int-aligned (teach via --assume-type): {}",
             escape_text(&list)
+        );
+    }
+    if !t.null_variables.is_empty() && (t.current.without_nulls.is_some() || t.current.with_nulls.is_some()) {
+        let _ = writeln!(
+            out,
+            "  NULLs move later offsets in: {} (NOT NULL removes that variable)",
+            t.null_variables.join(", ")
         );
     }
 }
@@ -613,9 +690,10 @@ fn is_line_hazard(c: char) -> bool {
     c.is_control() || c == '\u{2028}' || c == '\u{2029}'
 }
 
-fn tier_label(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Exact => "exact — fixed-width only",
+fn tier_label(t: &TableReport) -> &'static str {
+    match t.tier {
+        Tier::Exact if t.null_variables.is_empty() => "exact — fixed-width only",
+        Tier::Exact => EXACT_NULLS_LABEL,
         Tier::Estimate => ESTIMATE_LABEL,
         Tier::Unknown => "unknown — columns not fully known",
     }
@@ -623,10 +701,16 @@ fn tier_label(tier: Tier) -> &'static str {
 
 /// The estimate tier's label states the decision policy and the display model wherever a
 /// number is shown: the gate and the reorder advice rest on deterministic pads and dominance
-/// (never worse in any storage-form/payload realization); expected values are display-only
-/// figures under the stated model (varlena pads scored at the short/TOAST form, offset
-/// residues uniform). The printed min/max range bounds all storage forms with no assumption.
-const ESTIMATE_LABEL: &str = "estimate — gates on deterministic and dominance-proven padding; expected values are display-only (short-form, uniform-offset model)";
+/// (never worse in any storage-form, payload, or NULL realization); expected values are
+/// display-only figures under the stated model (varlena pads scored at the short/TOAST form,
+/// offset residues uniform, no NULLs). The printed min/max range bounds every realization with
+/// no assumption.
+const ESTIMATE_LABEL: &str = "estimate — gates on deterministic and dominance-proven padding over every storage form, payload length, and NULL; expected values are display-only (short-form, uniform-offset, no-NULL model)";
+
+/// An all-fixed table with nullable columns: every row is byte-exact, but which columns a row
+/// stores varies, so the gate takes the row-size saving over every NULL pattern.
+const EXACT_NULLS_LABEL: &str =
+    "exact per NULL pattern — fixed-width only, gates on the row-size saving over every NULL pattern";
 
 fn kind_label(kind: NoteKind) -> &'static str {
     match kind {
@@ -686,7 +770,7 @@ pub fn github(analysis: &Analysis, gate: &GateOutcome) -> String {
             "table {}: {:.1} B/row avoidable{saving}; {}{} — suggested order: {}",
             t.name,
             t.avoidable_bytes_per_row,
-            tier_label(t.tier),
+            tier_label(t),
             scope_note(t),
             t.suggested_order.join(", ")
         );
@@ -865,6 +949,13 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     let _ = writeln!(out);
     if analysis.tables.iter().any(|t| !t.ignored && t.tier == Tier::Estimate) {
         let _ = writeln!(out, "{ESTIMATE_LABEL}.\n");
+    }
+    if analysis
+        .tables
+        .iter()
+        .any(|t| !t.ignored && t.tier == Tier::Exact && !t.null_variables.is_empty())
+    {
+        let _ = writeln!(out, "{EXACT_NULLS_LABEL}.\n");
     }
     if ignored > 0 {
         let _ = writeln!(out, "{ignored} table(s) ignored via rowdiet:ignore.\n");
