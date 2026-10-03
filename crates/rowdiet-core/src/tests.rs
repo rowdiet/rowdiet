@@ -1017,6 +1017,29 @@ mod postaudit_pins {
     }
 
     #[test]
+    fn a_schema_qualified_rename_stays_in_its_schema() {
+        // ALTER TABLE s.t RENAME TO n leaves the table in s; keying it as bare n made a later
+        // CREATE TABLE n redefine it and dropped every later ALTER of s.n.
+        let sql = "CREATE TABLE rs.old (m macaddr, t text NOT NULL, s smallint NOT NULL);
+            ALTER TABLE rs.old RENAME TO new;
+            CREATE TABLE new (id bigint NOT NULL, flag boolean NOT NULL);
+            ALTER TABLE rs.new ADD COLUMN extra int4;
+            CREATE TABLE \"Q.x\".\"Old\" (a int NOT NULL);
+            ALTER TABLE \"Q.x\".\"Old\" RENAME TO \"New\";
+            ALTER TABLE \"Q.x\".\"New\" ADD COLUMN b int;";
+        let mut backends = vec![crate::ParserBackend::Sqlparser];
+        if cfg!(feature = "pg-exact") {
+            backends.push(crate::ParserBackend::PgExact);
+        }
+        for backend in backends {
+            let analysis = crate::analyze_sources_with(backend, &[src("V1__r.sql", sql)], &Config::default());
+            let tables: Vec<(&str, usize)> = analysis.tables.iter().map(|t| (t.name.as_str(), t.natts)).collect();
+            assert_eq!(tables, [("rs.new", 4), ("new", 2), ("Q.x.New", 2)], "{backend:?}");
+            assert!(analysis.notes.is_empty(), "{backend:?}: {:?}", analysis.notes);
+        }
+    }
+
+    #[test]
     fn drop_bitmap_boundary_at_nine_original_columns() {
         // live 8 + dropped 1 = 9 original attributes: bitmap pushes t_hoff 24 -> 32. A wrong
         // combination (multiplying instead of adding the counts) lands back under the
