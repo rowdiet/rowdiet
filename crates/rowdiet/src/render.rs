@@ -879,7 +879,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
                 "**block not dominance-optimal** (block order: {})",
                 gate.blocks
                     .get(&t.name)
-                    .map(|b| markdown_cell(&b.suggested_order.join(", ")))
+                    .map(|b| markdown_text(&b.suggested_order.join(", ")))
                     .unwrap_or_default()
             ),
             Some(TableVerdict::ModifiedSinceBaseline { .. }) => "**modified since baseline**".to_string(),
@@ -956,6 +956,24 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         let _ = writeln!(out, "Gate: ok.");
     } else {
         let _ = writeln!(out, "```\n{gate_line}```");
+    }
+    out
+}
+
+/// Markdown text that renders as written: the characters that open emphasis, a code span, a
+/// link, a tag, an entity, a heading or a table cell backslash-escaped, line breaks as spaces.
+fn markdown_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            c if c.is_control() => {}
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '~' | '&' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
     }
     out
 }

@@ -633,3 +633,20 @@ fn drop_then_add_reports_the_block_behind_the_dropped_slot() {
         "{rendered}"
     );
 }
+
+#[test]
+fn a_block_order_cell_renders_names_as_text() {
+    let analysis = analyze(
+        "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
+         ALTER TABLE t ADD COLUMN \"<img src=x>\" boolean NOT NULL;
+         ALTER TABLE t ADD COLUMN f bigint NOT NULL;
+         ALTER TABLE t ADD COLUMN g boolean NOT NULL;
+         ALTER TABLE t ADD COLUMN h bigint NOT NULL;",
+    );
+    let summary = github_step_summary(&analysis, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    let cell = summary
+        .lines()
+        .find(|l| l.contains("block not dominance-optimal"))
+        .expect("a block row");
+    assert!(cell.contains("\\<img src=x\\>"), "{cell}");
+}
