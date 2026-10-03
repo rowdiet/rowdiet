@@ -989,7 +989,7 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize], start: Start) {
     }
     let mut sorted = order[..fixed_len].to_vec();
     sorted.sort_by_key(|&i| sort_key(&kinds[i], i));
-    let greedy = greedy_pack(kinds, &sorted);
+    let greedy = greedy_pack(kinds, &sorted, start.stored);
     let best = [sorted, greedy]
         .into_iter()
         .min_by_key(|candidate| block_padding(candidate))
@@ -1002,12 +1002,17 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize], start: Start) {
 /// A fixed block packed column by column: each step takes the class that pads least from the
 /// current offset, the earliest in `sorted` on ties. It interleaves irregulars with the columns
 /// that absorb them (timetz with int4, macaddr with int2), which the sort keeps apart.
-fn greedy_pack(kinds: &[ColumnKind], sorted: &[usize]) -> Vec<usize> {
+fn greedy_pack(kinds: &[ColumnKind], sorted: &[usize], start: Residues) -> Vec<usize> {
     let mut queues: Vec<(ClassKey, std::collections::VecDeque<usize>)> = padding_classes(kinds, sorted)
         .into_iter()
         .map(|class| (class.key, class.members.into_iter().collect()))
         .collect();
-    let mut residue = 0u64;
+    // A block behind a prefix starts where the prefix ends when that is one residue.
+    let mut residue = if start.0.count_ones() == 1 {
+        u64::from(start.0.trailing_zeros())
+    } else {
+        0
+    };
     let mut packed = Vec::with_capacity(sorted.len());
     while let Some((key, queue)) = queues
         .iter_mut()
