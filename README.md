@@ -169,9 +169,12 @@ rowdiet therefore reports per table:
   values and ranges are still shown for orientation: the min/max bounds hold for every storage
   form; the expectation is a display-only figure under a stated model (varlena pads scored at
   the short/TOAST form, which stores unaligned; offset residues taken uniform) and decides
-  nothing. `varchar(n≤31)` is upgraded to *proven short, unaligned* (typmod bounds the payload
-  under the short-varlena limit), which pins the header form while the payload length still
-  varies, so later columns keep data-dependent offsets.
+  nothing. `varchar(n≤5)` is *proven short, unaligned*: the typmod bounds the payload at 20
+  bytes, under both the short-varlena limit and the 24-byte size the toaster needs before it
+  compresses anything, so the header form is pinned while the payload length still varies.
+  From `varchar(6)` on, a value can pass 20 bytes in 4-byte UTF-8 and a wide row's toaster can
+  compress it in line behind an aligned 4-byte header, so it is modeled like any other varlena
+  (measured: `varchar(10)` compressed by pglz and `varchar(6)` by lz4 on PostgreSQL 16.15).
 
 The suggested order starts from: fixed columns before varlena, alignment descending,
 irregular-size types (`timetz`, `macaddr`) at the end of their group, varlenas
@@ -179,12 +182,20 @@ alignment-descending with proven-short ones last. For all-regular schemas this y
 padding in every realization under any NULL mask. When the heuristic still pads, an exact
 search minimizes deterministic padding and the worst-case bound (within budgets it names in
 the output when they bind), and a reorder is recommended only when it dominates the order you
-wrote. On tables small enough to sweep (roughly up to seven distinct column identities; wider
-tables fall back to a budgeted candidate search and the output says so), the verdict is
-exhaustive: a clean table there provably has no dominating reorder. The search can
-beat plain fixed-first packing: `(text, boolean, bigint)` reorders to `(bigint, text, boolean)`,
-where the text sits on its alignment boundary in every storage form and the boolean never pads,
-reaching zero padding in every realization.
+wrote. Where the sweep completes over types whose stored lengths are verified, the verdict is
+exhaustive: a clean table there provably has no dominating reorder. Measured on 40,733 random
+five-column tables and 6,000 random tables of 6 to 12 columns, the sweep completes for every
+table of up to six columns with at most three varlenas, and for seven-column tables with at most
+two. Budgeted tables, which say "found" and name the budget: 36% of five-column tables with four
+varlenas and all with five, any all-`text` table of five or more columns, 26% of seven-column
+tables with three varlenas, and most tables of eight or more columns of mixed fixed types (49 to
+97% at eight, 94 to 100% from nine), where the candidate space outgrows the sweep. A type whose
+stored lengths depend on the database encoding or were not checked here (`char(n)`, `varchar(n)`
+below 134 characters, `inet`, `tsvector`, ranges, composites) turns a completed sweep into
+"found" as well, and names the types. The search can beat plain fixed-first packing:
+`(text, boolean, bigint)` reorders to `(bigint, text, boolean)`, where the text sits on its
+alignment boundary in every storage form and the boolean never pads, reaching zero padding in
+every realization.
 
 Non-obvious type facts it models: `uuid` is char-aligned (16 B, never pads);
 `inet`/`cidr` are varlena; `numeric(p,s)` is varlena regardless of precision; `char(1)` is

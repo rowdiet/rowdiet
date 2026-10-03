@@ -135,7 +135,8 @@ removes) plus `avoidable_dominance` (further worst-case waste the dominating reo
 The sum always equals the engine's proven maximum saving, so the headline can never exceed
 what some realization attains; the guaranteed minimum travels beside it (`dominance_saving`).
 Frontier bands never gate. "No dominating reorder exists" is printed only after an exhaustive
-sweep; a budgeted search says "found" plus its budget note, and a capped order search is
+sweep over a payload model no wider than storage; a budgeted search, or one over a type whose
+payload lengths are unverified, says "found" plus the reason, and a capped order search is
 labeled on clean lines and finding lines alike.
 
 **The dominance engine** (`dominance.rs`) computes exact bounds of `pad(A) − pad(B)` over all
@@ -143,32 +144,42 @@ realizations. Padding depends on a realization only through each varlena's (form
 8), so: when both orders keep the varlenas in the same relative sequence, a joint walk over the
 pair of offset residues (64 states, extremes merged per state) is exact at any column count;
 otherwise exhaustive enumeration runs within a budget (about 2M assignments), and past it the
-pair is reported as undecided (`dominance_search: budgeted`), never a guess. Frontier bands fix
-each varlena's form (up to 6 long-capable varlenas, else the frontier prints without band
-detail) and reuse the same engines.
+pair is reported as undecided (`dominance_search: budgeted`), never a guess. Both engines walk
+each fixed run through a per-residue table, so a comparison costs a step per varlena at any
+width. Frontier bands fix each varlena's form (up to 6 long-capable varlenas, else the frontier
+prints without band detail) and reuse the same engines.
 
 **The dominance sweep** is what makes the clean verdict a proof. Fixed columns of one padding
 class are pointwise interchangeable (they carry no realization variable, and their pads depend
-only on (alignment, len mod 8) and the offset residue), so one representative arrangement
-stands for all of them. Varlenas get no such collapse: a realization assigns each varlena
-column its own payload, so swapping two same-class varlena columns changes padding pointwise —
-in `(t1, m1, t2, m2)` the order `(m1, t2, t1, m2)` dominates while its class-sequence twin
+only on (alignment, len mod 8) and the offset residue), so one representative arrangement stands
+for all of them. Varlenas get no such collapse: a realization assigns each varlena column its
+own payload, so swapping two same-class varlena columns changes padding pointwise — in
+`(t1, m1, t2, m2)` the order `(m1, t2, t1, m2)` dominates while its class-sequence twin
 `(m1, t1, t2, m2)` measures 4 B/row worse at t1 = 132 B. `layout::order_space` therefore
 collapses fixed classes only and keeps every varlena an individual, which makes it
 pointwise-complete: if any reorder dominates the current order, some member attains identical
 padding in every realization. The sweep tests every member against the current order (up to
-5,040 sequences and a comparison-work budget), pruning candidates that fail a necessary
-condition for free (dominance implies <= on the worst case, the best case, and the mean over
-any sub-distribution, of which the display expectation is one — that prune makes the display
-model correctness-bearing, noted in code). A completed sweep reports
-`dominance_search: exhaustive` and the clean line reads "no dominating reorder exists", a
-universal claim the completeness argument above licenses; anything trimmed reports `budgeted`
-and says "found" instead. Scalar-objective poles alone were measured to miss 11-19% of
-dominating reorders on 4-5 column varlena schemas, which is why the sweep exists. Coverage is
-honest but narrow: the exhaustive label reaches tables whose candidate space fits the cap,
-roughly up to seven distinct column identities (a quarter of realistic schemas, none wider
-than about eleven columns); everything else falls back to the search poles plus the
-dominance-safe repack of the current order's own fixed prefix, labeled `budgeted`.
+5,040 sequences, 4M materialized column slots, and a comparison-work budget), pruning candidates
+that fail a necessary condition for free: dominance implies <= on the worst case, the best case,
+and the mean over any sub- distribution of realizations, and `dominance::summary` computes all
+three over the same realization model the comparison uses. Members that keep same-class varlenas
+in written order (the class sequences an earlier, collapsed sweep tested) go first, in that
+sweep's order, then the rest by ascending worst case, so a trimmed sweep keeps every finding the
+collapsed sweep made. A completed sweep reports `dominance_search: exhaustive` and the clean
+line reads "no dominating reorder exists", a universal claim the completeness argument above
+licenses; anything trimmed reports `budgeted` and says "found" instead. A trimmed or skipped
+sweep still tests the search poles, the current order with its leading fixed run repacked, and
+every fixed column first with the varlenas in written order; the last two keep the varlena
+sequence, so the joint walk decides them exactly at any width, and a dominating pole is always
+recommended, never printed as a frontier. Scalar-objective poles alone were measured to miss
+11-19% of dominating reorders on 4-5 column varlena schemas, which is why the sweep exists.
+Coverage, measured on 40,733 random five-column tables over an 11-type pool and 6,000 random
+tables of 6 to 12 columns: the sweep completes for every table of up to six columns with at most
+three varlenas and every seven-column table with at most two; at five columns, 36% of tables
+with four varlenas and all with five are budgeted, and an all-`text` table is budgeted from five
+columns; past seven columns of mixed fixed types the order space outgrows the 5,040 cap (49 to
+97% budgeted at eight columns, 94 to 100% from nine). On the five-column corpus every budgeted table was still right against an
+independent brute force (342 findings, 1,578 clean tables with no dominating order).
 
 **The search** (`layout::search`) emits three candidate poles: the fixed-first heuristic
 (fixed-prefix refined), the lexicographic (deterministic, worst-case) minimum — the certainty
@@ -177,15 +188,17 @@ the minimax pole. Both lexicographic pairs are additive per (class, residue-set 
 DP over class counts × the 15 cosets of Z/8 minimizes them exactly; a property test pins both
 poles against brute-force permutation search with irregulars and varlenas in the pool. The DP's
 memo is a dense mixed-radix vector of exactly the state-space bound (8 bytes per state, no
-hashing), and the whole-order search runs whenever that bound fits the state budget
-(`Π(count+1) × 15 <= 2^20`, 8 MB of memo at most, worst measured cost about 180 ms); there is
-no column-count cap, because the budget already bounds cost and a redundant cap was measured to
-flip a 7 B/row finding to a silent pass at exactly 25 columns. Past the budget the search
-degrades to the base fixed-prefix block search (3..=24 fixed columns, 12 fixed classes; its
-own bound tops out near 8M states, about 64 MB of memo and under a second, measured), and past
-that to the plain sort. The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and
-labeled on both clean and finding lines, because a capped search claiming nothing was avoidable
-is the worst defect this tool can have.
+hashing), filled in one ascending pass with no recursion, so a class of any size terminates in
+bounded stack; the whole-order search runs whenever that bound fits the state budget
+(`Π(count+1) × 15 <= 2^20`, 8 MB of memo at most); there is no column-count cap, because the
+budget already bounds cost and a redundant cap was measured to flip a 7 B/row finding to a
+silent pass at exactly 25 columns. Past the budget the search degrades to the fixed-prefix
+block search (bounded by `Π(count+1) × 8 <= 2^23` singleton states, 64 MB of memo, at any
+column count), and past that to the plain sort. The exact tier takes the certainty pole, which
+is the padding minimum whenever the search completed, and labels a capped search `budgeted`.
+The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and labeled on both clean
+and finding lines, because a capped search claiming nothing was avoidable is the worst defect
+this tool can have.
 
 The certainty pole exists for the frontier: `(timetz, timetz, text)` pays a certain 4 B/row,
 and interposing the text trades that for a data-dependent 0..=7 — measured 3 B/row worse on
@@ -193,18 +206,40 @@ and interposing the text trades that for a data-dependent 0..=7 — measured 3 B
 it with both worst cases and the bands.
 
 Two scope notes on the frontier itself. First (deviation five): a pole earns a frontier line
-only when it also improves a realization-free summary (worst case, or deterministic padding);
-an incomparable pole that is worse on both summaries is suppressed as noise, so one spelling of
-an incomparable pair can render a frontier while the reverse spelling renders none. Second, the
-band verdicts are computed over a superset of the realizations some types can take: an array of
-fixed-width elements or a blank-padded `char(n)` reaches only a subset of payload residues, so
-a band the model calls payload-length dependent can be deterministic for such a column. The
-direction is safe (a superset can only weaken a claim, never fabricate a dominance win); the
-cost is precision.
+only when it also improves a realization-free summary (worst case, or deterministic padding); an
+incomparable pole that is worse on both summaries is suppressed as noise, so one spelling of an
+incomparable pair can render a frontier while the reverse spelling renders none. Second, payload
+residues. A short value is stored uncompressed, and some encodings pin its length mod 8: an
+array's data area starts MAXALIGNed and every element is padded to the element alignment
+(`array.h`, `construct_md_array`), so a `float8[]` payload is always 4 mod 8 and an `int4[]` or
+`text[]` payload 0 or 4 mod 8; numeric stores a 2- or 4-byte header plus 2-byte digits, so its
+payloads are even (`numeric.c`). The model narrows the short form to those residues
+(`layout::Payload`); the long form keeps every residue, because a compressed inline value takes
+any length (measured on PostgreSQL 16.15: uncompressed `float8[]` payloads only ever 4 mod 8,
+`int4[]` and `text[]` 0 or 4, `int2[]` and `numeric` even, while compressed inline `float8[]`
+and `numeric` values reached all 8 residues). A model wider than storage is safe for a win,
+since dominance over more realizations implies dominance over fewer, but not for an absence
+claim: modeled with every residue, `(smallint, float8[], float8[], macaddr)` printed "no
+dominating reorder exists" while `(macaddr, smallint, a2, a1)` measures never worse on 5,996
+rows paired across short, long and mixed loads, and 8.444 to 1.730 B/row on the long-heavy one.
+Types whose stored lengths depend on the database encoding or were not checked here (`inet`,
+`bit`, `char(n)`, `varchar(n)` below 134 characters, whose single-byte spelling can neither
+reach every short residue nor an uncompressed long value, `tsvector`, ranges, composites,
+extension types other than `citext`, unknown types) keep every residue; their findings hold, and
+a completed sweep over them reports `dominance_search: superset` and says "found", naming the
+types.
+
+Third, the toaster decides a value's form per tuple: it compresses or moves out the largest
+attribute until the tuple fits, the tuple size includes the order's own padding, and size ties
+go to the lower attribute number. A row near the 2 kB threshold, or with two equally large
+values, can therefore realize differently in two orders of the same table (measured: 4 of 6,000
+`pin` rows, an array moved out of line in one order and kept inline in the other). Every claim
+here is per realization, and the measurement harness compares only rows both orders stored the
+same way and reports the rest.
 
 ## Suggested order
 
-Sort key of the heuristic pole: `(fixed=0 | varlena=1 | proven-short=2, alignment desc,
+Sort key of the heuristic pole: `(fixed=0 | varlena=1 | always-short=2, alignment desc,
 irregular-last, original index)`. Irregulars are fixed types whose size isn't a multiple of
 their own alignment — exactly `timetz (12,d)` and `macaddr (6,i)` among built-ins (also
 `tid (6,s)`); putting them last in their group keeps every following smaller-alignment column
@@ -230,8 +265,13 @@ frontier, or says what it searched (see the decision policy above).
 
 Derived rules (all from PostgreSQL source): enum → `(4,i)`; domain → base verbatim;
 array/range/multirange → varlena, `d` iff element/subtype is `d`, else `i`; composite → `(-1,d)`;
-serial family → int type + implicit NOT NULL. `varchar(n≤31)`/`char(n≤31)` are *proven short*
-(≤ 4·31+1 = 125 B worst-case UTF-8, under the 127 B short-varlena cap) — stored unaligned.
+serial family → int type + implicit NOT NULL. `varchar(n≤31)`/`char(n≤31)` keep the `p` in the
+layout signature (≤ 4·31+1 = 125 B worst-case UTF-8, under the 127 B short-varlena cap, so an
+uncompressed value stores unaligned), but only n ≤ 5 is *always short*: the toaster considers an
+attribute for compression once it passes 24 bytes with its header (`toast_helper.c`), lz4 has
+no minimum input, and a compressed value keeps the aligned 4-byte header (`VARATT_CAN_MAKE_SHORT`
+needs an uncompressed value). From n = 6 a value can pass 20 payload bytes in 4-byte UTF-8, so
+the model gives it the aligned form and leaves its payload unverified for absence claims.
 Bare `char` is `char(1)`; bare `varchar` is unlimited. Quoted `"char"` is the 1-byte type
 (catalog key `pgchar`).
 
