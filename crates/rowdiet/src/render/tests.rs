@@ -507,3 +507,17 @@ fn json_carries_the_null_model() {
     );
     assert_eq!(t["dominance_saving"], serde_json::json!({"min": 0, "max": 8}));
 }
+
+#[test]
+fn null_variable_names_print_escaped() {
+    let analysis = analyze("CREATE TABLE t (\"n\n::error::NULLVAR\" smallint, i integer NOT NULL, x text NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("NULLs move later offsets in: n\\n::error::NULLVAR"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|l| l.trim_start().starts_with("::")),
+        "{rendered}"
+    );
+}
