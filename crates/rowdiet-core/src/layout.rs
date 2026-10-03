@@ -1,14 +1,18 @@
 //! On-disk tuple layout math. Assumes 64-bit PostgreSQL (MAXALIGN = 8, `d` alignment = 8 bytes);
 //! a 32-bit knob is out of scope for v1.
 //!
-//! All row numbers assume every column non-NULL. Varlena payload bytes never count toward sizes
-//! (they are unknowable from DDL), but they do move every later column's offset: from the first
-//! varlena on, an offset is known only as a set of possible residues mod MAXALIGN, and each
-//! later pad is reported as a min/max/expected range over that set.
+//! [`walk`] lays out rows that store every column. A NULL stores no bytes and no pad
+//! (`heap_fill_tuple` skips it), so a nullable column moves later offsets by its pad and length in
+//! the rows that store it and by nothing in the rows that do not; [`Column`] carries that fact to
+//! the realization model in [`crate::dominance`], which bounds padding over every NULL pattern.
+//! Varlena payload bytes never count toward sizes (they are unknowable from DDL), but they do
+//! move every later column's offset: from the first varlena on, an offset is known only as a set
+//! of possible residues mod MAXALIGN, and each later pad is reported as a min/max/expected range
+//! over that set.
 //!
 //! Expected values are display-only figures: the gate and the reorder recommendation act on
 //! deterministic pads and dominance instead (see [`crate::dominance`] and the report layer).
-//! Two stated modeling assumptions feed every expected value, and only bounds hold without them:
+//! Three stated modeling assumptions feed every expected value, and only bounds hold without them:
 //!
 //! 1. **Varlena pads are scored at the short-form/TOAST value of zero.** Postgres stores a
 //!    varlena payload of 126 bytes or less with a 1-byte header and no alignment
@@ -19,6 +23,7 @@
 //! 2. **Offset residues after a varlena are taken as uniformly likely.** Real payload-width
 //!    distributions can be skewed mod 8 (fixed-length codes, TOAST pointers pin the residue),
 //!    which moves the expectation of later fixed-column pads inside the reported min/max range.
+//! 3. **No column holds a NULL.** NULL frequencies are workload facts the DDL does not carry.
 //!
 //! Pads placed while the offset is exactly known stay exact, so all-fixed tables keep
 //! byte-exact numbers.
@@ -171,6 +176,50 @@ impl ColumnKind {
     }
 }
 
+/// The payload residue whose short form advances a multiple of 8 bytes (a 1-byte header plus 7):
+/// the one non-NULL step that leaves the offset where a NULL leaves it.
+pub(crate) const NULL_LIKE_RESIDUE: u8 = 1 << 7;
+
+/// One column as the realization model sees it: its storage class and whether its rows may hold
+/// NULL. A NULL stores nothing, so a nullable column's NULL is a realization of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Column {
+    /// Storage class.
+    pub kind: ColumnKind,
+    /// Rows may store NULL here: such a row stores neither the value nor its pad.
+    pub nullable: bool,
+}
+
+impl Column {
+    /// A `NOT NULL` column: stored in every row.
+    pub fn not_null(kind: ColumnKind) -> Self {
+        Self { kind, nullable: false }
+    }
+
+    /// A nullable column.
+    pub fn nullable(kind: ColumnKind) -> Self {
+        Self { kind, nullable: true }
+    }
+
+    /// True when a NULL here is a step no stored value takes, so it moves later offsets in a way
+    /// the column's values cannot: every nullable fixed column, and a nullable varlena whose short
+    /// payloads never advance a multiple of 8 (numeric, arrays of wider elements). A nullable
+    /// text's NULL advances like its 7-byte payloads.
+    pub fn null_varies(&self) -> bool {
+        self.nullable
+            && match self.kind {
+                ColumnKind::Fixed { .. } => true,
+                ColumnKind::Varlena { payload, .. } => payload.residues() & NULL_LIKE_RESIDUE == 0,
+            }
+    }
+}
+
+impl From<ColumnKind> for Column {
+    fn from(kind: ColumnKind) -> Self {
+        Self::not_null(kind)
+    }
+}
+
 /// Bytes to insert so `offset` lands on a multiple of `align`; 0 when it already does.
 pub fn pad(offset: u64, align: u64) -> u64 {
     (align - offset % align) % align
@@ -290,6 +339,14 @@ impl Residues {
     fn shifted(self, len: u64) -> Self {
         Self(self.0.rotate_left((len % MAXALIGN) as u32))
     }
+
+    /// The largest pad for aligning to `align` from any residue in the set, and whether every
+    /// residue pads the same; valid for every set, cosets or not.
+    fn pad_spread(self, align: u64) -> (u64, bool) {
+        let mut pads = (0..MAXALIGN).filter(|&r| self.contains(r)).map(|r| pad_pow2(r, align));
+        let first = pads.next().expect("non-empty residue set");
+        pads.fold((first, true), |(max, same), p| (max.max(p), same && p == first))
+    }
 }
 
 /// One column's placement in a [`Walk`].
@@ -400,6 +457,79 @@ pub fn walk(kinds: &[ColumnKind]) -> Walk {
         uncertain_expected_eighths,
         end,
     }
+}
+
+/// Padding certain in every row that stores its column, over every NULL pattern: the pads whose
+/// value no payload length, storage form, or earlier NULL can change. Equals [`Walk::padding`]
+/// when no fixed column is nullable; a nullable fixed column widens the residues later columns
+/// can start at, so a pad behind one stays certain only if an alignment restores it.
+pub fn certain_padding(columns: &[Column], order: &[usize]) -> u64 {
+    let mut any = Residues::START;
+    let mut total = 0;
+    for &index in order {
+        let column = columns[index];
+        match column.kind {
+            ColumnKind::Fixed { len, align } => {
+                let (max, same) = any.pad_spread(align.bytes());
+                if same {
+                    total += max;
+                }
+                let stored = any.aligned(align.bytes()).shifted(len);
+                any = if column.nullable {
+                    Residues(any.0 | stored.0)
+                } else {
+                    stored
+                };
+            }
+            // A varlena's short form pads 0, so its own pad is never certain and nonzero.
+            ColumnKind::Varlena { .. } => any = Residues::FULL,
+        }
+    }
+    total
+}
+
+/// Exact smallest and largest data end over the rows of an all-fixed order that hold at least
+/// one NULL, or None when no column is nullable or a varlena makes the end unknowable. Feeds the
+/// footprint of NULL-carrying rows, which also pay the null bitmap in their header.
+pub fn null_row_ends(columns: &[Column]) -> Option<(u64, u64)> {
+    if !columns.iter().any(|c| c.nullable) || !columns.iter().all(|c| c.kind.is_fixed()) {
+        return None;
+    }
+    // State: (offset residue, some NULL seen) -> (smallest end, largest end).
+    let mut states: [Option<(u64, u64)>; 16] = [None; 16];
+    states[0] = Some((0, 0));
+    for column in columns {
+        let ColumnKind::Fixed { len, align } = column.kind else {
+            unreachable!("checked all-fixed above")
+        };
+        let mut next: [Option<(u64, u64)>; 16] = [None; 16];
+        let mut merge = |slot: usize, lo: u64, hi: u64| match &mut next[slot] {
+            Some((a, b)) => {
+                *a = (*a).min(lo);
+                *b = (*b).max(hi);
+            }
+            none @ None => *none = Some((lo, hi)),
+        };
+        for (state, bounds) in states.iter().enumerate() {
+            let Some((lo, hi)) = *bounds else { continue };
+            let (residue, seen) = ((state % 8) as u64, state / 8);
+            let p = pad_pow2(residue, align.bytes());
+            merge(
+                seen * 8 + ((residue + p + len) % MAXALIGN) as usize,
+                lo + p + len,
+                hi + p + len,
+            );
+            if column.nullable {
+                merge(8 + residue as usize, lo, hi);
+            }
+        }
+        states = next;
+    }
+    states[8..]
+        .iter()
+        .flatten()
+        .copied()
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
 }
 
 /// Per-row on-disk footprint for a table of only fixed-width columns, no-NULL scenario:
@@ -548,70 +678,104 @@ fn fixed_block_fits(kinds: &[ColumnKind], block: &[usize]) -> bool {
         .is_some_and(|states| states <= FIXED_BLOCK_STATE_BUDGET)
 }
 
-/// A dominance-complete candidate space over `kinds`, or None when it exceeds `cap`.
+/// A dominance-complete candidate space over `columns`, or None when it exceeds `cap`.
 ///
-/// Fixed columns of one padding class are pointwise interchangeable: they carry no realization
-/// variable, and their pads depend only on (alignment, len mod 8) and the offset residue, so
-/// swapping two of them changes no realization's padding and one representative arrangement
-/// (original relative order) stands for all. Varlenas get no such collapse: a realization
-/// assigns each varlena column its own payload, so swapping two same-class varlena columns
-/// permutes that assignment and changes padding pointwise (measured: in
-/// (t1, m1, t2, m2) the order (m1, t2, t1, m2) dominates while its class-sequence twin
-/// (m1, t1, t2, m2) can be 4 B/row worse). Every varlena is therefore its own singleton class
-/// here, which makes the space pointwise-complete: if any reorder dominates a given order,
-/// some member of this space attains identical padding in every realization.
-pub fn order_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> {
-    let identity: Vec<usize> = (0..kinds.len()).collect();
+/// `NOT NULL` fixed columns of one padding class are pointwise interchangeable: they carry no
+/// realization variable, and their pads depend only on (alignment, len mod 8) and the offset
+/// residue, so swapping two of them changes no realization's padding or row size and one
+/// representative arrangement (original relative order) stands for all. Columns that carry a
+/// realization variable get no such collapse: a realization assigns each varlena its own payload
+/// and each nullable column its own NULL, so swapping two same-class ones permutes that
+/// assignment and changes padding pointwise (measured: in (t1, m1, t2, m2) the order
+/// (m1, t2, t1, m2) dominates while its class-sequence twin (m1, t1, t2, m2) can be 4 B/row
+/// worse). Every varlena and every nullable fixed column is therefore its own singleton class
+/// here, which makes the space pointwise-complete: if any reorder dominates a given order, some
+/// member of this space attains identical padding in every realization.
+pub fn order_space(columns: &[Column], cap: usize) -> Option<Vec<Vec<usize>>> {
     let mut classes: Vec<PaddingClass> = Vec::new();
-    for &index in &identity {
-        match kinds[index] {
-            ColumnKind::Fixed { len, align } => {
-                let key = ClassKey::Fixed {
-                    align: align.bytes(),
-                    len_mod: len % MAXALIGN,
-                };
-                match classes.iter_mut().find(|c| c.key == key) {
-                    Some(class) => class.members.push(index),
-                    None => classes.push(PaddingClass {
-                        key,
-                        members: vec![index],
-                    }),
+    let mut collapsed: Vec<(ClassKey, usize)> = Vec::new();
+    for (index, &column) in columns.iter().enumerate() {
+        let key = class_key(column.kind);
+        // One class per varlena and per nullable fixed column: the realization variable each
+        // carries forbids the collapse.
+        let shared = column.kind.is_fixed() && !column.nullable;
+        match collapsed.iter().find(|(k, _)| shared && *k == key) {
+            Some(&(_, class)) => classes[class].members.push(index),
+            None => {
+                if shared {
+                    collapsed.push((key, classes.len()));
                 }
+                classes.push(PaddingClass {
+                    key,
+                    members: vec![index],
+                });
             }
-            // One class per varlena column: payload identity forbids the collapse.
-            ColumnKind::Varlena { align, .. } => classes.push(PaddingClass {
-                key: ClassKey::Varlena { align: align.bytes() },
-                members: vec![index],
-            }),
         }
     }
-    let mut sequences: usize = 1;
-    let mut remaining = kinds.len();
-    for class in &classes {
-        sequences = sequences.checked_mul(binomial(remaining, class.members.len(), cap)?)?;
-        if sequences > cap {
-            return None;
-        }
-        remaining -= class.members.len();
-    }
-    let mut queues: Vec<std::collections::VecDeque<usize>> =
-        classes.iter().map(|c| c.members.iter().copied().collect()).collect();
-    let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
-    let mut out = Vec::with_capacity(sequences);
-    let mut current = Vec::with_capacity(kinds.len());
-    generate_orders(&mut queues, &mut counts, kinds.len(), &mut current, &mut out);
-    Some(out)
+    generate_space(&classes, columns.len(), cap)
 }
 
-/// The members of [`order_space`] that keep same-class varlenas in written order, generated over
-/// padding classes: the candidate space an earlier, collapsed sweep tested, in the order it tested
-/// them. None when it exceeds `cap`.
-pub fn class_sequence_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<usize>>> {
-    let identity: Vec<usize> = (0..kinds.len()).collect();
-    let classes = padding_classes(kinds, &identity);
+/// The members of [`order_space`] that keep [`keeps_class_order`]: same-class varlenas and
+/// same-class nullable fixed columns in written order, generated over padding classes. This is
+/// the candidate space an earlier, collapsed sweep tested, in the order it tested them. None
+/// when it exceeds `cap`.
+pub fn class_sequence_space(columns: &[Column], cap: usize) -> Option<Vec<Vec<usize>>> {
+    let mut classes: Vec<(SequenceKey, PaddingClass)> = Vec::new();
+    for (index, &column) in columns.iter().enumerate() {
+        let key = sequence_key(column);
+        match classes.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, class)) => class.members.push(index),
+            None => classes.push((
+                key,
+                PaddingClass {
+                    key: key.class,
+                    members: vec![index],
+                },
+            )),
+        }
+    }
+    let classes: Vec<PaddingClass> = classes.into_iter().map(|(_, class)| class).collect();
+    generate_space(&classes, columns.len(), cap)
+}
+
+/// True when `order` keeps same-class varlenas and same-class nullable fixed columns in written
+/// order: the members [`class_sequence_space`] generates.
+pub fn keeps_class_order(columns: &[Column], order: &[usize]) -> bool {
+    let mut last_seen: Vec<(SequenceKey, usize)> = Vec::new();
+    for &column in order {
+        let key = sequence_key(columns[column]);
+        if !key.variable {
+            continue;
+        }
+        match last_seen.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, last)) if *last > column => return false,
+            Some((_, last)) => *last = column,
+            None => last_seen.push((key, column)),
+        }
+    }
+    true
+}
+
+/// A column's class in [`class_sequence_space`]: its padding class, split by whether it carries
+/// a realization variable (a varlena, or a nullable fixed column).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SequenceKey {
+    class: ClassKey,
+    variable: bool,
+}
+
+fn sequence_key(column: Column) -> SequenceKey {
+    SequenceKey {
+        class: class_key(column.kind),
+        variable: !column.kind.is_fixed() || column.nullable,
+    }
+}
+
+/// Every interleaving of `classes` that keeps each class's members in order, or None past `cap`.
+fn generate_space(classes: &[PaddingClass], total: usize, cap: usize) -> Option<Vec<Vec<usize>>> {
     let mut sequences: usize = 1;
-    let mut remaining = kinds.len();
-    for class in &classes {
+    let mut remaining = total;
+    for class in classes {
         sequences = sequences.checked_mul(binomial(remaining, class.members.len(), cap)?)?;
         if sequences > cap {
             return None;
@@ -622,8 +786,8 @@ pub fn class_sequence_space(kinds: &[ColumnKind], cap: usize) -> Option<Vec<Vec<
         classes.iter().map(|c| c.members.iter().copied().collect()).collect();
     let mut counts: Vec<usize> = classes.iter().map(|c| c.members.len()).collect();
     let mut out = Vec::with_capacity(sequences);
-    let mut current = Vec::with_capacity(kinds.len());
-    generate_orders(&mut queues, &mut counts, kinds.len(), &mut current, &mut out);
+    let mut current = Vec::with_capacity(total);
+    generate_orders(&mut queues, &mut counts, total, &mut current, &mut out);
     Some(out)
 }
 
@@ -839,19 +1003,7 @@ fn run_dp(classes: &[PaddingClass], total: usize, mode: LexMode) -> Vec<usize> {
 fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
     let mut classes: Vec<PaddingClass> = Vec::new();
     for &index in order {
-        let key = match kinds[index] {
-            ColumnKind::Fixed { len, align } => ClassKey::Fixed {
-                align: align.bytes(),
-                len_mod: len % MAXALIGN,
-            },
-            kind @ ColumnKind::Varlena { align, .. } => {
-                if kind.always_short() || align == Align::Char {
-                    ClassKey::PadlessVarlena
-                } else {
-                    ClassKey::Varlena { align: align.bytes() }
-                }
-            }
-        };
+        let key = class_key(kinds[index]);
         match classes.iter_mut().find(|c| c.key == key) {
             Some(class) => class.members.push(index),
             None => classes.push(PaddingClass {
@@ -861,6 +1013,20 @@ fn padding_classes(kinds: &[ColumnKind], order: &[usize]) -> Vec<PaddingClass> {
         }
     }
     classes
+}
+
+/// A column's padding class: fixed columns by (alignment, len mod 8); varlenas that never pad in
+/// any storage form (always short, or char-aligned) share one class; the others class by
+/// alignment, which decides their worst-case long-form pad.
+fn class_key(kind: ColumnKind) -> ClassKey {
+    match kind {
+        ColumnKind::Fixed { len, align } => ClassKey::Fixed {
+            align: align.bytes(),
+            len_mod: len % MAXALIGN,
+        },
+        ColumnKind::Varlena { align, .. } if kind.always_short() || align == Align::Char => ClassKey::PadlessVarlena,
+        ColumnKind::Varlena { align, .. } => ClassKey::Varlena { align: align.bytes() },
+    }
 }
 
 struct PaddingClass {

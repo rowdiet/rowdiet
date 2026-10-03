@@ -141,6 +141,9 @@ pub struct GateOutcome {
     pub skipped_statements: usize,
     /// Non-ignored tables marked incomplete (skipped or unexpanded DDL touched them).
     pub incomplete_tables: usize,
+    /// Non-ignored complete tables whose dominance search ran out of budget: a clean verdict
+    /// there says only that the searched candidates hold no dominating reorder.
+    pub budgeted_tables: usize,
     /// Scanned paths that matched no SQL files at all — a typo'd migrations directory would
     /// otherwise gate green forever having analyzed nothing.
     pub empty_scans: usize,
@@ -154,19 +157,20 @@ pub struct GateOutcome {
 }
 
 impl GateOutcome {
-    /// True when the analysis degraded: statements were skipped, tables are incomplete, or a
-    /// scanned path matched no SQL files. This is exactly the condition `fail_on_degraded`
-    /// escalates to a failure; without that flag it stays visible here while the gate stays
-    /// green.
+    /// True when the analysis degraded: statements were skipped, tables are incomplete, a
+    /// table's dominance search was budgeted, or a scanned path matched no SQL files. This is
+    /// exactly the condition `fail_on_degraded` escalates to a failure; without that flag it stays
+    /// visible here while the gate stays green.
     pub fn degraded(&self) -> bool {
-        self.skipped_statements > 0 || self.incomplete_tables > 0 || self.empty_scans > 0
+        self.skipped_statements > 0 || self.incomplete_tables > 0 || self.budgeted_tables > 0 || self.empty_scans > 0
     }
 }
 
 /// Gate an analysis. An explicit `fail_over` wins over the baseline file's recorded one; with
 /// neither present nothing can fail. Ignored tables are outside both gate and baseline.
 /// `fail_on_degraded` additionally fails the gate when statements were skipped, tables are
-/// incomplete, or a scanned path matched no SQL files — without it those are surfaced in the
+/// incomplete, a dominance search was budgeted, or a scanned path matched no SQL files — without
+/// it those are surfaced in the
 /// outcome but stay green (a sqlparser user cannot always fix a parser gap; under pg-exact
 /// skips should be zero, so strict is cheap).
 pub fn evaluate(
@@ -201,6 +205,7 @@ pub fn evaluate(
         .filter(|n| n.kind == crate::fold::NoteKind::SkippedStatement)
         .count();
     let incomplete_tables = analysis.gated_tables().filter(|t| t.incomplete).count();
+    let budgeted_tables = analysis.gated_tables().filter(|t| t.budgeted()).count();
     let empty_scans = analysis
         .notes
         .iter()
@@ -210,6 +215,7 @@ pub fn evaluate(
         exceeded: false,
         skipped_statements,
         incomplete_tables,
+        budgeted_tables,
         empty_scans,
         verdicts,
         orphaned,
