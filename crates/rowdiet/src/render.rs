@@ -767,7 +767,7 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         for note in &analysis.notes {
             let _ = writeln!(
                 out,
-                "- `{}:{}` [{}] {}",
+                "- {}:{} [{}] {}",
                 markdown_cell(&note.origin.source),
                 note.origin.line,
                 kind_label(note.kind),
@@ -786,8 +786,26 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     out
 }
 
+/// Text for one markdown table cell or list item: line breaks become spaces, control characters
+/// drop, and every character markdown or HTML would read as syntax is backslash-escaped.
+fn markdown_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            c if c.is_control() => {}
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '~' | '&' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn markdown_cell(s: &str) -> String {
-    escape_text(s).replace('|', "\\|")
+    markdown_text(s)
 }
 
 pub fn json(analysis: &Analysis, fail_over: Option<f64>, gate: &GateOutcome) -> Result<String, String> {

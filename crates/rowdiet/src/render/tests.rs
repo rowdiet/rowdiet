@@ -332,7 +332,7 @@ fn step_summary_cells_hold_one_line() {
         analyze("CREATE TABLE \"a\r|b\" (x int NOT NULL, y bigint NOT NULL, z int NOT NULL, w bigint NOT NULL);");
     let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
     assert!(!summary.contains('\r'), "{summary}");
-    assert!(summary.contains(r#"| "a\r\|b" | 8.0 |"#), "{summary}");
+    assert!(summary.contains(r#"| "a \|b" | 8.0 |"#), "{summary}");
 }
 
 #[test]
@@ -393,5 +393,30 @@ fn a_capped_search_never_prints_a_checkmark_over_certain_padding() {
     assert!(
         rendered.contains("7 B padding; no order the capped search tried saves a footprint rung (search capped: heuristic orders only)"),
         "{rendered}"
+    );
+}
+
+#[test]
+fn step_summary_cells_render_no_html_or_markdown_from_names() {
+    let sql = [
+        include_str!("../../tests/fixtures/markdown/V1__md.sql"),
+        include_str!("../../tests/fixtures/markdown/V2__img.sql"),
+        "CREATE TABLE d (a int, \"<img src=https://example.invalid/d.png>\" text);\n\
+         ALTER TABLE d DROP COLUMN \"<img src=https://example.invalid/d.png>\";",
+    ]
+    .concat();
+    let analysis = analyze(&sql);
+    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let unescaped = summary.replace("\\<", "");
+    for raw in ["<img", "<a ", "<b>", "```sql", "**rowdiet"] {
+        assert!(!unescaped.contains(raw), "{raw} reached the summary:\n{summary}");
+    }
+    assert!(
+        summary.contains(r"frontier: \<img src=https://example.invalid/a.png\>"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains(r"column \<img src=https://example.invalid/d.png\> dropped"),
+        "{summary}"
     );
 }
