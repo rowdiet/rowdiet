@@ -455,7 +455,8 @@ pub enum SearchScope {
     /// The whole-order search was over budget; the fixed prefix was still searched exactly and
     /// varlena placement follows the heuristic.
     FixedPrefix,
-    /// Even the fixed-prefix search was out of caps; the order is the plain heuristic sort.
+    /// Even the fixed-prefix search was out of caps; the fixed block takes the better of the
+    /// heuristic sort and a greedy residue packing.
     SortOnly,
 }
 
@@ -664,7 +665,8 @@ fn generate_orders(
 }
 
 /// Repack the leading fixed run of `order` to its deterministic minimum (past the search budget,
-/// to the heuristic sort when that pads less), leaving everything from the first varlena on
+/// to the better of the sort and a greedy packing when that pads less), leaving everything from
+/// the first varlena on
 /// untouched. With the suffix preserved, any prefix improvement dominates the original order
 /// (the never-negative-recovery induction), which makes this the decision policy's always-safe
 /// repair candidate at any width.
@@ -677,7 +679,8 @@ pub fn refine_leading_fixed(kinds: &[ColumnKind], order: &mut [usize]) {
 /// would absorb. When the fixed block pads, find the exact minimum over the block: deterministic
 /// padding depends only on (alignment, len mod MAXALIGN) classes and the running offset residue,
 /// so a memoized search over class counts is exhaustive. Past [`FIXED_BLOCK_STATE_BUDGET`] the
-/// block takes the heuristic sort instead, when that pads less. The varlena tail stays where it
+/// block takes the better of the heuristic sort and [`greedy_pack`], when that pads less. The
+/// varlena tail stays where it
 /// was, which makes the refinement dominance-safe: with the tail sequence preserved, reducing the
 /// prefix padding reduces the total in every realization (the report layer relies on exactly
 /// this).
@@ -701,9 +704,41 @@ fn refine_fixed_block(kinds: &[ColumnKind], order: &mut [usize]) {
     }
     let mut sorted = order[..fixed_len].to_vec();
     sorted.sort_by_key(|&i| sort_key(&kinds[i], i));
-    if block_padding(&sorted) < current {
-        order[..fixed_len].copy_from_slice(&sorted);
+    let greedy = greedy_pack(kinds, &sorted);
+    let best = [sorted, greedy]
+        .into_iter()
+        .min_by_key(|candidate| block_padding(candidate))
+        .expect("two candidates");
+    if block_padding(&best) < current {
+        order[..fixed_len].copy_from_slice(&best);
     }
+}
+
+/// A fixed block packed column by column: each step takes the class that pads least from the
+/// current offset, the earliest in `sorted` on ties. It interleaves irregulars with the columns
+/// that absorb them (timetz with int4, macaddr with int2), which the sort keeps apart.
+fn greedy_pack(kinds: &[ColumnKind], sorted: &[usize]) -> Vec<usize> {
+    let mut queues: Vec<(ClassKey, std::collections::VecDeque<usize>)> = padding_classes(kinds, sorted)
+        .into_iter()
+        .map(|class| (class.key, class.members.into_iter().collect()))
+        .collect();
+    let mut residue = 0u64;
+    let mut packed = Vec::with_capacity(sorted.len());
+    while let Some((key, queue)) = queues
+        .iter_mut()
+        .filter(|(_, queue)| !queue.is_empty())
+        .min_by_key(|(key, _)| match key {
+            ClassKey::Fixed { align, .. } => pad_pow2(residue, *align),
+            ClassKey::Varlena { .. } | ClassKey::PadlessVarlena => u64::MAX,
+        })
+    {
+        let ClassKey::Fixed { align, len_mod } = *key else {
+            unreachable!("a fixed block holds fixed columns")
+        };
+        packed.push(queue.pop_front().expect("non-empty"));
+        residue = (residue + pad_pow2(residue, align) + len_mod) % MAXALIGN;
+    }
+    packed
 }
 
 /// The two lexicographic objectives the policy needs. Both components are additive per

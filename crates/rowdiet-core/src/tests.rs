@@ -1836,6 +1836,27 @@ mod closure_review {
     }
 
     #[test]
+    fn a_capped_fixed_search_still_packs_the_irregulars() {
+        // 49 fixed columns in 7 classes put the block search over budget; the sort keeps every
+        // timetz and macaddr padding, and the capped table passed as "nothing to gain".
+        // Measured on PostgreSQL 16: 403 B tuples as written, 367 B hand-packed.
+        let mut types: Vec<&str> = Vec::new();
+        for ty in ["bigint", "timetz", "integer", "macaddr", "smallint"] {
+            types.extend([ty; 7]);
+        }
+        for _ in 0..7 {
+            types.extend(["boolean", "uuid"]);
+        }
+        let a = analyze_sources(&[src("V1__f.sql", &table_sql("fbs", &types))], &Config::default());
+        let t = &a.tables[0];
+        assert_eq!(t.search_scope, SearchScope::SortOnly);
+        assert_eq!(t.current.padding, 36);
+        assert_eq!(t.suggested.padding, 0);
+        assert_eq!((t.current.footprint, t.suggested.footprint), (Some(408), Some(368)));
+        assert_eq!(t.avoidable_bytes_per_row, 40.0);
+    }
+
+    #[test]
     fn a_capped_exact_search_claims_no_exhaustiveness() {
         // Seven fixed classes of 40 columns each put both searches over budget; the heuristic
         // sort still pads, and the labels must say the search was capped.

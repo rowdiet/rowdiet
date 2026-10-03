@@ -379,3 +379,19 @@ fn sql_spelling_quotes_only_what_needs_it() {
     assert_eq!(sql_spelling("bare\u{2028}name"), None);
     assert_eq!(sql_spelling("\"open"), None);
 }
+
+#[test]
+fn a_capped_search_never_prints_a_checkmark_over_certain_padding() {
+    let mut analysis = analyze("CREATE TABLE f (a boolean NOT NULL, b bigint NOT NULL);");
+    let t = &mut analysis.tables[0];
+    assert_eq!(t.current.padding, 7);
+    t.avoidable_bytes_per_row = 0.0;
+    t.search_scope = SearchScope::SortOnly;
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.starts_with("◐ f "), "{rendered}");
+    assert!(!rendered.contains("nothing to gain"), "{rendered}");
+    assert!(
+        rendered.contains("7 B padding; no order the capped search tried saves a footprint rung (search capped: heuristic orders only)"),
+        "{rendered}"
+    );
+}

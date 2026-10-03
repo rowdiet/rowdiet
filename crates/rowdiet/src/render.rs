@@ -130,9 +130,17 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         return;
     }
     if t.avoidable_bytes_per_row == 0.0 {
+        // Certain padding a capped search left in place is not a clean result.
+        let capped_waste = t.search_scope != SearchScope::Complete && t.current.padding > 0;
         let detail = match (t.tier, t.current.padding) {
             (Tier::Estimate, _) => format!("{}, {}{}", stats_line(&t.current), verdict_phrase(t), scope_note(t)),
             (Tier::Exact, 0) => format!("optimal: zero padding{}", scope_note(t)),
+            (Tier::Exact, p) if capped_waste => {
+                format!(
+                    "{p} B padding; no order the capped search tried saves a footprint rung{}",
+                    scope_note(t)
+                )
+            }
             (Tier::Exact, p) => {
                 format!(
                     "{p} B padding but footprint unchanged (MAXALIGN rounding) — nothing to gain{}",
@@ -142,7 +150,8 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
             // Incomplete tables return above as "not analyzable"; unreachable here in practice.
             (Tier::Unknown, _) => "columns not fully known".to_string(),
         };
-        let _ = writeln!(out, "✓ {display} ({loc}) — {detail} [{}]", tier_label(t.tier));
+        let mark = if capped_waste { "◐" } else { "✓" };
+        let _ = writeln!(out, "{mark} {display} ({loc}) — {detail} [{}]", tier_label(t.tier));
         render_frontier(out, t);
         render_flags(out, t);
         render_verdict(out, t, verdict);
@@ -257,7 +266,7 @@ fn scope_note(t: &TableReport) -> &'static str {
     match t.search_scope {
         SearchScope::Complete => "",
         SearchScope::FixedPrefix => " (search capped: fixed prefix exact, varlena placement heuristic)",
-        SearchScope::SortOnly => " (search capped: heuristic sort only)",
+        SearchScope::SortOnly => " (search capped: heuristic orders only)",
     }
 }
 

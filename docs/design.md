@@ -194,8 +194,11 @@ bounded stack; the whole-order search runs whenever that bound fits the state bu
 budget already bounds cost and a redundant cap was measured to flip a 7 B/row finding to a
 silent pass at exactly 25 columns. Past the budget the search degrades to the fixed-prefix
 block search (bounded by `Π(count+1) × 8 <= 2^23` singleton states, 64 MB of memo, at any
-column count), and past that to the plain sort. The exact tier takes the certainty pole, which
-is the padding minimum whenever the search completed, and labels a capped search `budgeted`.
+column count), and past that to the better of the plain sort and a greedy packing that takes,
+column by column, the class padding least from the current offset (it pairs `timetz` with
+`int4` and `macaddr` with `int2`, which the sort keeps apart). The exact tier takes the certainty
+pole, which is the padding minimum whenever the search completed, and labels a capped search
+`budgeted`; a capped table that still pads prints `◐` with what was searched, never `✓`.
 The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and labeled on both clean
 and finding lines, because a capped search claiming nothing was avoidable is the worst defect
 this tool can have.
