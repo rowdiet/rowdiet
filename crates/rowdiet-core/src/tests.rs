@@ -899,14 +899,36 @@ mod audit_fixes_model {
     }
 
     #[test]
-    fn partition_children_inherit_the_dropped_slots() {
-        let sql = "CREATE TABLE p (a int NOT NULL, b bigint NOT NULL, junk int NOT NULL) PARTITION BY RANGE (b);
+    fn partition_children_and_like_copies_number_their_columns_afresh() {
+        // PostgreSQL copies no dropped attribute into a new table: a partition created after the
+        // drop and a LIKE copy both hold the live columns at attnums 1..n (checked against
+        // pg_attribute), so the copy has no bitmap a dropped slot would force. The delta review's
+        // like9: the source stores 72 B rows, the copy 64 B (t_hoff 24, lp_len 60 measured).
+        let sql =
+            "CREATE TABLE l9 (c0 int8 NOT NULL, gone int4, c1 int4 NOT NULL, c2 int4 NOT NULL, c3 int4 NOT NULL, \
+                c4 int4 NOT NULL, c5 int4 NOT NULL, c6 int4 NOT NULL, c7 int4 NOT NULL);
+            ALTER TABLE l9 DROP COLUMN gone;
+            CREATE TABLE l9cp (LIKE l9);
+            CREATE TABLE p (a int NOT NULL, b bigint NOT NULL, junk int NOT NULL) PARTITION BY RANGE (b);
             ALTER TABLE p DROP COLUMN junk;
             CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);";
         let analysis = analyze_sources(&[src("V1__p.sql", sql)], &Config::default());
-        let child = analysis.tables.iter().find(|t| t.name == "c").unwrap();
-        assert_eq!(child.dropped_columns, 1);
-        assert_eq!(child.current.footprint, analysis.tables[0].current.footprint);
+        let table = |name: &str| analysis.tables.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(table("l9").current.footprint, Some(72));
+        let copy = table("l9cp");
+        assert_eq!((copy.dropped_columns, copy.current.footprint), (0, Some(64)));
+        assert_eq!(copy.layout_signature, "f8d,f4i,f4i,f4i,f4i,f4i,f4i,f4i");
+        assert_eq!(
+            copy.columns.iter().map(|c| c.attnum).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        let child = table("c");
+        assert_eq!(child.dropped_columns, 0);
+        assert_eq!(child.layout_signature, "f4i,f8d");
+        assert_eq!(
+            child.columns[0].added_in.line, 6,
+            "the copy's columns come from its own statement"
+        );
     }
 }
 

@@ -373,13 +373,10 @@ impl Folder {
         // columns) — inherit the parent's modeled columns when the parent is in the set.
         let mut incomplete = incomplete_columns;
         let mut inherited: Vec<FoldedColumn> = Vec::new();
-        let mut inherited_dropped = 0usize;
         if let Some(parent) = &partition_of {
             match self.tables.get(&parent.key) {
                 Some(parent_table) => {
                     inherited.clone_from(&parent_table.columns);
-                    // Children share the parent's attribute numbering, dropped slots included.
-                    inherited_dropped = parent_table.dropped_count;
                     incomplete = incomplete || parent_table.incomplete;
                 }
                 None => {
@@ -400,7 +397,6 @@ impl Folder {
                 match self.tables.get(&source.key) {
                     Some(src) => {
                         inherited.clone_from(&src.columns);
-                        inherited_dropped = src.dropped_count;
                         incomplete = incomplete || src.incomplete;
                     }
                     None => {
@@ -428,8 +424,18 @@ impl Folder {
             altered_in: Vec::new(),
             ignored: ignore_marker,
             incomplete,
-            columns: inherited,
-            dropped_count: inherited_dropped,
+            // A partition or a LIKE copy gets the live columns only, numbered afresh: PostgreSQL
+            // copies no dropped attribute into a new table.
+            columns: inherited
+                .into_iter()
+                .enumerate()
+                .map(|(i, column)| FoldedColumn {
+                    attnum: i + 1,
+                    origin: origin.clone(),
+                    ..column
+                })
+                .collect(),
+            dropped_count: 0,
         };
         let mut seen: std::collections::HashSet<String> = table.columns.iter().map(|c| c.key.clone()).collect();
         for raw in columns {

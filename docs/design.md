@@ -379,9 +379,12 @@ exist (pgvector, citext, hstore) come from their published `CREATE TYPE` definit
   implicitly NOT NULL; serial types likewise.
 - CTAS (`CREATE TABLE … AS SELECT`) and `LIKE` clauses cannot be resolved statically → note +
   ghost/incomplete.
-- `PARTITION OF parent`: the child inherits the parent's modeled columns verbatim (children
-  cannot add columns), including the parent's incompleteness; an out-of-set parent leaves the
-  child not modeled. Plain `INHERITS` stays incomplete (inherited-plus-own semantics
+- `PARTITION OF parent`: the child inherits the parent's modeled columns (children cannot add
+  columns), including the parent's incompleteness; an out-of-set parent leaves the child not
+  modeled. A child, like a plain `(LIKE source)` copy of a known table, gets the live columns
+  only, numbered from 1: PostgreSQL copies no dropped attribute into a new table, so a copy of a
+  table with a dropped column has no dropped slot and no bitmap it would force (measured: 64 B
+  rows for the copy where the source stores 72 B). Plain `INHERITS` stays incomplete (inherited-plus-own semantics
   are not modeled).
 
 ## Baseline gate (brownfield adoption)
