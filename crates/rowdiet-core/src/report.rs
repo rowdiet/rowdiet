@@ -164,7 +164,8 @@ pub struct ColumnReport {
     pub not_null: bool,
     /// False when the type resolved by assumption (listed in [`TableReport::assumed_types`]).
     pub known_type: bool,
-    /// Resolved storage class.
+    /// Storage class as the column's rows can hold it: the declared class, widened where a
+    /// `STORAGE PLAIN` era lets a typmod-short varlena keep the aligned 4-byte header.
     pub kind: ColumnKind,
     /// Padding before this column in the current order in rows that store every column, bytes,
     /// when its value is certain there; None when it depends on the payload lengths of preceding
@@ -176,6 +177,8 @@ pub struct ColumnReport {
     pub offset: Option<u64>,
     /// The statement that added the column: its CREATE TABLE or its ADD COLUMN.
     pub added_in: Origin,
+    /// The column's TOAST strategy when DDL set one; None for the type's own.
+    pub storage: Option<crate::extract::Storage>,
     /// Physical attribute number, 1-based, as PostgreSQL numbers it: a column added after a
     /// drop is numbered past the dropped slot.
     pub attnum: usize,
@@ -718,12 +721,14 @@ fn frontier_report(
 }
 
 pub(crate) fn build(table: FoldedTable) -> TableReport {
-    let kinds: Vec<ColumnKind> = table.columns.iter().map(|c| c.kind).collect();
+    // The signature names the declared layout; the engine sees what rows can actually hold.
+    let kinds: Vec<ColumnKind> = table.columns.iter().map(stored_kind).collect();
     let columns: Vec<Column> = table
         .columns
         .iter()
-        .map(|c| Column {
-            kind: c.kind,
+        .zip(&kinds)
+        .map(|(c, &kind)| Column {
+            kind,
             nullable: !c.not_null,
         })
         .collect();
@@ -834,7 +839,8 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             type_display: c.type_display.clone(),
             not_null: c.not_null,
             known_type: c.known_type,
-            kind: c.kind,
+            kind: stored_kind(c),
+            storage: c.storage,
             pad_before: w.pad_before.exact(),
             offset: w.offset,
             added_in: c.origin.clone(),
@@ -899,6 +905,24 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         superset_types,
         dropped_columns: table.dropped_count,
         layout_signature,
+    }
+}
+
+/// The column's storage class as its rows can hold it. PLAIN does not make the 1-byte header on
+/// the way in (`VARLENA_ATT_IS_PACKABLE`), so a value a COPY or an UPDATE writes keeps the aligned
+/// 4-byte header at any length: a typmod no longer proves the column short. Only a column whose
+/// every row was written under PLAIN is sure to hold no TOAST pointer.
+fn stored_kind(column: &crate::fold::FoldedColumn) -> ColumnKind {
+    match column.kind {
+        ColumnKind::Varlena { align, payload, .. } if column.plain_rows => ColumnKind::Varlena {
+            align,
+            proven_short: false,
+            payload: layout::Payload {
+                toastable: column.toasted_rows,
+                ..payload
+            },
+        },
+        kind => kind,
     }
 }
 

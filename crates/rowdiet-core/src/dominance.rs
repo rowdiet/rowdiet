@@ -216,7 +216,7 @@ impl Domain {
                 long: 0,
             },
             ColumnKind::Varlena { payload, .. } => Self {
-                short: payload.residues() | TOAST_RESIDUE | null,
+                short: payload.residues() | if payload.toastable { TOAST_RESIDUE } else { 0 } | null,
                 long: 0xFF,
             },
             ColumnKind::Fixed { .. } => Self { short: 0, long: 0 },

@@ -10,7 +10,7 @@
 //! unqualified (meaning unlimited).
 
 use crate::catalog::TypeRef;
-use crate::extract::{DdlOp, RawColumn, RawName};
+use crate::extract::{DdlOp, RawColumn, RawName, Storage};
 use pg_query::NodeEnum;
 use pg_query::protobuf as pb;
 
@@ -159,6 +159,7 @@ fn map_column(cd: &pb::ColumnDef) -> RawColumn {
         key: cd.colname.clone(),
         type_ref,
         not_null,
+        storage: Storage::from_keyword(&cd.storage_name),
     }
 }
 
@@ -203,6 +204,14 @@ fn map_alter_cmd(table: &RawName, cmd: &pb::AlterTableCmd) -> Vec<DdlOp> {
                 type_ref: map_type(tn),
             }],
             None => vec![DdlOp::Irrelevant],
+        },
+        pb::AlterTableType::AtSetStorage => match cmd.def.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(NodeEnum::String(mode)) => vec![DdlOp::SetStorage {
+                table: table.clone(),
+                column: cmd.name.clone(),
+                storage: Storage::from_keyword(&mode.sval),
+            }],
+            _ => vec![DdlOp::Irrelevant],
         },
         pb::AlterTableType::AtSetNotNull => {
             vec![DdlOp::SetNotNull {
