@@ -233,8 +233,17 @@ licenses; anything trimmed reports `budgeted` and says "found" instead. A trimme
 sweep still tests the search poles, the current order with its leading fixed run repacked, and
 every fixed column first with the varlenas in written order; the last two keep the varlena
 sequence, so the joint walk decides them exactly at any width, and a dominating pole is always
-recommended, never printed as a frontier. Scalar-objective poles alone were measured to miss
-11-19% of dominating reorders on 4-5 column varlena schemas, which is why the sweep exists.
+recommended, never printed as a frontier. After those it sweeps every order that keeps the
+written varlena sequence and moves only fixed columns (`layout::sequence_space`, `NOT NULL`
+classes collapsed, up to 40,320 orders), ranked by worst case behind the same prunes and bounded
+by the same work budget. On the stack delta review's 3,000 realistic tables of 4 to 8 columns, 378
+budgeted tables were clean before this sweep; 229 of them have a dominating order of that shape,
+226 are now findings (the 721 budgeted findings that an independent enumeration could check all
+dominate with the reported saving range), and the corpus takes 50 s, as before. `rev_g534`'s
+suggestion measures 21,884 B smaller over 4,000 rows on PostgreSQL 16 and never larger on a row.
+A clean budgeted table whose certain padding is above zero prints `◐`, like a capped one.
+Scalar-objective poles alone were measured to miss 11-19% of dominating reorders on 4-5 column
+varlena schemas, which is why the sweep exists.
 Coverage, measured on 40,733 random five-column tables over an 11-type pool and 6,000 random
 tables of 6 to 12 columns: the sweep completes for every table of up to six columns with at most
 three varlenas and every seven-column table with at most two; at five columns, 36% of tables
