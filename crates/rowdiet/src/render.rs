@@ -455,7 +455,7 @@ fn render_flags(out: &mut String, t: &TableReport) {
         let _ = writeln!(
             out,
             "  NULLs move later offsets in: {} (NOT NULL removes that variable)",
-            t.null_variables.join(", ")
+            escape_text(&t.null_variables.join(", "))
         );
     }
 }
