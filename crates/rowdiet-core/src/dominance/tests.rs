@@ -791,3 +791,21 @@ mod summaries {
         }
     }
 }
+
+#[test]
+fn a_column_written_only_under_plain_holds_no_toast_pointer() {
+    let plain = Column::not_null(ColumnKind::Varlena {
+        align: Align::Int,
+        proven_short: false,
+        payload: Payload {
+            toastable: false,
+            ..Payload::EVEN
+        },
+    });
+    let domain = Domain::of(plain, Nulls::Vary);
+    assert_eq!(domain.short, Payload::EVEN.residues(), "no 18-byte pointer");
+    assert_eq!(
+        Domain::of(numeric(), Nulls::Vary).short,
+        Payload::EVEN.residues() | TOAST_RESIDUE
+    );
+}

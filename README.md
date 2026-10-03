@@ -54,7 +54,8 @@ column order a **pre-apply, CI-time** concern — exactly where a static linter 
 - **Two-tier reporting** — byte-exact for fixed-width tables; with varlenas involved the gate
   and the advice use deterministic and dominance-proven padding only (see below), so it never
   claims savings that MAXALIGN rounding or varlena data-dependence can take away, and it hands
-  you the decision boundary when the winner genuinely depends on your payloads.
+  you the decision boundary when the winner genuinely depends on your payloads, with a query
+  that settles it on your own rows.
 - **Embeddable** — a pure-Rust core crate (`rowdiet-core`, wasm32-clean) with a thin CLI; a
   numeric CI gate (`--fail-over`) no other tool offers.
 - **Loud degradation** — statements the parser can't handle are skipped *visibly*, and tables
@@ -178,7 +179,10 @@ rowdiet therefore reports per table:
   dominance-proven worst-case waste, shown with its guaranteed-to-maximum range. When neither
   order dominates — say a text and a `float8[]` competing for the one guaranteed-aligned slot,
   where payload sizes decide the winner — the table shows a **frontier** instead: both orders,
-  both worst cases, and the storage-form band each one wins. Frontiers never gate. Expected
+  both worst cases, and the storage-form band each one wins, plus a query that settles it: run
+  on a copy of your data (it needs `pageinspect` and superuser), it reads every stored row off
+  its page, lays the same values out in the other order, and counts the rows each order stores
+  smaller and the bytes the switch saves. Frontiers never gate. Expected
   values and ranges are still shown for orientation: the min/max bounds hold for every storage
   form; the expectation is a display-only figure under a stated model (varlena pads scored at
   the short/TOAST form, which stores unaligned; offset residues taken uniform) and decides
@@ -188,6 +192,12 @@ rowdiet therefore reports per table:
   From `varchar(6)` on, a value can pass 20 bytes in 4-byte UTF-8 and a wide row's toaster can
   compress it in line behind an aligned 4-byte header, so it is modeled like any other varlena
   (measured: `varchar(10)` compressed by pglz and `varchar(6)` by lz4 on PostgreSQL 16.15).
+  `STORAGE PLAIN` takes the proof away as well: PLAIN does not make the 1-byte header on the way
+  in, so a `COPY` or an `UPDATE` stores even a two-character value behind the aligned 4-byte
+  header (measured on a PLAIN `varchar(5)`: `(s, c)` pads 2.000 B/row against 0.500 written).
+  `--parser pg-exact` reads `STORAGE` on column definitions and in `ALTER COLUMN ... SET
+  STORAGE` and models such a column with every header form; the default parser cannot parse the
+  clause, skips the statement, and says so.
 
 NULLs count as realizations too. A row that holds NULL in a nullable column stores neither the
 value nor its pad, so every later column starts somewhere else in that row: a reorder that is

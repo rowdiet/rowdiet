@@ -10,7 +10,7 @@
 //! unqualified (meaning unlimited).
 
 use crate::catalog::TypeRef;
-use crate::extract::{DdlOp, RawColumn, RawName};
+use crate::extract::{DdlOp, RawColumn, RawName, Storage};
 use pg_query::NodeEnum;
 use pg_query::protobuf as pb;
 
@@ -159,6 +159,7 @@ fn map_column(cd: &pb::ColumnDef) -> RawColumn {
         key: cd.colname.clone(),
         type_ref,
         not_null,
+        storage: Storage::from_keyword(&cd.storage_name),
     }
 }
 
@@ -203,6 +204,14 @@ fn map_alter_cmd(table: &RawName, cmd: &pb::AlterTableCmd) -> Vec<DdlOp> {
                 type_ref: map_type(tn),
             }],
             None => vec![DdlOp::Irrelevant],
+        },
+        pb::AlterTableType::AtSetStorage => match cmd.def.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(NodeEnum::String(mode)) => vec![DdlOp::SetStorage {
+                table: table.clone(),
+                column: cmd.name.clone(),
+                storage: Storage::from_keyword(&mode.sval),
+            }],
+            _ => vec![DdlOp::Irrelevant],
         },
         pb::AlterTableType::AtSetNotNull => {
             vec![DdlOp::SetNotNull {
@@ -255,6 +264,7 @@ fn map_rename(rs: &pb::RenameStmt) -> Vec<DdlOp> {
             let new = RawName {
                 display: rs.newname.clone(),
                 key: rs.newname.clone(),
+                parts: vec![rs.newname.clone()],
             };
             vec![DdlOp::RenameTable { table, new }]
         }
@@ -265,6 +275,7 @@ fn map_rename(rs: &pb::RenameStmt) -> Vec<DdlOp> {
             let new = RawName {
                 display: rs.newname.clone(),
                 key: rs.newname.clone(),
+                parts: Vec::new(),
             };
             vec![DdlOp::RenameType { name, new }]
         }
@@ -275,7 +286,7 @@ fn map_rename(rs: &pb::RenameStmt) -> Vec<DdlOp> {
 fn map_drop(ds: &pb::DropStmt) -> Vec<DdlOp> {
     match ds.remove_type() {
         pb::ObjectType::ObjectTable => {
-            let names = ds.objects.iter().filter_map(dropped_name).collect();
+            let names = ds.objects.iter().filter_map(dropped_table_name).collect();
             vec![DdlOp::DropTables {
                 names,
                 if_exists: ds.missing_ok,
@@ -292,6 +303,7 @@ fn map_drop(ds: &pb::DropStmt) -> Vec<DdlOp> {
                         Some(RawName {
                             display: parts.join("."),
                             key: (*last).to_string(),
+                            parts: Vec::new(),
                         })
                     }
                     _ => None,
@@ -392,7 +404,12 @@ fn rangevar_name(rv: &pb::RangeVar) -> RawName {
         let joined = format!("{}.{}", rv.schemaname, rv.relname);
         (joined.clone(), joined)
     };
-    RawName { display, key }
+    let parts = [&rv.schemaname, &rv.relname]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect();
+    RawName { display, key, parts }
 }
 
 /// Type names resolve unqualified in the catalog — last component only.
@@ -405,6 +422,7 @@ fn type_rangevar_name(rv: &pb::RangeVar) -> RawName {
     RawName {
         display,
         key: rv.relname.clone(),
+        parts: Vec::new(),
     }
 }
 
@@ -414,7 +432,23 @@ fn name_from_nodes(nodes: &[pb::Node]) -> RawName {
     RawName {
         display: parts.join("."),
         key,
+        parts: Vec::new(),
     }
+}
+
+/// [`dropped_name`] for a table, which keeps its name parts apart.
+fn dropped_table_name(n: &pb::Node) -> Option<RawName> {
+    let parts: Vec<String> = match n.node.as_ref()? {
+        NodeEnum::List(list) => list
+            .items
+            .iter()
+            .filter_map(string_node_ref)
+            .map(str::to_string)
+            .collect(),
+        NodeEnum::String(s) => vec![s.sval.clone()],
+        _ => Vec::new(),
+    };
+    dropped_name(n).map(|name| RawName { parts, ..name })
 }
 
 fn dropped_name(n: &pb::Node) -> Option<RawName> {
@@ -428,11 +462,13 @@ fn dropped_name(n: &pb::Node) -> Option<RawName> {
             Some(RawName {
                 display: joined.clone(),
                 key: joined,
+                parts: Vec::new(),
             })
         }
         NodeEnum::String(s) => Some(RawName {
             display: s.sval.clone(),
             key: s.sval.clone(),
+            parts: Vec::new(),
         }),
         _ => None,
     }

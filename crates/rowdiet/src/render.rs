@@ -427,6 +427,18 @@ fn render_frontier_body(out: &mut String, t: &TableReport, frontier: &Frontier, 
         let _ = writeln!(out, "             {line}");
     }
     let _ = render_frontier_assumption_free(out, frontier);
+    if let Some(query) = &frontier.query {
+        let _ = writeln!(
+            out,
+            "             settle it on rows like yours (pageinspect, superuser):"
+        );
+        for line in query.sql.lines() {
+            let _ = writeln!(out, "               {line}");
+        }
+        for reading in &query.readings {
+            let _ = writeln!(out, "             {reading}");
+        }
+    }
 }
 
 /// Decision-boundary lines shown before the block elides into a summary: past this a band
@@ -936,6 +948,30 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
     if ignored > 0 {
         let _ = writeln!(out, "{ignored} table(s) ignored via rowdiet:ignore.\n");
     }
+    for t in analysis.tables.iter().filter(|t| !t.ignored) {
+        let frontiers = [
+            t.frontier.as_ref().map(|f| ("", f)),
+            gate.blocks
+                .get(&t.name)
+                .and_then(|b| b.frontier.as_ref())
+                .map(|f| ("appended block of ", f)),
+        ];
+        for (scope, frontier) in frontiers.into_iter().flatten() {
+            let Some(query) = &frontier.query else { continue };
+            let fence = fence_for(&query.sql);
+            let _ = writeln!(
+                out,
+                "### Settling the {scope}{}\n\nFrontier order: {}. Run on rows like yours:\n\n{fence}sql\n{}\n{fence}\n",
+                markdown_text(&t.display),
+                markdown_text(&frontier.order.join(", ")),
+                query.sql
+            );
+            for reading in &query.readings {
+                let _ = writeln!(out, "- {}", markdown_text(reading));
+            }
+            let _ = writeln!(out);
+        }
+    }
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "<details><summary>{} note(s)</summary>\n", analysis.notes.len());
         for note in &analysis.notes {
@@ -958,6 +994,12 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
         let _ = writeln!(out, "```\n{gate_line}```");
     }
     out
+}
+
+/// A code fence longer than any backtick run in `text`, so nothing inside can close it.
+fn fence_for(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(longest.max(2) + 1)
 }
 
 /// Markdown text that renders as written: the characters that open emphasis, a code span, a

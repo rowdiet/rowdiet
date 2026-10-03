@@ -109,6 +109,9 @@ struct Paired {
     saving_max: i64,
     size_saving_min: i64,
     size_saving_max: i64,
+    /// Current minus alternative over the rows stored alike: padding, then row size.
+    saving_sum: i64,
+    size_saving_sum: i64,
     /// Rows the toaster stored differently in the two orders, left out of the savings.
     stored_differently: u64,
 }
@@ -638,6 +641,7 @@ fn measure() {
     for fixture in block_fixtures() {
         run_block_fixture(&pg, &binary, &fixture, &mut failures);
     }
+    run_plain_checks(&pg, &binary, &mut failures);
     run_report_only_checks(&binary, &mut failures);
     let pattern = format!("{}%", prefix().replace('_', "\\_"));
     pg.query(&format!(
@@ -803,6 +807,11 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
                         fixture.name, paired.stored_differently
                     );
                 }
+                // Property (f): the frontier's printed query, run on the written table, replays the
+                // alternative order to exactly what the alternative table measures.
+                if avoidable == 0.0 && paired.stored_differently == 0 {
+                    verify_query(pg, fixture, table_report, &paired, workload, failures);
+                }
                 // Property (b): a recommendation is pointwise, so no row may measure worse, in
                 // the measure the tier decides in.
                 let (worst, unit) = if exact {
@@ -944,6 +953,41 @@ fn check_boundary(
         failures.push(format!(
             "{}: boundary does not flip the winner (current {cur_a:.3} vs alt {alt_a:.3}; then current {cur_b:.3} vs alt {alt_b:.3})",
             fixture.name
+        ));
+    }
+}
+
+/// Run a frontier's printed query against the written table and hold its answer to the paired
+/// measurement: the same rows, no replay mismatch, the same bytes saved in the frontier's
+/// measure, and the same count of rows each order stores smaller.
+fn verify_query(
+    pg: &Pg,
+    fixture: &Fixture,
+    table_report: &serde_json::Value,
+    paired: &Paired,
+    workload: &str,
+    failures: &mut Vec<String>,
+) {
+    let Some(sql) = table_report["frontier"]["query"]["sql"].as_str() else {
+        failures.push(format!("{}: a frontier without a settling query", fixture.name));
+        return;
+    };
+    let out = pg.query(sql).expect("settling query");
+    let f: Vec<i64> = out.trim().split('|').map(|v| v.parse().expect("query count")).collect();
+    let (rows, saved, mismatches) = (f[0], f[3], f[4]);
+    let measured = if table_report["frontier"]["measure"].as_str() == Some("row_size") {
+        paired.size_saving_sum
+    } else {
+        paired.saving_sum
+    };
+    println!(
+        "| {} | query | {workload} | rows {rows}, alternative smaller {}, current smaller {}, saved {saved} | measured saved {measured} | mismatches {mismatches} |",
+        fixture.name, f[1], f[2]
+    );
+    if rows != paired.current.rows as i64 || mismatches != 0 || saved != measured {
+        failures.push(format!(
+            "{}/{workload}: the settling query says {rows} rows, {saved} B saved, {mismatches} mismatches; measured {} rows, {measured} B",
+            fixture.name, paired.current.rows
         ));
     }
 }
@@ -1285,7 +1329,8 @@ fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Pa
                 round(avg(ap)::numeric, 3), min(ap), max(ap), \
                 min(cp - ap) FILTER (WHERE same), max(cp - ap) FILTER (WHERE same), \
                 min(cs - asz) FILTER (WHERE same), max(cs - asz) FILTER (WHERE same), \
-                count(*) FILTER (WHERE NOT same) \
+                count(*) FILTER (WHERE NOT same), \
+                coalesce(sum(cp - ap) FILTER (WHERE same), 0), coalesce(sum(cs - asz) FILTER (WHERE same), 0) \
          FROM j;",
         row_pads_sql(cur.0, cur.1),
         row_pads_sql(alt.0, alt.1)
@@ -1317,6 +1362,8 @@ fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Pa
         size_saving_min: f[11].parse().expect("size saving min"),
         size_saving_max: f[12].parse().expect("size saving max"),
         stored_differently: f[13].parse().expect("differing rows"),
+        saving_sum: f[14].parse().expect("saving sum"),
+        size_saving_sum: f[15].parse().expect("size saving sum"),
     }
 }
 
@@ -1553,6 +1600,88 @@ fn run_block_fixture(pg: &Pg, binary: &std::path::Path, fixture: &BlockFixture, 
             failures.push(format!(
                 "{}/{workload}: per-row {unit} savings {lo}..{hi} outside the reported [{saving_min},{saving_max}]",
                 fixture.name
+            ));
+        }
+    }
+}
+
+/// `STORAGE PLAIN` under both parsers. pg-exact reads it and must not prove a PLAIN varchar(5)
+/// short; sqlparser cannot parse it and must make no claim. The rows are loaded with COPY and
+/// with an UPDATE, the two writes that store the 4-byte header under PLAIN, and every row must
+/// sit inside pg-exact's bounds, while `(s, c)`, which the typmod alone would prove never worse,
+/// measures worse.
+fn run_plain_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<String>) {
+    let table = format!("{}plain", prefix());
+    let alt = format!("{table}_alt");
+    let ddl = format!("CREATE TABLE {table} (c varchar(5) STORAGE PLAIN, s smallint);");
+    let exact = analyze(binary, &ddl, &["--parser", "pg-exact"]);
+    let t = &exact["analysis"]["tables"][0];
+    let suggested: Vec<&str> = t["suggested_order"]
+        .as_array()
+        .expect("order")
+        .iter()
+        .map(|v| v.as_str().expect("name"))
+        .collect();
+    let avoidable = t["avoidable_bytes_per_row"].as_f64().expect("avoidable");
+    let (lo, hi) = model_bounds(&t["current"], false);
+    println!(
+        "| plain (pg-exact) | report | - | [{lo},{hi}] | avoidable {avoidable}, order {} | - |",
+        suggested.join(",")
+    );
+    if avoidable > 0.0 && suggested == ["s", "c"] {
+        failures.push("plain: pg-exact recommends (s, c) for a PLAIN varchar(5)".into());
+    }
+    let sqlparser = analyze(binary, &ddl, &[]);
+    let tables = sqlparser["analysis"]["tables"].as_array().map_or(0, Vec::len);
+    if tables != 0 {
+        failures.push(format!("plain: sqlparser analyzed {tables} table(s) it cannot parse"));
+    }
+    let cur: Vec<Col<'_>> = vec![("c", "varchar(5)", true), ("s", "smallint", true)];
+    let swapped: Vec<Col<'_>> = vec![("s", "smallint", true), ("c", "varchar(5)", true)];
+    let rows: String = (1..=1200)
+        .map(|g| format!("{}\t{}\n", "x".repeat(g % 6), g % 7))
+        .collect();
+    pg.query(&format!(
+        "DROP TABLE IF EXISTS {table}, {alt};\n{ddl}\nCREATE TABLE {alt} (s smallint, c varchar(5) STORAGE PLAIN);"
+    ))
+    .expect("plain tables");
+    let loads = [
+        (
+            "copy",
+            format!(
+                "TRUNCATE {table}, {alt};\nCOPY {table} (c, s) FROM STDIN;\n{rows}\\.\nCOPY {alt} (c, s) FROM STDIN;\n{rows}\\.\n"
+            ),
+        ),
+        (
+            "update",
+            format!(
+                "TRUNCATE {table}, {alt};\nINSERT INTO {table} SELECT repeat('x', g % 6), g % 7 FROM generate_series(1, 1200) g;\n\
+                 INSERT INTO {alt} SELECT s, c FROM {table};\nUPDATE {table} SET c = c || '';\nUPDATE {alt} SET c = c || '';"
+            ),
+        ),
+    ];
+    for (load, sql) in loads {
+        pg.query(&sql).expect("plain load");
+        let paired = measure_pair(pg, (&table, &cur), (&alt, &swapped));
+        println!(
+            "| plain | {load} | - | [{lo},{hi}] | written {:.3} ({}-{}), (s, c) {:.3}, saving {}..{} | {} |",
+            paired.current.mean,
+            paired.current.min,
+            paired.current.max,
+            paired.alternative.mean,
+            paired.saving_min,
+            paired.saving_max,
+            paired.current.rows
+        );
+        if paired.current.min < lo || paired.current.max > hi {
+            failures.push(format!(
+                "plain/{load}: measured [{}-{}] outside pg-exact's bounds [{lo},{hi}]",
+                paired.current.min, paired.current.max
+            ));
+        }
+        if paired.saving_min >= 0 {
+            failures.push(format!(
+                "plain/{load}: (s, c) measures no worse on any row, so the PLAIN rows did not keep the 4-byte header"
             ));
         }
     }

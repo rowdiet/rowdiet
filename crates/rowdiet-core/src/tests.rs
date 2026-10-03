@@ -288,6 +288,7 @@ mod differential {
         RawName {
             display: n.key.clone(),
             key: n.key,
+            parts: n.parts,
         }
     }
 
@@ -306,6 +307,7 @@ mod differential {
             key: c.key,
             type_ref: norm_type(c.type_ref),
             not_null: c.not_null,
+            storage: c.storage,
         }
     }
 
@@ -372,6 +374,11 @@ mod differential {
                 table: norm_name(table),
                 column,
                 value,
+            },
+            DdlOp::SetStorage { table, column, storage } => DdlOp::SetStorage {
+                table: norm_name(table),
+                column,
+                storage,
             },
             DdlOp::DropTables { names, if_exists } => DdlOp::DropTables {
                 names: names.into_iter().map(norm_name).collect(),
@@ -2109,5 +2116,138 @@ mod null_masks {
             assert_eq!(t.avoidable_bytes_per_row, saving.max as f64);
             assert_eq!(t.suggested.with_nulls.map(|r| r.footprint_min), Some(32), "{width}");
         }
+    }
+}
+
+/// STORAGE strategies: PLAIN does not make the 1-byte header on the way in, so a COPY or UPDATE
+/// stores a typmod-short varlena behind the aligned 4-byte header, and PLAIN never moves a value
+/// out of line. pg-exact reads the clause; sqlparser cannot parse it and skips the statement.
+#[cfg(feature = "pg-exact")]
+mod storage_strategies {
+    use crate::extract::Storage;
+    use crate::{Config, ParserBackend, SqlSource, analyze_sources_with};
+
+    fn both(sql: &str) -> [crate::Analysis; 2] {
+        let sources = [SqlSource::new("V1__t.sql", sql)];
+        [ParserBackend::PgExact, ParserBackend::Sqlparser]
+            .map(|b| analyze_sources_with(b, &sources, &Config::default()))
+    }
+
+    #[test]
+    fn plain_keeps_a_short_typmod_from_being_proven_short() {
+        // The round-4 closure review's case: as `varchar(5)` the column always stores the 1-byte
+        // header and `(s, c)` is never worse; under PLAIN a COPY stores the 4-byte header, which
+        // aligns behind s (measured 2.000 against 0.500 B/row on 1,200 COPY-loaded rows).
+        let [exact, sqlparser] = both("CREATE TABLE t (c varchar(5) STORAGE PLAIN, s smallint);");
+        let t = &exact.tables[0];
+        assert_eq!(t.columns[0].storage, Some(Storage::Plain));
+        assert_eq!(t.avoidable_bytes_per_row, 0.0, "{:?}", t.suggested_order);
+        assert_ne!(t.suggested_order, vec!["s", "c"]);
+        assert!(
+            sqlparser.tables.is_empty(),
+            "sqlparser skips the statement: {:?}",
+            sqlparser.notes
+        );
+        let [default, _] = both("CREATE TABLE t (c varchar(5), s smallint);");
+        assert_eq!(default.tables[0].suggested_order, vec!["s", "c"]);
+        assert!(default.tables[0].avoidable_bytes_per_row > 0.0);
+    }
+
+    #[test]
+    fn set_storage_marks_the_rows_it_writes() {
+        let [exact, sqlparser] = both(
+            "CREATE TABLE t (c varchar(5), s smallint);
+             ALTER TABLE t ALTER COLUMN c SET STORAGE PLAIN;
+             ALTER TABLE t ALTER COLUMN c SET STORAGE EXTENDED;",
+        );
+        let t = &exact.tables[0];
+        assert_eq!(t.columns[0].storage, Some(Storage::Extended));
+        assert_eq!(
+            t.avoidable_bytes_per_row, 0.0,
+            "rows written under PLAIN keep their header"
+        );
+        assert!(
+            sqlparser.tables[0].incomplete,
+            "sqlparser skips SET STORAGE and says so"
+        );
+    }
+
+    #[test]
+    fn a_type_change_resets_the_strategy() {
+        let [exact, _] = both(
+            "CREATE TABLE t (c varchar(5) STORAGE PLAIN, s smallint);
+             ALTER TABLE t ALTER COLUMN c TYPE varchar(30);",
+        );
+        assert_eq!(exact.tables[0].columns[0].storage, None);
+    }
+
+    #[test]
+    fn only_plain_rows_hold_no_toast_pointer() {
+        let [exact, _] = both(
+            "CREATE TABLE a (n numeric STORAGE PLAIN);
+             CREATE TABLE b (n numeric);
+             ALTER TABLE b ALTER COLUMN n SET STORAGE PLAIN;",
+        );
+        let toastable = |t: &crate::TableReport| match t.columns[0].kind {
+            crate::ColumnKind::Varlena { payload, .. } => payload.toastable,
+            crate::ColumnKind::Fixed { .. } => unreachable!(),
+        };
+        assert!(!toastable(&exact.tables[0]));
+        assert!(
+            toastable(&exact.tables[1]),
+            "rows from before the switch may hold pointers"
+        );
+    }
+}
+
+/// The SQL that settles a frontier names the table by literal and its columns by attribute
+/// number, so no identifier spelling can change what it reads.
+mod settling_queries {
+    use super::src;
+    use crate::{Config, analyze_sources};
+
+    fn query_of(sql: &str) -> (Vec<String>, String) {
+        let a = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
+        let t = &a.tables[0];
+        let q = t
+            .frontier
+            .as_ref()
+            .and_then(|f| f.query.as_ref())
+            .expect("a frontier with a query");
+        (t.relation.clone(), q.sql.clone())
+    }
+
+    #[test]
+    fn a_dotted_quoted_name_is_one_relation() {
+        let (relation, sql) = query_of("CREATE TABLE \"rev_A.b\" (t text NOT NULL, m macaddr NOT NULL);");
+        assert_eq!(relation, vec!["rev_A.b"]);
+        assert!(
+            sql.contains("c.relname = 'rev_A.b' AND pg_catalog.pg_table_is_visible(c.oid)"),
+            "{sql}"
+        );
+        let (relation, sql) = query_of("CREATE TABLE \"rev_A\".b (t text NOT NULL, m macaddr NOT NULL);");
+        assert_eq!(relation, vec!["rev_A", "b"]);
+        assert!(sql.contains("c.relname = 'b' AND n.nspname = 'rev_A'"), "{sql}");
+    }
+
+    #[test]
+    fn keyword_quote_and_newline_names_stay_literals() {
+        for (ddl, literal) in [
+            ("\"current_user\"", "'current_user'"),
+            ("\"o'q\"\"x\"", "'o''q\"x'"),
+            ("\"n\nl\"", "U&'n\\000Al'"),
+        ] {
+            let (_, sql) = query_of(&format!(
+                "CREATE TABLE {ddl} (\"current_role\" text NOT NULL, \"x\"\"; DROP TABLE v; --\" macaddr NOT NULL);"
+            ));
+            assert!(sql.contains(&format!("c.relname = {literal} AND")), "{sql}");
+            assert!(!sql.contains("current_role") && !sql.contains("DROP"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn unquoted_names_fold_ascii_only_like_postgres() {
+        let a = analyze_sources(&[src("V1__t.sql", "CREATE TABLE Ämac (a int);")], &Config::default());
+        assert_eq!(a.tables[0].name, "Ämac");
     }
 }

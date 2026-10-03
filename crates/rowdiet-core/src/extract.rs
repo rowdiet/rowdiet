@@ -16,6 +16,10 @@ pub struct RawName {
     /// Identity: unquoted parts case-folded. Tables keep their qualification (`a.things`);
     /// type names are keyed by their last component.
     pub key: String,
+    /// A table name's folded parts, schema first: the key joins them with `.`, which a quoted
+    /// part can contain too, so SQL that names the relation needs them apart. Empty for other
+    /// names.
+    pub parts: Vec<String>,
 }
 
 /// One column definition as parsed from `CREATE TABLE` / `ADD COLUMN`.
@@ -29,6 +33,36 @@ pub struct RawColumn {
     pub type_ref: TypeRef,
     /// The definition itself forces NOT NULL: explicit constraint, PRIMARY KEY, or identity.
     pub not_null: bool,
+    /// A `STORAGE` clause on the definition; None keeps the type's strategy.
+    pub storage: Option<Storage>,
+}
+
+/// A column's TOAST strategy (`attstorage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(rename_all = "lowercase"))]
+pub enum Storage {
+    /// No compression, no out-of-line storage, and no 1-byte header made on the way in.
+    Plain,
+    /// Out-of-line storage without compression.
+    External,
+    /// Compression, then out-of-line storage.
+    Extended,
+    /// Compression; out-of-line storage only as a last resort.
+    Main,
+}
+
+impl Storage {
+    /// The strategy a keyword names; None for `DEFAULT` (the type's own strategy) or anything
+    /// else.
+    pub fn from_keyword(word: &str) -> Option<Self> {
+        match word.to_ascii_lowercase().as_str() {
+            "plain" => Some(Self::Plain),
+            "external" => Some(Self::External),
+            "extended" => Some(Self::Extended),
+            "main" => Some(Self::Main),
+            _ => None,
+        }
+    }
 }
 
 /// One layout-relevant DDL effect, dialect- and backend-neutral: both parser backends emit this
@@ -108,6 +142,16 @@ pub enum DdlOp {
         column: String,
         /// The new type.
         type_ref: TypeRef,
+    },
+    /// `ALTER TABLE .. ALTER COLUMN .. SET STORAGE`: the strategy for rows written from now on;
+    /// rows already stored keep their form.
+    SetStorage {
+        /// Target table.
+        table: RawName,
+        /// Key of the altered column.
+        column: String,
+        /// The new strategy; None for `DEFAULT`.
+        storage: Option<Storage>,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`; also the per-column effect of `ADD PRIMARY KEY`.
     SetNotNull {
@@ -195,6 +239,7 @@ fn map_statement(stmt: sq::Statement) -> Vec<DdlOp> {
                 new: RawName {
                     display: rename.new_name.value.clone(),
                     key: ident_key(&rename.new_name),
+                    parts: Vec::new(),
                 },
             }],
             _ => vec![DdlOp::Irrelevant],
@@ -278,6 +323,8 @@ fn map_column(cd: &sq::ColumnDef) -> RawColumn {
         key: ident_key(&cd.name),
         type_ref: map_type(&cd.data_type),
         not_null,
+        // sqlparser does not parse STORAGE; a statement carrying it is skipped loudly instead.
+        storage: None,
     }
 }
 
@@ -394,10 +441,11 @@ fn map_create_type(name: &sq::ObjectName, representation: Option<sq::UserDefined
     }
 }
 
-/// Postgres folds unquoted identifiers to lowercase; quoted ones are verbatim.
+/// Postgres folds unquoted identifiers to lowercase, ASCII letters only; quoted ones are
+/// verbatim.
 fn ident_key(id: &sq::Ident) -> String {
     match id.quote_style {
-        None => id.value.to_lowercase(),
+        None => id.value.to_ascii_lowercase(),
         Some(_) => id.value.clone(),
     }
 }
@@ -415,6 +463,7 @@ fn raw_name(name: &sq::ObjectName) -> RawName {
     RawName {
         display: name.to_string(),
         key,
+        parts: Vec::new(),
     }
 }
 
@@ -439,6 +488,7 @@ fn table_name(name: &sq::ObjectName) -> RawName {
     RawName {
         display: name.to_string(),
         key,
+        parts,
     }
 }
 
