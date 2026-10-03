@@ -1027,10 +1027,10 @@ mod postaudit_pins {
             CREATE TABLE \"Q.x\".\"Old\" (a int NOT NULL);
             ALTER TABLE \"Q.x\".\"Old\" RENAME TO \"New\";
             ALTER TABLE \"Q.x\".\"New\" ADD COLUMN b int;";
+        #[cfg_attr(not(feature = "pg-exact"), allow(unused_mut))]
         let mut backends = vec![crate::ParserBackend::Sqlparser];
-        if cfg!(feature = "pg-exact") {
-            backends.push(crate::ParserBackend::PgExact);
-        }
+        #[cfg(feature = "pg-exact")]
+        backends.push(crate::ParserBackend::PgExact);
         for backend in backends {
             let analysis = crate::analyze_sources_with(backend, &[src("V1__r.sql", sql)], &Config::default());
             let tables: Vec<(&str, usize)> = analysis.tables.iter().map(|t| (t.name.as_str(), t.natts)).collect();
