@@ -4,7 +4,7 @@
 //! — visible degradation, never silent.
 
 use crate::catalog::{AssumedKind, Catalog, Resolved, TypeRef};
-use crate::extract::{DdlOp, RawColumn, RawName, Sniff};
+use crate::extract::{DdlOp, RawColumn, RawName, Sniff, Storage};
 use crate::layout::ColumnKind;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -173,6 +173,15 @@ pub struct FoldedColumn {
     /// Physical attribute number, 1-based: dropped columns keep theirs, so a column added after a
     /// drop is numbered past the dropped slot, as PostgreSQL numbers it.
     pub attnum: usize,
+    /// The column's current TOAST strategy; None for the type's own.
+    pub storage: Option<Storage>,
+    /// Some row may have been written while PLAIN was in force: such a row can hold a varlena
+    /// behind the aligned 4-byte header at any length (a COPY or UPDATE stores it so), whatever
+    /// its typmod proves. Rows keep their form until a rewrite, so this only accumulates.
+    pub plain_rows: bool,
+    /// Some row may have been written under a strategy that moves values out of line, so it can
+    /// hold an 18-byte TOAST pointer.
+    pub toasted_rows: bool,
 }
 
 /// One table's modeled state after the replay — what [`Folder::finish`] hands to reporting.
@@ -183,6 +192,8 @@ pub struct FoldedTable {
     /// Fold key: case-folded, qualification kept — the identity ALTERs address and baselines
     /// key on.
     pub key: String,
+    /// The relation's folded name parts, schema first, as SQL addresses it.
+    pub relation: Vec<String>,
     /// The statement that created the table (the latest CREATE when redefined).
     pub origin: Origin,
     /// Statements that changed the table after creation (consecutive duplicates collapsed).
@@ -312,6 +323,7 @@ impl Folder {
                 type_ref,
             } => self.set_column_type(table, column, type_ref, origin),
             DdlOp::SetNotNull { table, column, value } => self.set_not_null(table, column, value, origin),
+            DdlOp::SetStorage { table, column, storage } => self.set_storage(table, column, storage, origin),
             DdlOp::DropTables { names, if_exists } => self.drop_tables(names, if_exists, origin),
             DdlOp::CreateEnum { name } => self.catalog.define_enum(name.key),
             DdlOp::CreateComposite { name } => self.catalog.define_composite(name.key),
@@ -396,7 +408,15 @@ impl Folder {
             if columns.is_empty() {
                 match self.tables.get(&source.key) {
                     Some(src) => {
-                        inherited.clone_from(&src.columns);
+                        // Plain LIKE copies no storage strategy: each column takes its type's own.
+                        inherited = src
+                            .columns
+                            .iter()
+                            .map(|c| FoldedColumn {
+                                storage: None,
+                                ..c.clone()
+                            })
+                            .collect();
                         incomplete = incomplete || src.incomplete;
                     }
                     None => {
@@ -417,9 +437,15 @@ impl Folder {
                 incomplete = true;
             }
         }
+        let relation = if name.parts.is_empty() {
+            vec![name.key.clone()]
+        } else {
+            name.parts.clone()
+        };
         let mut table = FoldedTable {
             display: name.display,
             key: name.key.clone(),
+            relation,
             origin: origin.clone(),
             altered_in: Vec::new(),
             ignored: ignore_marker,
@@ -430,6 +456,10 @@ impl Folder {
                 .into_iter()
                 .enumerate()
                 .map(|(i, column)| FoldedColumn {
+                    // A new table holds no rows yet: every row it stores is written under its
+                    // current strategy.
+                    plain_rows: column.storage == Some(Storage::Plain),
+                    toasted_rows: column.storage != Some(Storage::Plain),
                     attnum: i + 1,
                     origin: origin.clone(),
                     ..column
@@ -544,6 +574,10 @@ impl Folder {
             self.order.retain(|key| key != &new.key);
         }
         let mut entry = self.tables.remove(&table.key).expect("checked above");
+        // RENAME TO names the relation only; it stays in its schema.
+        if let Some(last) = entry.relation.last_mut() {
+            last.clone_from(new.parts.last().unwrap_or(&new.key));
+        }
         entry.key.clone_from(&new.key);
         entry.display = new.display;
         mark_altered(&mut entry, origin);
@@ -566,6 +600,26 @@ impl Folder {
                 col.kind = resolved.kind;
                 col.known_type = resolved.known;
                 col.type_display = type_ref.display;
+                // PostgreSQL resets the strategy to the type's own. A binary-coercible change keeps
+                // the stored rows, so a PLAIN-era row can survive it.
+                col.storage = None;
+                col.toasted_rows = true;
+                mark_altered(entry, origin);
+            }
+            None => self.unknown_column(&table, &column, origin),
+        }
+    }
+
+    fn set_storage(&mut self, table: RawName, column: String, storage: Option<Storage>, origin: &Origin) {
+        if !self.require_table(&table, origin) {
+            return;
+        }
+        let entry = self.tables.get_mut(&table.key).expect("checked above");
+        match entry.columns.iter_mut().find(|c| c.key == column) {
+            Some(col) => {
+                col.plain_rows |= storage == Some(Storage::Plain);
+                col.toasted_rows |= storage != Some(Storage::Plain);
+                col.storage = storage;
                 mark_altered(entry, origin);
             }
             None => self.unknown_column(&table, &column, origin),
@@ -675,6 +729,9 @@ impl Folder {
             not_null: raw.not_null || resolved.implicit_not_null,
             origin: origin.clone(),
             attnum: 0,
+            storage: raw.storage,
+            plain_rows: raw.storage == Some(Storage::Plain),
+            toasted_rows: raw.storage != Some(Storage::Plain),
         }
     }
 

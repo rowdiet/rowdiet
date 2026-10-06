@@ -80,6 +80,8 @@ pub struct TableReport {
     pub incomplete: bool,
     /// How solid the numbers are; see [`Tier`].
     pub tier: Tier,
+    /// The relation's name parts, schema first, as SQL addresses it.
+    pub relation: Vec<String>,
     /// Live column count (dropped attribute slots are in `dropped_columns`).
     pub natts: usize,
     /// Some column is nullable: rows holding a NULL carry a null bitmap in their header.
@@ -158,13 +160,16 @@ impl TableReport {
 pub struct ColumnReport {
     /// Column name (display spelling).
     pub name: String,
+    /// The name PostgreSQL stores: case-folded unless the DDL quoted it.
+    pub key: String,
     /// Declared type as written.
     pub type_display: String,
     /// Declared or implied NOT NULL.
     pub not_null: bool,
     /// False when the type resolved by assumption (listed in [`TableReport::assumed_types`]).
     pub known_type: bool,
-    /// Resolved storage class.
+    /// Storage class as the column's rows can hold it: the declared class, widened where a
+    /// `STORAGE PLAIN` era lets a typmod-short varlena keep the aligned 4-byte header.
     pub kind: ColumnKind,
     /// Padding before this column in the current order in rows that store every column, bytes,
     /// when its value is certain there; None when it depends on the payload lengths of preceding
@@ -176,6 +181,8 @@ pub struct ColumnReport {
     pub offset: Option<u64>,
     /// The statement that added the column: its CREATE TABLE or its ADD COLUMN.
     pub added_in: Origin,
+    /// The column's TOAST strategy when DDL set one; None for the type's own.
+    pub storage: Option<crate::extract::Storage>,
     /// Physical attribute number, 1-based, as PostgreSQL numbers it: a column added after a
     /// drop is numbered past the dropped slot.
     pub attnum: usize,
@@ -276,6 +283,8 @@ pub struct Frontier {
     /// The comparison in rows that store every column, over every storage form and payload,
     /// when it differs from the comparison over every NULL pattern.
     pub without_nulls: Option<NullFreeComparison>,
+    /// The SQL that settles this frontier on real rows, and how to read its answer.
+    pub query: Option<crate::resolve::FrontierQuery>,
 }
 
 /// A frontier's verdict in rows without NULLs.
@@ -714,16 +723,19 @@ fn frontier_report(
         decided,
         bands,
         without_nulls,
+        query: None,
     }
 }
 
 pub(crate) fn build(table: FoldedTable) -> TableReport {
-    let kinds: Vec<ColumnKind> = table.columns.iter().map(|c| c.kind).collect();
+    // The signature names the declared layout; the engine sees what rows can actually hold.
+    let kinds: Vec<ColumnKind> = table.columns.iter().map(stored_kind).collect();
     let columns: Vec<Column> = table
         .columns
         .iter()
-        .map(|c| Column {
-            kind: c.kind,
+        .zip(&kinds)
+        .map(|(c, &kind)| Column {
+            kind,
             nullable: !c.not_null,
         })
         .collect();
@@ -815,7 +827,22 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
     };
     let frontier = decision.frontier_order.as_ref().map(|alternative| {
         let names: Vec<String> = table.columns.iter().map(|c| c.display.clone()).collect();
-        frontier_report(Start::TABLE, &columns, &names, &current_walk, alternative, measure)
+        let mut frontier = frontier_report(Start::TABLE, &columns, &names, &current_walk, alternative, measure);
+        let query_columns: Vec<crate::resolve::QueryColumn> = table
+            .columns
+            .iter()
+            .zip(&kinds)
+            .map(|(c, &kind)| crate::resolve::QueryColumn::new(&c.key, kind, &c.type_display))
+            .collect();
+        let written: Vec<usize> = (0..kinds.len()).collect();
+        frontier.query = Some(crate::resolve::query(
+            &table.relation,
+            &query_columns,
+            &written,
+            alternative,
+            measure,
+        ));
+        frontier
     });
     let suggested_order = final_order.iter().map(|&i| table.columns[i].display.clone()).collect();
     let null_variables = table
@@ -831,10 +858,12 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         .zip(&current_walk.columns)
         .map(|(c, w)| ColumnReport {
             name: c.display.clone(),
+            key: c.key.clone(),
             type_display: c.type_display.clone(),
             not_null: c.not_null,
             known_type: c.known_type,
-            kind: c.kind,
+            kind: stored_kind(c),
+            storage: c.storage,
             pad_before: w.pad_before.exact(),
             offset: w.offset,
             added_in: c.origin.clone(),
@@ -877,6 +906,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         ignored: table.ignored,
         incomplete: table.incomplete,
         tier,
+        relation: table.relation.clone(),
         natts: kinds.len(),
         any_nullable,
         null_variables,
@@ -899,6 +929,24 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         superset_types,
         dropped_columns: table.dropped_count,
         layout_signature,
+    }
+}
+
+/// The column's storage class as its rows can hold it. PLAIN does not make the 1-byte header on
+/// the way in (`VARLENA_ATT_IS_PACKABLE`), so a value a COPY or an UPDATE writes keeps the aligned
+/// 4-byte header at any length: a typmod no longer proves the column short. Only a column whose
+/// every row was written under PLAIN is sure to hold no TOAST pointer.
+fn stored_kind(column: &crate::fold::FoldedColumn) -> ColumnKind {
+    match column.kind {
+        ColumnKind::Varlena { align, payload, .. } if column.plain_rows => ColumnKind::Varlena {
+            align,
+            proven_short: false,
+            payload: layout::Payload {
+                toastable: column.toasted_rows,
+                ..payload
+            },
+        },
+        kind => kind,
     }
 }
 
@@ -993,10 +1041,26 @@ pub fn block_finding(table: &TableReport, committed_slots: usize) -> Option<Bloc
     } else {
         decision.order
     };
-    let frontier = decision
-        .frontier_order
-        .as_ref()
-        .map(|alternative| frontier_report(start, block, &names, &walk, alternative, measure));
+    let frontier = decision.frontier_order.as_ref().map(|alternative| {
+        let mut frontier = frontier_report(start, block, &names, &walk, alternative, measure);
+        let query_columns: Vec<crate::resolve::QueryColumn> = table
+            .columns
+            .iter()
+            .map(|c| crate::resolve::QueryColumn::new(&c.key, c.kind, &c.type_display))
+            .collect();
+        let current: Vec<usize> = (0..table.columns.len()).collect();
+        let whole: Vec<usize> = (0..prefix_columns)
+            .chain(alternative.iter().map(|&i| prefix_columns + i))
+            .collect();
+        frontier.query = Some(crate::resolve::query(
+            &table.relation,
+            &query_columns,
+            &current,
+            &whole,
+            measure,
+        ));
+        frontier
+    });
     let mut origins: Vec<Origin> = Vec::new();
     for column in &table.columns[prefix_columns..] {
         if !origins.contains(&column.added_in) {

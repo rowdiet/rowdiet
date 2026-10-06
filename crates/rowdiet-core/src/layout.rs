@@ -105,6 +105,9 @@ pub struct Payload {
     /// behind an aligned 4-byte header (lz4 has no minimum input; the toaster considers any
     /// attribute over 24 bytes, toast_helper.c).
     pub compressible: bool,
+    /// A value can be moved out of line, leaving an 18-byte TOAST pointer: false only for a
+    /// column whose every row was written under `STORAGE PLAIN`.
+    pub toastable: bool,
 }
 
 impl Payload {
@@ -113,18 +116,21 @@ impl Payload {
         step: 1,
         verified: true,
         compressible: true,
+        toastable: true,
     };
     /// Any payload length assumed, not verified against the type's encoding.
     pub const UNVERIFIED: Self = Self {
         step: 1,
         verified: false,
         compressible: true,
+        toastable: true,
     };
     /// numeric: a 2- or 4-byte header plus 2-byte digits, so every length is even.
     pub const EVEN: Self = Self {
         step: 2,
         verified: true,
         compressible: true,
+        toastable: true,
     };
 
     /// An array's payload: its elements each take a multiple of their stride.
@@ -133,6 +139,7 @@ impl Payload {
             step: gcd(stride, MAXALIGN) as u8,
             verified: true,
             compressible: true,
+            toastable: true,
         }
     }
 

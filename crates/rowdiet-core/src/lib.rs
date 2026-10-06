@@ -31,6 +31,7 @@ pub mod fold;
 pub mod fs;
 pub mod layout;
 pub mod report;
+pub mod resolve;
 pub mod split;
 pub mod version;
 
@@ -365,6 +366,7 @@ fn dispatch_dynamic_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &O
         | DdlOp::RenameTable { table, .. }
         | DdlOp::SetColumnType { table, .. }
         | DdlOp::SetNotNull { table, .. }
+        | DdlOp::SetStorage { table, .. }
             if concrete(table) =>
         {
             dispatch_do_op(folder, op, origin);
@@ -416,6 +418,7 @@ fn dispatch_do_op(folder: &mut fold::Folder, op: extract::DdlOp, origin: &Origin
         DdlOp::RenameTable { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (rename)", origin),
         DdlOp::SetColumnType { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (set type)", origin),
         DdlOp::SetNotNull { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (nullability)", origin),
+        DdlOp::SetStorage { table, .. } => folder.conditional_table_ddl(&table, "ALTER TABLE (set storage)", origin),
         DdlOp::DropTables { names, .. } => {
             for name in names {
                 folder.conditional_table_ddl(&name, "DROP TABLE", origin);

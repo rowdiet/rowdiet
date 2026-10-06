@@ -314,6 +314,91 @@ values, can therefore realize differently in two orders of the same table (measu
 here is per realization, and the measurement harness compares only rows both orders stored the
 same way and reports the rest.
 
+Fourth, storage strategies. `heap_fill_tuple` makes the 1-byte header only for an attribute
+whose strategy is not PLAIN (`VARLENA_ATT_IS_PACKABLE`), so under PLAIN a value that arrives with
+the 4-byte header keeps it, aligned, at any length: a `COPY` or an `UPDATE` stores it so, while a
+plain `INSERT` of a literal arrives short and stays short (measured on PostgreSQL 16.15, a PLAIN
+`varchar(5)`: `(c, s)` pads 0.500 B/row, `(s, c)` 2.000, on rows loaded by `COPY` and by
+`UPDATE`). A PLAIN column also never moves a value out of line. The fold records each column's
+strategy and whether any row since the last rewrite was written under PLAIN (`plain_rows`) or
+under a strategy that toasts (`toasted_rows`), since `SET STORAGE` changes only the rows written
+afterwards; `ALTER COLUMN ... TYPE` resets the strategy to the type's own, as PostgreSQL does, and
+keeps the history, since a binary-coercible change leaves the rows in place. A column with PLAIN
+rows is modeled long-capable whatever its typmod proves, and without the TOAST pointer when every
+row was written under PLAIN. pg-exact reads `STORAGE` on column definitions and in
+`SET STORAGE`; sqlparser does not parse the clause, so the statement is skipped loudly and the
+table makes no claim. The layout signature keeps the declared kinds, so a strategy change
+expires no baseline entry.
+
+**The settling queries.** A frontier's winner turns on payload lengths, storage forms and
+NULLs the DDL does not carry. Every frontier carries two read-only `SELECT`s (`query.reader` and
+`query.pageinspect` in the JSON; the text and the step summary print the reader query, or the
+pageinspect one under `--settle-exact`). Both lay every row out in both orders the way
+`heap_fill_tuple` places values (a 1-byte header or a TOAST pointer unaligned, a 4-byte header
+and every fixed-width value aligned, a NULL nowhere) and return the rows each order stores
+smaller and the bytes the switch saves, in padding at the estimate tier and in row size at the
+exact tier. Each walk is one nested expression per order over per-row values computed once
+(`LATERAL ... OFFSET 0`), so both queries are linear in rows and write no temp files.
+
+The reader query runs as any role that can read the table on PostgreSQL 14 or later, managed
+PostgreSQL included; on an older server it answers "cannot settle" and names the version. It
+reads each value's stored form exactly. For the text and bytea families, `pg_column_size` and
+`octet_length` tell a 1-byte header, a 4-byte header and an uncompressed TOAST pointer apart.
+For every other varlena, and for a compressed text, it compares `pg_column_size` of the value
+with that of a one-column row built from it: the row adds 24 bytes to a value stored in line,
+21 to a 4-byte header a 1-byte one could replace, and more to an out-of-line value, which
+PostgreSQL fetches from TOAST to build the row. That fetch is the only TOAST data the query
+reads. A sum of payload sizes cannot make this call: for an out-of-line value `pg_column_size`
+reports the external payload, so a row just past the threshold looks like one that fits. Both
+orders are then counted as a rewrite would store the row: a 4-byte header shortened where the
+column allows it, and an out-of-line value back in line when the row, with the value fetched,
+fits under the TOAST threshold (2,032 bytes at 8 kB pages) in both orders. A row that fits in
+one order and not the other would be toasted in one order only; it is counted in
+`approximate_rows` and left out of the other counts. The per-row SQL is built by `format` over
+the column names the catalog confirmed and run through `query_to_xml`, whose answer is read
+with a regular expression rather than `xpath`, so a missing table or column answers "cannot
+settle" with the reason instead of an error. The pageinspect query reads every row version off
+the page (`heap_page_item_attrs`, superuser), replays its stored bytes exactly, and checks the
+written-order replay against the tuple's own length.
+
+Neither answers silently wrong. Both look the table up by the schema the DDL names (or the
+search path when it names none) and the columns by name, so an attached partition or a `LIKE`
+copy with its own attribute numbers reads right. A table or a column the database does not have
+yet (a block whose migration has not run) gives a "cannot settle" row with the reason and no
+counts. A partitioned parent reads every partition (the pageinspect query every leaf); an
+inheritance parent reads its own rows and the note names the children left out. A column with a
+fast default is counted as a rewrite stores it by the reader query and noted; the pageinspect
+query skips the row versions written before it (`t_infomask2` holds fewer attributes) and counts
+them in `skipped_rows`. Rows that still hold a dropped column's value, and partitions in another
+column order, are left out of the replay check only. The pageinspect query counts dead row
+versions until pruning or VACUUM removes them. Names reach either query only as string literals
+(`U&'...'` escapes for a backslash, a line break, `##[`, and the characters markdown or HTML
+would read). The harness runs both printed queries on every frontier workload and holds them to
+the paired measurement (the same rows, winners and bytes saved, nothing approximate, mismatched
+or skipped), and runs both on a table outside the search path, hostile names, an absent table
+and column, a fast default before and after a rewrite, dropped-column rows, dead versions, a
+partitioned parent with an attached partition in its own order, and an inheritance parent. On
+jsonb in every storage form (short, 4-byte, compressed in line, out of line just past the
+threshold, values at the 127-byte short limit), on rows a `PLAIN` era left with 4-byte headers,
+on out-of-line values an `UPDATE` left in rows that now fit, and on rows the frontier order
+pushes over the threshold, the reader query must match copies of the table rebuilt in each order
+and rewritten by `VACUUM FULL`: the same counts over the rows both copies store alike, and
+`approximate_rows` equal to the rows the toaster stored differently.
+
+Measured on PostgreSQL 16, one row in ten NULL, seconds including the client. Text table:
+`(m macaddr, t text NOT NULL, s smallint NOT NULL)`, texts of 0 to 200 B. Jsonb table: the
+same with `j jsonb`, one row in twenty holding an incompressible 3.9 kB value stored out of
+line.
+
+| rows | text table | reader | pageinspect, JIT on | pageinspect, JIT off | jsonb table | reader | pageinspect, JIT off | temp files |
+|---|---|---|---|---|---|---|---|---|
+| 10,000 | 1.4 MB | 0.08 s | 0.54 s | 0.09 s | 1.5 MB + 2.1 MB TOAST | 0.08 s | 0.09 s | 0 |
+| 100,000 | 14 MB | 0.23 s | 0.73 s | 0.28 s | 14 MB + 20 MB TOAST | 0.25 s | 0.28 s | 0 |
+| 1,000,000 | 136 MB | 1.7 s | 2.5 s | 2.2 s | 144 MB + 198 MB TOAST | 1.8 s | 2.2 s | 0 |
+
+The pageinspect query's fixed 0.4 s under JIT is compilation; both queries agree on every
+count at every size.
+
 ## Suggested order
 
 Sort key of the heuristic pole: `(fixed=0 | varlena=1 | always-short=2, alignment desc,
