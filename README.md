@@ -181,10 +181,10 @@ rowdiet therefore reports per table:
   order dominates — say a text and a `float8[]` competing for the one guaranteed-aligned slot,
   where payload sizes decide the winner — the table shows a **frontier** instead: both orders,
   both worst cases, and the storage-form band each one wins, plus a query that settles it: any
-  role that can read the table runs it, it sizes every stored value with `pg_column_size` and
-  friends, lays each row out in both orders, and counts the rows each order stores smaller and
-  the bytes the switch saves (`--settle-exact` prints a pageinspect replay of the stored bytes
-  instead, for a superuser). Frontiers never gate. Expected
+  role that can read the table runs it (PostgreSQL 14 or later), it reads every stored value's
+  form with `pg_column_size` and friends, lays each row out in both orders, and counts the rows
+  each order stores smaller and the bytes the switch saves (`--settle-exact` prints a
+  pageinspect replay of the stored bytes instead, for a superuser). Frontiers never gate. Expected
   values and ranges are still shown for orientation: the min/max bounds hold for every storage
   form; the expectation is a display-only figure under a stated model (varlena pads scored at
   the short/TOAST form, which stores unaligned; offset residues taken uniform) and decides
