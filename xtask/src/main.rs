@@ -12,7 +12,11 @@
 //!     equal the bounds; every declared boundary pair flips the measured winner;
 //! (d) the gated headline never exceeds the dominance engine's proven maximum saving;
 //! (e) at the exact tier, which decides in row size, every row takes the reported size: rows
-//!     without NULLs the footprint, rows with one the bitmap header and the reported range.
+//!     without NULLs the footprint, rows with one the bitmap header and the reported range;
+//! (f) both settling queries a frontier prints count, on the written table, the rows, the rows
+//!     each order stores smaller and the bytes saved that the paired tables measure, and on
+//!     tables outside the search path, partitioned, inheritance, fast-default, dropped-column and
+//!     updated tables they either agree with a rewritten copy or say why they cannot settle.
 //!
 //! Fixtures with nullable columns also run workloads that hold NULL in them, one bit of the row
 //! counter per nullable column, so every NULL pattern over up to ten columns occurs; those rows
@@ -116,6 +120,11 @@ struct Paired {
     size_saving_sum: i64,
     /// Rows the toaster stored differently in the two orders, left out of the savings.
     stored_differently: u64,
+    /// Rows each order stores with less padding, then in fewer bytes, among the rows stored alike.
+    alternative_smaller: i64,
+    current_smaller: i64,
+    size_alternative_smaller: i64,
+    size_current_smaller: i64,
 }
 
 struct Column {
@@ -648,6 +657,7 @@ fn measure() {
         run_block_fixture(&pg, &binary, &fixture, &mut failures);
     }
     run_plain_checks(&pg, &binary, &mut failures);
+    run_settling_checks(&pg, &binary, &mut failures);
     run_report_only_checks(&binary, &mut failures);
     let pattern = format!("{}%", prefix().replace('_', "\\_"));
     pg.query(&format!(
@@ -989,9 +999,28 @@ fn check_boundary(
     }
 }
 
-/// Run a frontier's printed query against the written table and hold its answer to the paired
-/// measurement: the same rows, no replay mismatch, the same bytes saved in the frontier's
-/// measure, and the same count of rows each order stores smaller.
+/// What a settling query answers: rows, rows each order stores smaller, bytes saved.
+type Settled = [Option<i64>; 4];
+
+/// Run one printed settling query and split its row into the counts, the variant's own flag
+/// columns, and the note.
+fn run_settling(pg: &Pg, sql: &str) -> (Settled, Vec<Option<i64>>, String) {
+    let out = pg.query(sql).expect("settling query");
+    let fields: Vec<&str> = out.trim_end_matches('\n').split('|').collect();
+    let number = |v: &str| v.parse::<i64>().ok();
+    let counts = [
+        number(fields[0]),
+        number(fields[1]),
+        number(fields[2]),
+        number(fields[3]),
+    ];
+    let flags = fields[4..fields.len() - 1].iter().map(|v| number(v)).collect();
+    (counts, flags, fields[fields.len() - 1].to_string())
+}
+
+/// Run both of a frontier's printed queries against the written table and hold each to the
+/// paired measurement: the same rows, the same count of rows each order stores smaller, the
+/// same bytes saved in the frontier's measure, nothing approximate, mismatched or skipped.
 fn verify_query(
     pg: &Pg,
     fixture: &Fixture,
@@ -1000,27 +1029,40 @@ fn verify_query(
     workload: &str,
     failures: &mut Vec<String>,
 ) {
-    let Some(sql) = table_report["frontier"]["query"]["sql"].as_str() else {
-        failures.push(format!("{}: a frontier without a settling query", fixture.name));
-        return;
-    };
-    let out = pg.query(sql).expect("settling query");
-    let f: Vec<i64> = out.trim().split('|').map(|v| v.parse().expect("query count")).collect();
-    let (rows, saved, mismatches) = (f[0], f[3], f[4]);
-    let measured = if table_report["frontier"]["measure"].as_str() == Some("row_size") {
-        paired.size_saving_sum
+    let expected: Settled = if table_report["frontier"]["measure"].as_str() == Some("row_size") {
+        [
+            Some(paired.current.rows as i64),
+            Some(paired.size_alternative_smaller),
+            Some(paired.size_current_smaller),
+            Some(paired.size_saving_sum),
+        ]
     } else {
-        paired.saving_sum
+        [
+            Some(paired.current.rows as i64),
+            Some(paired.alternative_smaller),
+            Some(paired.current_smaller),
+            Some(paired.saving_sum),
+        ]
     };
-    println!(
-        "| {} | query | {workload} | rows {rows}, alternative smaller {}, current smaller {}, saved {saved} | measured saved {measured} | mismatches {mismatches} |",
-        fixture.name, f[1], f[2]
-    );
-    if rows != paired.current.rows as i64 || mismatches != 0 || saved != measured {
-        failures.push(format!(
-            "{}/{workload}: the settling query says {rows} rows, {saved} B saved, {mismatches} mismatches; measured {} rows, {measured} B",
-            fixture.name, paired.current.rows
-        ));
+    for variant in ["reader", "pageinspect"] {
+        let Some(sql) = table_report["frontier"]["query"][variant]["sql"].as_str() else {
+            failures.push(format!(
+                "{}: a frontier without a {variant} settling query",
+                fixture.name
+            ));
+            continue;
+        };
+        let (counts, flags, note) = run_settling(pg, sql);
+        println!(
+            "| {} | {variant} query | {workload} | {counts:?} flags {flags:?} {note} | measured {expected:?} | - |",
+            fixture.name
+        );
+        if counts != expected || flags.iter().any(|f| *f != Some(0)) || !note.is_empty() {
+            failures.push(format!(
+                "{}/{workload}: the {variant} settling query says {counts:?}, flags {flags:?}, note `{note}`; measured {expected:?}",
+                fixture.name
+            ));
+        }
     }
 }
 
@@ -1362,7 +1404,9 @@ fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Pa
                 min(cp - ap) FILTER (WHERE same), max(cp - ap) FILTER (WHERE same), \
                 min(cs - asz) FILTER (WHERE same), max(cs - asz) FILTER (WHERE same), \
                 count(*) FILTER (WHERE NOT same), \
-                coalesce(sum(cp - ap) FILTER (WHERE same), 0), coalesce(sum(cs - asz) FILTER (WHERE same), 0) \
+                coalesce(sum(cp - ap) FILTER (WHERE same), 0), coalesce(sum(cs - asz) FILTER (WHERE same), 0), \
+                count(*) FILTER (WHERE same AND ap < cp), count(*) FILTER (WHERE same AND ap > cp), \
+                count(*) FILTER (WHERE same AND asz < cs), count(*) FILTER (WHERE same AND asz > cs) \
          FROM j;",
         row_pads_sql(cur.0, cur.1),
         row_pads_sql(alt.0, alt.1)
@@ -1396,6 +1440,10 @@ fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Pa
         stored_differently: f[13].parse().expect("differing rows"),
         saving_sum: f[14].parse().expect("saving sum"),
         size_saving_sum: f[15].parse().expect("size saving sum"),
+        alternative_smaller: f[16].parse().expect("alternative smaller"),
+        current_smaller: f[17].parse().expect("current smaller"),
+        size_alternative_smaller: f[18].parse().expect("size alternative smaller"),
+        size_current_smaller: f[19].parse().expect("size current smaller"),
     }
 }
 
@@ -1760,4 +1808,246 @@ fn run_report_only_checks(binary: &std::path::Path, failures: &mut Vec<String>) 
     if scope != "fixed_prefix" {
         failures.push(format!("cls: expected a capped-scope label, got {scope}"));
     }
+}
+
+/// One settling scenario's DDL, analyzed for its printed queries.
+fn settling_queries(binary: &std::path::Path, relation: &str) -> (String, String) {
+    settling_queries_named(binary, relation, ["n", "a", "m"])
+}
+
+fn settling_queries_named(binary: &std::path::Path, relation: &str, [n, a, m]: [&str; 3]) -> (String, String) {
+    let ddl = format!("CREATE TABLE {relation} ({n} int4 NOT NULL, {a} text NOT NULL, {m} macaddr NOT NULL);");
+    let value = analyze(binary, &ddl, &[]);
+    let query = &value["analysis"]["tables"][0]["frontier"]["query"];
+    let sql = |variant: &str| query[variant]["sql"].as_str().expect("a settling query").to_string();
+    (sql("reader"), sql("pageinspect"))
+}
+
+/// Property (f) on the shapes a migration history leaves: the queries find a table outside the
+/// search path, read every partition, say what they leave out, and refuse to settle on a table
+/// or column that is not there. Every expectation comes from a copy in the frontier order,
+/// paired by `n` and measured as each row's stored data length on the page.
+fn run_settling_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<String>) {
+    let p = prefix();
+    let fill = |table: &str, lo: u32, hi: u32| {
+        format!(
+            "INSERT INTO {table} (n, a, m) SELECT g, repeat('x', g % 200), '08:00:2b:01:02:03' FROM generate_series({lo}, {hi}) g;"
+        )
+    };
+    let base = format!("{p}settle");
+    pg.query(&format!(
+        "DROP TABLE IF EXISTS {base}, {base}_alt CASCADE;\n\
+         CREATE TABLE {base} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL);\n{}\n\
+         CREATE TABLE {base}_alt AS SELECT n, m, a FROM {base};",
+        fill(&base, 1, 1000)
+    ))
+    .expect("settling baseline");
+    let expect = |lo: u32, hi: u32| -> Settled {
+        let stored = |table: &str| {
+            format!(
+                "SELECT t.n, h.lp_len - h.t_hoff AS s FROM {table} t \
+                 JOIN (SELECT p, (heap_page_items(get_raw_page('{table}', p::int))).* \
+                       FROM generate_series(0, pg_relation_size('{table}') / 8192 - 1) p) h \
+                   ON t.ctid = format('(%s,%s)', h.p, h.lp)::tid"
+            )
+        };
+        let out = pg
+            .query(&format!(
+                "SELECT count(*), count(*) FILTER (WHERE a.s < c.s), count(*) FILTER (WHERE a.s > c.s), sum(c.s - a.s) \
+                 FROM ({}) c JOIN ({}) a USING (n) WHERE n BETWEEN {lo} AND {hi};",
+                stored(&base),
+                stored(&format!("{base}_alt"))
+            ))
+            .expect("expected counts");
+        let f: Vec<Option<i64>> = out.trim().split('|').map(|v| v.parse().ok()).collect();
+        [f[0], f[1], f[2], f[3]]
+    };
+    let mut problems: Vec<String> = Vec::new();
+    let mut check = |scenario: &str, variant: &str, sql: &str, want: Settled, flags: &[Option<i64>], note: &str| {
+        let (counts, got_flags, got_note) = run_settling(pg, sql);
+        println!("| settle {scenario} | {variant} | - | {counts:?} flags {got_flags:?} | {got_note} | - |");
+        if counts != want || got_flags != flags || !got_note.contains(note) || (note.is_empty() && !got_note.is_empty())
+        {
+            problems.push(format!(
+                "settle {scenario}/{variant}: {counts:?} flags {got_flags:?} note `{got_note}`; want {want:?} flags {flags:?} note containing `{note}`"
+            ));
+        }
+    };
+    let none: Settled = [None; 4];
+    let (reader, exact) = settling_queries(binary, &base);
+    check("plain", "reader", &reader, expect(1, 1000), &[Some(0)], "");
+    check("plain", "pageinspect", &exact, expect(1, 1000), &[Some(0), Some(0)], "");
+    // A schema outside the search path, found by the schema the DDL names.
+    let schema = format!("{p}schema");
+    pg.query(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE;\nCREATE SCHEMA {schema};\n\
+         CREATE TABLE {schema}.{base} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL);\n{}",
+        fill(&format!("{schema}.{base}"), 1, 1000)
+    ))
+    .expect("schema table");
+    let (reader, exact) = settling_queries(binary, &format!("{schema}.{base}"));
+    check("schema", "reader", &reader, expect(1, 1000), &[Some(0)], "");
+    check(
+        "schema",
+        "pageinspect",
+        &exact,
+        expect(1, 1000),
+        &[Some(0), Some(0)],
+        "",
+    );
+    pg.query(&format!("DROP SCHEMA {schema} CASCADE;"))
+        .expect("drop schema");
+    // Names that are keywords or hold quotes reach the queries as literals only.
+    let hostile = format!("\"{p}Settle \"\"q\"");
+    let names = ["\"N\"", "\"current_role\"", "\"x\"\"; DROP TABLE v; --\""];
+    pg.query(&format!(
+        "CREATE TABLE {hostile} ({} int4 NOT NULL, {} text NOT NULL, {} macaddr NOT NULL);\n\
+         INSERT INTO {hostile} SELECT n, a, m FROM {base};",
+        names[0], names[1], names[2]
+    ))
+    .expect("hostile names");
+    let (reader, exact) = settling_queries_named(binary, &hostile, names);
+    check("hostile names", "reader", &reader, expect(1, 1000), &[Some(0)], "");
+    check(
+        "hostile names",
+        "pageinspect",
+        &exact,
+        expect(1, 1000),
+        &[Some(0), Some(0)],
+        "",
+    );
+    pg.query(&format!("DROP TABLE {hostile};")).expect("drop hostile");
+    // A table, then a column, the database does not have yet.
+    let (reader, exact) = settling_queries(binary, &format!("{p}settle_absent"));
+    check(
+        "absent table",
+        "reader",
+        &reader,
+        none,
+        &[None],
+        "cannot settle: no relation",
+    );
+    check(
+        "absent table",
+        "pageinspect",
+        &exact,
+        none,
+        &[None, Some(0)],
+        "cannot settle: no relation",
+    );
+    let t = format!("{p}settle_t");
+    pg.query(&format!(
+        "DROP TABLE IF EXISTS {t} CASCADE;\nCREATE TABLE {t} (n int4 NOT NULL, a text NOT NULL);\n\
+         INSERT INTO {t} SELECT g, repeat('x', g % 200) FROM generate_series(1, 500) g;"
+    ))
+    .expect("table without m");
+    let (reader, exact) = settling_queries(binary, &t);
+    let not_yet = "cannot settle: column(s) m not in the table yet";
+    check("absent column", "reader", &reader, none, &[None], not_yet);
+    check("absent column", "pageinspect", &exact, none, &[None, Some(0)], not_yet);
+    // Rows written before a column added with a default do not store it.
+    pg.query(&format!(
+        "ALTER TABLE {t} ADD COLUMN m macaddr NOT NULL DEFAULT '08:00:2b:01:02:03';\n{}",
+        fill(&t, 501, 1000)
+    ))
+    .expect("fast default");
+    check(
+        "fast default",
+        "reader",
+        &reader,
+        expect(1, 1000),
+        &[Some(0)],
+        "carry a default",
+    );
+    check(
+        "fast default",
+        "pageinspect",
+        &exact,
+        expect(501, 1000),
+        &[Some(0), Some(500)],
+        "skipped_rows predate column(s) m",
+    );
+    pg.query(&format!("VACUUM FULL {t};")).expect("rewrite");
+    check(
+        "fast default rewritten",
+        "pageinspect",
+        &exact,
+        expect(1, 1000),
+        &[Some(0), Some(0)],
+        "",
+    );
+    // Rows written before a drop still hold the dropped value; the replay check skips them.
+    pg.query(&format!(
+        "DROP TABLE {t};\nCREATE TABLE {t} (n int4 NOT NULL, x int8, a text NOT NULL, m macaddr NOT NULL);\n\
+         INSERT INTO {t} SELECT g, g, repeat('x', g % 200), '08:00:2b:01:02:03' FROM generate_series(1, 500) g;\n\
+         ALTER TABLE {t} DROP COLUMN x;\n{}",
+        fill(&t, 501, 1000)
+    ))
+    .expect("dropped column");
+    check("dropped column", "reader", &reader, expect(1, 1000), &[Some(0)], "");
+    check(
+        "dropped column",
+        "pageinspect",
+        &exact,
+        expect(1, 1000),
+        &[Some(0), Some(0)],
+        "",
+    );
+    // An update leaves dead versions on the page until a scan prunes it or VACUUM runs; only the
+    // page reader counts them, so it runs first.
+    pg.query(&format!("UPDATE {t} SET a = a WHERE n <= 100;"))
+        .expect("update");
+    let dead_counts = run_settling(pg, &exact).0;
+    println!("| settle updated | pageinspect | - | {dead_counts:?} | dead versions counted | - |");
+    if dead_counts[0] != Some(1100) {
+        failures.push(format!("settle updated/pageinspect: {dead_counts:?}, want 1100 rows"));
+    }
+    check("updated", "reader", &reader, expect(1, 1000), &[Some(0)], "");
+    // A partitioned parent: one partition created from it, one attached in its own column order.
+    pg.query(&format!(
+        "DROP TABLE {t};\nCREATE TABLE {t} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL) PARTITION BY RANGE (n);\n\
+         CREATE TABLE {t}_p1 PARTITION OF {t} FOR VALUES FROM (0) TO (500);\n\
+         CREATE TABLE {t}_p2 (m macaddr NOT NULL, x int, a text NOT NULL, n int4 NOT NULL);\n\
+         ALTER TABLE {t}_p2 DROP COLUMN x;\n\
+         ALTER TABLE {t} ATTACH PARTITION {t}_p2 FOR VALUES FROM (500) TO (2000);\n{}",
+        fill(&t, 1, 1000)
+    ))
+    .expect("partitioned");
+    check(
+        "partitioned",
+        "reader",
+        &reader,
+        expect(1, 1000),
+        &[Some(0)],
+        "partitioned: every partition read",
+    );
+    check(
+        "partitioned",
+        "pageinspect",
+        &exact,
+        expect(1, 1000),
+        &[Some(0), Some(0)],
+        "partitioned: every leaf partition read",
+    );
+    // An inheritance parent: its own rows, and the note names the child left out.
+    pg.query(&format!(
+        "DROP TABLE {t};\nCREATE TABLE {t} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL);\n\
+         CREATE TABLE {t}_child () INHERITS ({t});\n{}\n{}",
+        fill(&t, 1, 600),
+        fill(&format!("{t}_child"), 601, 1000)
+    ))
+    .expect("inheritance");
+    let child = "1 child table(s) not read";
+    check("inheritance", "reader", &reader, expect(1, 600), &[Some(0)], child);
+    check(
+        "inheritance",
+        "pageinspect",
+        &exact,
+        expect(1, 600),
+        &[Some(0), Some(0)],
+        child,
+    );
+    pg.query(&format!("DROP TABLE {t} CASCADE;\nDROP TABLE {base}, {base}_alt;"))
+        .expect("settling cleanup");
+    failures.extend(problems);
 }
