@@ -511,6 +511,10 @@ fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
         rendered.contains("budgeted: 1 table(s) where the dominance search hit its budget"),
         "{rendered}"
     );
+    assert!(
+        rendered.contains("pass --fail-on-budgeted to gate on this"),
+        "{rendered}"
+    );
     assert!(!outcome.exceeded);
     outcome.fail_on_budgeted();
     assert!(outcome.exceeded, "--fail-on-budgeted fails on a budgeted search");
@@ -520,6 +524,7 @@ fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
         "{rendered}"
     );
     assert!(!rendered.contains("--fail-on-degraded)"), "{rendered}");
+    assert!(!rendered.contains("pass --fail-on-budgeted"), "{rendered}");
 }
 
 #[test]

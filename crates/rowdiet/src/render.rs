@@ -70,9 +70,14 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
         );
     }
     if gate.budgeted_tables > 0 {
+        let hint = if gate.failed_on_budgeted {
+            ""
+        } else {
+            " — pass --fail-on-budgeted to gate on this"
+        };
         let _ = writeln!(
             out,
-            "budgeted: {} table(s) where the dominance search hit its budget; findings there stand, clean verdicts cover the searched candidates only — pass --fail-on-budgeted to gate on this",
+            "budgeted: {} table(s) where the dominance search hit its budget; findings there stand, clean verdicts cover the searched candidates only{hint}",
             gate.budgeted_tables
         );
     }
