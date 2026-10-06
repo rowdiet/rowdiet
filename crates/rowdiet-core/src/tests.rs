@@ -2311,3 +2311,36 @@ mod settling_queries {
         assert_eq!(a.tables[0].name, "Ämac");
     }
 }
+
+/// A LIKE copy takes each type's own storage strategy, while a partition keeps its parent's,
+/// and neither holds rows written before it existed (checked against pg_attribute).
+#[cfg(feature = "pg-exact")]
+mod copied_storage {
+    use crate::extract::Storage;
+    use crate::{Config, ParserBackend, SqlSource, analyze_sources_with};
+
+    #[test]
+    fn like_resets_and_partition_of_keeps_the_strategy() {
+        let sql = "CREATE TABLE src (c varchar(5), s smallint);
+             ALTER TABLE src ALTER COLUMN c SET STORAGE PLAIN;
+             ALTER TABLE src ALTER COLUMN c SET STORAGE EXTENDED;
+             CREATE TABLE cp (LIKE src);
+             CREATE TABLE p (c varchar(5) STORAGE PLAIN, s smallint) PARTITION BY RANGE (s);
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);";
+        let a = analyze_sources_with(
+            ParserBackend::PgExact,
+            &[SqlSource::new("V1__t.sql", sql)],
+            &Config::default(),
+        );
+        let table = |name: &str| a.tables.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(
+            table("src").avoidable_bytes_per_row,
+            0.0,
+            "PLAIN-era rows keep the 4-byte header"
+        );
+        let cp = table("cp");
+        assert_eq!(cp.columns[0].storage, None);
+        assert_eq!(cp.suggested_order, vec!["s", "c"], "the copy holds no PLAIN-era rows");
+        assert_eq!(table("p1").columns[0].storage, Some(Storage::Plain));
+    }
+}

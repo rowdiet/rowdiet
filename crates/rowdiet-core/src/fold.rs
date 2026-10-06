@@ -408,7 +408,15 @@ impl Folder {
             if columns.is_empty() {
                 match self.tables.get(&source.key) {
                     Some(src) => {
-                        inherited.clone_from(&src.columns);
+                        // Plain LIKE copies no storage strategy: each column takes its type's own.
+                        inherited = src
+                            .columns
+                            .iter()
+                            .map(|c| FoldedColumn {
+                                storage: None,
+                                ..c.clone()
+                            })
+                            .collect();
                         incomplete = incomplete || src.incomplete;
                     }
                     None => {
@@ -448,6 +456,10 @@ impl Folder {
                 .into_iter()
                 .enumerate()
                 .map(|(i, column)| FoldedColumn {
+                    // A new table holds no rows yet: every row it stores is written under its
+                    // current strategy.
+                    plain_rows: column.storage == Some(Storage::Plain),
+                    toasted_rows: column.storage != Some(Storage::Plain),
                     attnum: i + 1,
                     origin: origin.clone(),
                     ..column
