@@ -104,26 +104,37 @@ fn catalog(relation: &[String], columns: &[QueryColumn], storage: bool) -> Strin
     let lookup = match relation {
         [.., schema, name] => format!(
             "pg_catalog.format('%I.%I', {}, {})",
-            string_literal(schema),
-            string_literal(name)
+            string_literal(identifier(schema)),
+            string_literal(identifier(name))
         ),
-        [name] => format!("pg_catalog.format('%I', {})", string_literal(name)),
+        [name] => format!("pg_catalog.format('%I', {})", string_literal(identifier(name))),
         [] => "''".to_string(),
     };
-    let names: Vec<String> = columns.iter().map(|c| string_literal(&c.name)).collect();
+    let looked_up = match relation {
+        [_, _, ..] => "'here'",
+        [_] | [] => "'on the search path (' || current_setting('search_path') || ')'",
+    };
+    let names: Vec<String> = columns.iter().map(|c| string_literal(identifier(&c.name))).collect();
     let plain = if storage {
         "
            ARRAY(SELECT coalesce(a.attstorage = 'p', false)::text
                  FROM unnest(t.names) WITH ORDINALITY AS w(name, k)
                  LEFT JOIN pg_catalog.pg_attribute AS a
                         ON a.attrelid = t.r AND a.attname::text = w.name AND a.attnum > 0 AND NOT a.attisdropped
-                 ORDER BY w.k) AS plain,"
+                 ORDER BY w.k) AS plain,
+           ARRAY(SELECT coalesce(y.typstorage = 'p', false)::text
+                 FROM unnest(t.names) WITH ORDINALITY AS w(name, k)
+                 LEFT JOIN pg_catalog.pg_attribute AS a
+                        ON a.attrelid = t.r AND a.attname::text = w.name AND a.attnum > 0 AND NOT a.attisdropped
+                 LEFT JOIN pg_catalog.pg_type AS y ON y.oid = a.atttypid
+                 ORDER BY w.k) AS typplain,
+           c.relnatts, current_setting('server_version_num')::int AS version,"
     } else {
         ""
     };
     format!(
         "WITH target AS (
-    SELECT n.name, pg_catalog.to_regclass(n.name) AS r, ARRAY[{names}]::text[] AS names
+    SELECT n.name, {looked_up} AS looked_up, pg_catalog.to_regclass(n.name) AS r, ARRAY[{names}]::text[] AS names
     FROM (SELECT {lookup} AS name) AS n
 ), info AS (
     SELECT t.*, c.relkind,{plain}
@@ -147,19 +158,20 @@ fn catalog(relation: &[String], columns: &[QueryColumn], storage: bool) -> Strin
 }
 
 /// The reasons both queries give for not settling, in a `concat_ws` list over `a`.
-const CANNOT_SETTLE: &str = "CASE WHEN a.r IS NULL THEN 'cannot settle: no relation ' || a.name || ' here' END,
+const CANNOT_SETTLE: &str = "CASE WHEN a.r IS NULL THEN 'cannot settle: no relation ' || a.name || ' ' || a.looked_up END,
         CASE WHEN a.relkind NOT IN ('r', 'p') THEN 'cannot settle: ' || a.name || ' is not a table' END,
         CASE WHEN a.r IS NOT NULL AND cardinality(a.missing) > 0 THEN 'cannot settle: column(s) ' || pg_catalog.array_to_string(a.missing, ', ')
              || ' not in the table yet; apply the migration that adds them and load rows first' END,
         CASE WHEN a.n = 0 AND a.relkind IN ('r', 'p') AND cardinality(a.missing) = 0
              THEN 'cannot settle: no rows to compare' END";
 
-/// The walk's end offset for `order`: each step aligns to `e{i}` and adds `z{i}` from `v`.
-fn walk(order: &[usize]) -> String {
+/// The walk's end offset for `order`: each step aligns to `e{i}` and adds `z{i}` from `forms`.
+fn walk(order: &[usize], forms: &str) -> String {
     let mut offset = "0".to_string();
     for &index in order {
         let i = index + 1;
-        offset = format!("(({offset} + v.e{i} - 1) / v.e{i} * v.e{i} + v.z{i})");
+        let (e, z) = (format!("{forms}.e{i}"), format!("{forms}.z{i}"));
+        offset = format!("(({offset} + {e} - 1) / {e} * {e} + {z})");
     }
     offset
 }
@@ -180,21 +192,19 @@ fn align_and_width(kind: ColumnKind) -> (u64, Option<u64>) {
     }
 }
 
-/// One `WHEN` of a value's form: the alignment it takes, the bytes it stores, and whether the
-/// form is a guess. `when: None` is the `ELSE`.
+/// One `WHEN` of a value's form: the alignment it takes and the bytes it stores. `when: None`
+/// is the `ELSE`.
 struct Form {
     when: Option<String>,
     align: String,
     bytes: String,
-    guess: bool,
 }
 
-fn form(when: Option<String>, align: impl ToString, bytes: impl ToString, guess: bool) -> Form {
+fn form(when: Option<String>, align: impl ToString, bytes: impl ToString) -> Form {
     Form {
         when,
         align: align.to_string(),
         bytes: bytes.to_string(),
-        guess,
     }
 }
 
@@ -214,39 +224,43 @@ fn case(forms: &[Form], pick: impl Fn(&Form) -> String) -> String {
     out
 }
 
-/// A value's form as a rewrite in either order stores it, from what its size functions say.
-/// `plain` is the format placeholder for the column's `attstorage = 'p'`.
-fn reader_forms(i: usize, column: &QueryColumn, plain: &str) -> Vec<Form> {
+/// A value's form as a rewrite in either order stores it. `q{i}` is how much a one-column row
+/// adds to the value: 24 in line, 21 for a 4-byte header a short one could replace, more for a
+/// value fetched from TOAST. `plain` and `typplain` are the placeholders for the column's and
+/// its type's `PLAIN` storage.
+fn reader_forms(i: usize, column: &QueryColumn, plain: &str, typplain: &str) -> Vec<Form> {
     let (align, width) = align_and_width(column.kind);
     if let Some(width) = width {
-        return vec![
-            form(Some(format!("m.n{i}")), 1, 0, false),
-            form(None, align, width, false),
-        ];
+        return vec![form(Some(format!("m.n{i}")), 1, 0), form(None, align, width)];
     }
-    let (s, c, l) = (format!("m.s{i}"), format!("m.c{i}"), format!("m.l{i}"));
-    let mut forms = vec![
-        form(Some(format!("{s} IS NULL")), 1, 0, false),
-        form(Some(format!("{c} AND NOT t.big")), align, &s, false),
-        form(Some(c), 1, 18, true),
-    ];
+    let (s, c, l, q) = (
+        format!("m.s{i}"),
+        format!("m.c{i}"),
+        format!("m.l{i}"),
+        format!("m.q{i}"),
+    );
+    let mut forms = vec![form(Some(format!("{s} IS NULL")), 1, 0)];
     if column.octets {
         forms.extend([
-            form(Some(format!("{s} = {l}")), 1, 18, false),
+            form(Some(format!("{c} AND {q} > 24")), 1, 18),
+            form(Some(c), align, &s),
+            form(Some(format!("{s} = {l}")), 1, 18),
             form(
                 Some(format!("{s} - {l} = 1 OR ({l} <= 126 AND NOT {plain})")),
                 1,
                 format!("{l} + 1"),
-                false,
             ),
-            form(None, align, format!("{l} + 4"), false),
+            form(None, align, format!("{l} + 4")),
         ]);
     } else {
         forms.extend([
-            form(Some(format!("{s} <= 127 AND NOT {plain}")), 1, &s, false),
-            form(Some(format!("{s} <= 127")), align, &s, true),
-            form(Some("NOT t.big".to_string()), align, &s, false),
-            form(None, 1, 18, true),
+            form(Some(typplain.to_string()), align, &s),
+            form(Some(format!("{q} > 24")), 1, 18),
+            form(Some(c), align, &s),
+            form(Some(format!("{q} < 24 AND NOT {plain}")), 1, format!("{s} - 3")),
+            form(Some(format!("{q} < 24")), align, &s),
+            form(Some(format!("{s} <= 127")), 1, &s),
+            form(None, align, &s),
         ]);
     }
     forms
@@ -262,89 +276,118 @@ fn reader_query(
     measure: Measure,
 ) -> SettlingQuery {
     let k = columns.len();
-    // Placeholders: %1$s the relation, %2$s ONLY or nothing, then each name, then each PLAIN flag.
-    let name = |i: usize| format!("r.%{}$I", i + 2);
-    let plain = |i: usize| format!("%{}$s", k + i + 2);
+    // Placeholders: the relation, ONLY or nothing, its attribute count, then per column its
+    // name, its PLAIN flag, its type's PLAIN flag.
+    let name = |i: usize| format!("r.%{}$I", i + 3);
+    let plain = |i: usize| format!("%{}$s", k + i + 3);
+    let typplain = |i: usize| format!("%{}$s", 2 * k + i + 3);
     let mut sizes = Vec::new();
-    let mut big = vec!["24".to_string()];
+    let mut nulls = Vec::new();
     let mut picks = Vec::new();
-    let mut guesses = Vec::new();
+    let mut fetched = Vec::new();
     for (index, column) in columns.iter().enumerate() {
         let i = index + 1;
-        let (_, width) = align_and_width(column.kind);
-        match width {
-            Some(width) => {
-                sizes.push(format!("{} IS NULL AS n{i}", name(i)));
-                big.push(format!("CASE WHEN m.n{i} THEN 0 ELSE {width} END"));
-            }
-            None => {
+        let (align, width) = align_and_width(column.kind);
+        if width.is_some() {
+            sizes.push(format!("{} IS NULL AS n{i}", name(i)));
+            nulls.push(format!("m.n{i}"));
+            fetched.push(format!("v.e{i} AS e{i}, v.z{i} AS z{i}"));
+        } else {
+            let v = name(i);
+            sizes.push(format!(
+                "pg_catalog.pg_column_size({v}) AS s{i}, pg_catalog.pg_column_compression({v}) IS NOT NULL AS c{i}"
+            ));
+            let row = format!("pg_catalog.pg_column_size(ROW({v})) - pg_catalog.pg_column_size({v})");
+            if column.octets {
                 sizes.push(format!(
-                    "pg_catalog.pg_column_size({0}) AS s{i}, pg_catalog.pg_column_compression({0}) IS NOT NULL AS c{i}",
-                    name(i)
+                    "pg_catalog.octet_length({v}) AS l{i}, CASE WHEN pg_catalog.pg_column_compression({v}) IS NOT NULL THEN {row} END AS q{i}"
                 ));
-                if column.octets {
-                    sizes.push(format!("pg_catalog.octet_length({}) AS l{i}", name(i)));
-                    big.push(format!(
-                        "coalesce(CASE WHEN NOT m.c{i} AND m.s{i} = m.l{i} THEN 18 ELSE m.s{i} END, 0)"
-                    ));
-                } else {
-                    big.push(format!("coalesce(m.s{i}, 0)"));
-                }
+            } else {
+                sizes.push(format!("{row} AS q{i}"));
             }
+            nulls.push(format!("m.s{i} IS NULL"));
+            let outside = if column.octets {
+                format!("CASE WHEN m.c{i} THEN m.q{i} > 24 ELSE m.s{i} = m.l{i} END")
+            } else {
+                format!("m.q{i} > 24")
+            };
+            picks.push(format!("coalesce({outside}, false) AS x{i}"));
+            fetched.push(format!(
+                "CASE WHEN v.x{i} THEN {align} ELSE v.e{i} END AS e{i}, CASE WHEN v.x{i} THEN m.s{i} + 4 ELSE v.z{i} END AS z{i}"
+            ));
         }
-        let forms = reader_forms(i, column, &plain(i));
+        let forms = reader_forms(i, column, &plain(i), &typplain(i));
         picks.push(format!("{} AS e{i}", case(&forms, |f| f.align.clone())));
         picks.push(format!("{} AS z{i}", case(&forms, |f| f.bytes.clone())));
-        if forms.iter().any(|f| f.guess) {
-            guesses.push(case(&forms, |f| f.guess.to_string()));
-        }
     }
-    let guessed = if guesses.is_empty() {
-        "false".to_string()
-    } else {
-        guesses.join("\n               OR ")
+    let header = |natts: &str, dropped: &str| {
+        format!("CASE WHEN v.nulls{dropped} THEN (23 + ({natts} + 7) / 8 + 7) / 8 * 8 ELSE 24 END")
     };
+    let threshold = "(current_setting('block_size')::int - 40) / 32 * 8";
     let template = format!(
         "SELECT count(*) AS n,
-       count(*) FILTER (WHERE w.alt < w.cur) AS alternative_smaller,
-       count(*) FILTER (WHERE w.alt > w.cur) AS current_smaller,
-       coalesce(sum(w.cur - w.alt), 0) AS bytes_saved,
-       count(*) FILTER (WHERE v.guessed) AS approximate_rows
+       count(*) FILTER (WHERE NOT w.crosses AND w.alt < w.cur) AS alternative_smaller,
+       count(*) FILTER (WHERE NOT w.crosses AND w.alt > w.cur) AS current_smaller,
+       coalesce(sum(w.cur - w.alt) FILTER (WHERE NOT w.crosses), 0) AS bytes_saved,
+       count(*) FILTER (WHERE w.crosses) AS approximate_rows
 FROM %2$s %1$s AS r
 CROSS JOIN LATERAL (
     SELECT {sizes}
     OFFSET 0
 ) AS m
 CROSS JOIN LATERAL (
-    SELECT {big} > (current_setting('block_size')::int - 40) / 32 * 8 AS big
-    OFFSET 0
-) AS t
-CROSS JOIN LATERAL (
     SELECT {picks},
-           {guessed} AS guessed
+           {nulls} AS nulls
     OFFSET 0
 ) AS v
 CROSS JOIN LATERAL (
-    SELECT {cur} AS cur,
-           {alt} AS alt
+    SELECT {fetched}
+    OFFSET 0
+) AS t
+CROSS JOIN LATERAL (
+    SELECT {cur_walk} AS oc,
+           {alt_walk} AS oa,
+           {cur_fetched} AS tc,
+           {alt_fetched} AS ta
+    OFFSET 0
+) AS o
+CROSS JOIN LATERAL (
+    SELECT {cur_header} + o.tc <= {threshold} AS fits_current,
+           {alt_header} + o.ta <= {threshold} AS fits_alternative
+    OFFSET 0
+) AS f
+CROSS JOIN LATERAL (
+    SELECT CASE WHEN f.fits_current AND f.fits_alternative THEN {cur_inline} ELSE {cur} END AS cur,
+           CASE WHEN f.fits_current AND f.fits_alternative THEN {alt_inline} ELSE {alt} END AS alt,
+           f.fits_current <> f.fits_alternative AS crosses
     OFFSET 0
 ) AS w",
         sizes = sizes.join(",\n           "),
-        big = big.join(" + "),
         picks = picks.join(",\n           "),
-        cur = cost(&walk(current), measure),
-        alt = cost(&walk(alternative), measure),
+        nulls = nulls.join(" OR "),
+        fetched = fetched.join(",\n           "),
+        cur_walk = walk(current, "v"),
+        alt_walk = walk(alternative, "v"),
+        cur_fetched = walk(current, "t"),
+        alt_fetched = walk(alternative, "t"),
+        cur = cost("o.oc", measure),
+        alt = cost("o.oa", measure),
+        cur_inline = cost("o.tc", measure),
+        alt_inline = cost("o.ta", measure),
+        cur_header = header("%3$s", &format!(" OR %3$s > {k}")),
+        alt_header = header(&k.to_string(), ""),
     );
     let tag = dollar_tag(&template);
-    let field = |f: &str| format!("(pg_catalog.xpath('/table/row/{f}/text()', s.x))[1]::text::bigint AS {f}");
+    let field = |f: &str| format!("substring(s.x::text FROM '<{f}>(-?[0-9]+)</{f}>')::bigint AS {f}");
     let sql = format!(
         "{catalog}, settled AS (
     SELECT i.*,
            (SELECT pg_catalog.query_to_xml(pg_catalog.format({tag}
 {template}
-{tag}, VARIADIC ARRAY[i.r::text, CASE WHEN i.relkind = 'p' THEN '' ELSE 'ONLY' END] || i.names || i.plain),
+{tag}, VARIADIC ARRAY[i.r::text, CASE WHEN i.relkind = 'p' THEN '' ELSE 'ONLY' END, i.relnatts::text]
+                       || i.names || i.plain || i.typplain),
                    false, false, '')
-            WHERE i.relkind IN ('r', 'p') AND cardinality(i.missing) = 0) AS x
+            WHERE i.relkind IN ('r', 'p') AND cardinality(i.missing) = 0 AND i.version >= 140000) AS x
     FROM info AS i
 ), answer AS (
     SELECT s.*,
@@ -361,12 +404,15 @@ SELECT CASE WHEN a.n > 0 THEN a.n END AS rows,
        CASE WHEN a.n > 0 THEN a.bytes_saved END AS bytes_saved,
        CASE WHEN a.n > 0 THEN a.approximate_rows END AS approximate_rows,
        pg_catalog.concat_ws('; ',
+        CASE WHEN a.version < 140000 THEN 'cannot settle: the reader query needs PostgreSQL 14 or later; '
+             || 'the pageinspect query (--settle-exact) runs on older servers' END,
         {CANNOT_SETTLE},
         CASE WHEN a.relkind = 'p' THEN 'partitioned: every partition read' END,
         CASE WHEN a.foreign_leaves > 0 THEN a.foreign_leaves || ' foreign partition(s) read through their server, sizes approximate' END,
         CASE WHEN a.relkind = 'r' AND a.children > 0 THEN 'inheritance parent: its own rows only, ' || a.children || ' child table(s) not read' END,
         CASE WHEN cardinality(a.fast_default) > 0 THEN 'column(s) ' || pg_catalog.array_to_string(a.fast_default, ', ')
-             || ' carry a default older rows do not store; both orders count it as a rewrite stores it' END) AS note
+             || ' carry a default older rows do not store; both orders count it as a rewrite stores it' END,
+        CASE WHEN a.approximate_rows > 0 THEN 'approximate_rows cross the TOAST threshold between the two orders and are left out of the counts' END) AS note
 FROM answer AS a;",
         catalog = catalog(relation, columns, true),
         n = field("n"),
@@ -377,16 +423,19 @@ FROM answer AS a;",
     );
     let readings = vec![
         counts_reading(measure),
-        "runs as any role that can read the table on PostgreSQL 14 or later and reads no TOAST \
-         data: each value's form comes from pg_column_size, pg_column_compression and, for text \
-         types, octet_length, as a rewrite in either order would store it"
+        "runs as any role that can read the table on PostgreSQL 14 or later: each value's form comes \
+         from pg_column_size, pg_column_compression, octet_length for text types, and the size of a \
+         one-column row built from the value, which fetches out-of-line non-text and compressed \
+         values from TOAST once; both orders are counted as a rewrite would store the row, an \
+         out-of-line value back in line where the row then fits under the TOAST threshold in both"
             .to_string(),
-        "approximate_rows counts rows holding a value whose form is a guess: a compressed or long \
-         non-text value in a row over the TOAST threshold, or a short non-text value in a PLAIN \
-         column; the pageinspect query (--settle-exact) settles those"
+        "approximate_rows counts rows that fit under the TOAST threshold in one order and not the \
+         other: a rewrite would toast them in one order only, so they are left out of the other \
+         counts"
             .to_string(),
         "note gives the reason when the query cannot settle (no such table, columns not added yet, \
-         no rows) and says what it read: partitions, inheritance children, fast defaults"
+         no rows, a server before PostgreSQL 14) and says what it read: partitions, inheritance \
+         children, fast defaults"
             .to_string(),
     ];
     SettlingQuery { sql, readings }
@@ -497,9 +546,9 @@ FROM answer AS a;",
         catalog = catalog(relation, columns, false),
         values = values.join(",\n               "),
         picks = picks.join(",\n               "),
-        cur_walk = walk(current),
+        cur_walk = walk(current, "v"),
         cur = cost("c.o", measure),
-        alt = cost(&walk(alternative), measure),
+        alt = cost(&walk(alternative, "v"), measure),
     );
     let readings = vec![
         counts_reading(measure),
@@ -517,6 +566,15 @@ FROM answer AS a;",
             .to_string(),
     ];
     SettlingQuery { sql, readings }
+}
+
+/// A name as PostgreSQL stores it: cut to 63 bytes at a character boundary.
+fn identifier(name: &str) -> &str {
+    let mut end = name.len().min(63);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// A string literal PostgreSQL reads back byte for byte: `U&'...'` with `\XXXX` escapes when the

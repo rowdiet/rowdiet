@@ -74,3 +74,12 @@ fn the_template_quote_never_closes_inside_its_body() {
     assert_eq!(dollar_tag("SELECT 1"), "$rowdiet$");
     assert_eq!(dollar_tag("a $rowdiet$ b"), "$rowdiet1$");
 }
+
+#[test]
+fn a_long_name_is_cut_where_postgresql_cuts_it() {
+    let long = "m".repeat(70);
+    assert_eq!(identifier(&long), "m".repeat(63));
+    let wide = format!("{}é", "m".repeat(62));
+    assert_eq!(identifier(&wide), "m".repeat(62), "a character is never split");
+    assert_eq!(identifier("short"), "short");
+}
