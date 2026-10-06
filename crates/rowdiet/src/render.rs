@@ -3,15 +3,41 @@
 use rowdiet_core::dominance::Measure;
 use rowdiet_core::layout::SearchScope;
 use rowdiet_core::report::{BandWinner, BlockFinding, DominanceScope, Frontier};
+use rowdiet_core::resolve::{FrontierQuery, SettlingQuery};
 use rowdiet_core::{Analysis, ColumnReport, GateOutcome, NoteKind, OrderStats, TableReport, TableVerdict, Tier};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, gate: &GateOutcome) -> String {
+/// Which settling query a report prints under a frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// The query any role that can read the table runs.
+    Reader,
+    /// The exact replay of the stored tuples, for a superuser with pageinspect.
+    Pageinspect,
+}
+
+impl Settle {
+    fn pick(self, query: &FrontierQuery) -> &SettlingQuery {
+        match self {
+            Self::Reader => &query.reader,
+            Self::Pageinspect => &query.pageinspect,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reader => "any role that can read the table",
+            Self::Pageinspect => "pageinspect, superuser",
+        }
+    }
+}
+
+pub fn text(analysis: &Analysis, rows: Option<u64>, suggest: bool, settle: Settle, gate: &GateOutcome) -> String {
     let mut out = String::new();
     for table in &analysis.tables {
-        render_table(&mut out, table, rows, suggest, gate);
+        render_table(&mut out, table, rows, suggest, settle, gate);
     }
     if !analysis.notes.is_empty() {
         let _ = writeln!(out, "notes:");
@@ -123,7 +149,14 @@ fn render_gate_summary(out: &mut String, gate: &GateOutcome) {
     }
 }
 
-fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: bool, gate: &GateOutcome) {
+fn render_table(
+    out: &mut String,
+    t: &TableReport,
+    rows: Option<u64>,
+    suggest: bool,
+    settle: Settle,
+    gate: &GateOutcome,
+) {
     let verdict = gate.verdicts.get(&t.name).copied();
     let block = gate.blocks.get(&t.name);
     let loc = escape_text(&t.origin.to_string()).into_owned();
@@ -180,9 +213,9 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         };
         let mark = if capped_waste { "◐" } else { "✓" };
         let _ = writeln!(out, "{mark} {display} ({loc}) — {detail} [{}]", tier_label(t));
-        render_frontier(out, t);
+        render_frontier(out, t, settle);
         render_flags(out, t);
-        render_verdict(out, t, verdict, block);
+        render_verdict(out, t, verdict, block, settle);
         return;
     }
     let _ = writeln!(
@@ -235,19 +268,26 @@ fn render_table(out: &mut String, t: &TableReport, rows: Option<u64>, suggest: b
         }
     }
     render_flags(out, t);
-    render_verdict(out, t, verdict, block);
+    render_verdict(out, t, verdict, block, settle);
     if suggest {
         render_suggestion(out, t);
     }
 }
 
-fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdict>, block: Option<&BlockFinding>) {
+fn render_verdict(
+    out: &mut String,
+    t: &TableReport,
+    verdict: Option<TableVerdict>,
+    block: Option<&BlockFinding>,
+    settle: Settle,
+) {
     if let Some(block) = block {
         render_block(
             out,
             t,
             block,
             matches!(verdict, Some(TableVerdict::BlockNotDominanceOptimal { .. })),
+            settle,
         );
     }
     if let Some(TableVerdict::ModifiedSinceBaseline { .. }) = verdict {
@@ -261,7 +301,7 @@ fn render_verdict(out: &mut String, t: &TableReport, verdict: Option<TableVerdic
 
 /// The appended block of a baselined table: the one order still free, judged with the
 /// committed prefix in place.
-fn render_block(out: &mut String, t: &TableReport, block: &BlockFinding, failing: bool) {
+fn render_block(out: &mut String, t: &TableReport, block: &BlockFinding, failing: bool, settle: Settle) {
     let dropped = block.committed_slots - block.prefix_columns;
     let appended = format!(
         "{} column(s) after a committed prefix of {}{}",
@@ -311,7 +351,7 @@ fn render_block(out: &mut String, t: &TableReport, block: &BlockFinding, failing
         );
     }
     if let Some(frontier) = &block.frontier {
-        render_frontier_body(out, t, frontier, "    block frontier");
+        render_frontier_body(out, t, frontier, "    block frontier", settle);
     }
 }
 
@@ -340,13 +380,13 @@ fn scope_note(t: &TableReport) -> &'static str {
 
 /// The workload-dependent alternative: both orders, worst cases, and the decision boundary by
 /// storage-form band. Reported only; the gate never sees it.
-fn render_frontier(out: &mut String, t: &TableReport) {
+fn render_frontier(out: &mut String, t: &TableReport, settle: Settle) {
     if let Some(frontier) = &t.frontier {
-        render_frontier_body(out, t, frontier, "  frontier ");
+        render_frontier_body(out, t, frontier, "  frontier ", settle);
     }
 }
 
-fn render_frontier_body(out: &mut String, t: &TableReport, frontier: &Frontier, label: &str) {
+fn render_frontier_body(out: &mut String, t: &TableReport, frontier: &Frontier, label: &str, settle: Settle) {
     let _ = writeln!(
         out,
         "{label}: {} — worst case {} B/row vs current {} B/row (workload-dependent, not gated)",
@@ -440,11 +480,8 @@ fn render_frontier_body(out: &mut String, t: &TableReport, frontier: &Frontier, 
         let _ = writeln!(out, "             {line}");
     }
     let _ = render_frontier_assumption_free(out, frontier);
-    if let Some(query) = &frontier.query {
-        let _ = writeln!(
-            out,
-            "             settle it on rows like yours (pageinspect, superuser):"
-        );
+    if let Some(query) = frontier.query.as_ref().map(|q| settle.pick(q)) {
+        let _ = writeln!(out, "             settle it on rows like yours ({}):", settle.label());
         for line in query.sql.lines() {
             let _ = writeln!(out, "               {line}");
         }
@@ -992,7 +1029,7 @@ impl AnnotationBudget {
 
 /// Markdown for `$GITHUB_STEP_SUMMARY`: the full, uncapped report — the annotation budget
 /// above stays honest because everything it drops is here.
-pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
+pub fn github_step_summary(analysis: &Analysis, settle: Settle, gate: &GateOutcome) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "## rowdiet\n");
     let _ = writeln!(
@@ -1077,13 +1114,16 @@ pub fn github_step_summary(analysis: &Analysis, gate: &GateOutcome) -> String {
                 .map(|f| ("appended block of ", f)),
         ];
         for (scope, frontier) in frontiers.into_iter().flatten() {
-            let Some(query) = &frontier.query else { continue };
+            let Some(query) = frontier.query.as_ref().map(|q| settle.pick(q)) else {
+                continue;
+            };
             let fence = fence_for(&query.sql);
             let _ = writeln!(
                 out,
-                "### Settling the {scope}{}\n\nFrontier order: {}. Run on rows like yours:\n\n{fence}sql\n{}\n{fence}\n",
+                "### Settling the {scope}{}\n\nFrontier order: {}. Run on rows like yours ({}):\n\n{fence}sql\n{}\n{fence}\n",
                 markdown_text(&t.display),
                 markdown_text(&frontier.order.join(", ")),
+                settle.label(),
                 query.sql
             );
             for reading in &query.readings {

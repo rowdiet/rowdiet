@@ -56,6 +56,10 @@ struct Cli {
     /// covers only the searched candidates
     #[arg(long)]
     fail_on_budgeted: bool,
+    /// Print the settling query that replays the stored tuples exactly (needs pageinspect and a
+    /// superuser) instead of the one any role that can read the table runs
+    #[arg(long)]
+    settle_exact: bool,
 }
 
 /// A permissive f64 parser would accept `nan` and `inf`, both of which make every `avoidable >
@@ -127,14 +131,19 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         gate.fail_on_budgeted();
     }
     let shown_fail_over = cli.fail_over.or_else(|| loaded.as_ref().map(|b| b.fail_over));
+    let settle = if cli.settle_exact {
+        render::Settle::Pageinspect
+    } else {
+        render::Settle::Reader
+    };
     let output = match cli.format {
-        Format::Text => render::text(&analysis, cli.rows, cli.suggest, &gate),
+        Format::Text => render::text(&analysis, cli.rows, cli.suggest, settle, &gate),
         Format::Json => render::json(&analysis, shown_fail_over, &gate)?,
         Format::Github => render::github(&analysis, &gate),
     };
     print!("{output}");
     if matches!(cli.format, Format::Github) {
-        append_step_summary(&analysis, &gate);
+        append_step_summary(&analysis, settle, &gate);
     }
     Ok(if gate.exceeded {
         ExitCode::from(1)
@@ -146,14 +155,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
 /// Under GitHub Actions the annotation stream is capped by the runner (10 per severity per
 /// step), so `--format github` also appends the full report to `$GITHUB_STEP_SUMMARY` when the
 /// environment provides it. Best-effort: a broken summary path must not change the exit code.
-fn append_step_summary(analysis: &Analysis, gate: &rowdiet_core::GateOutcome) {
+fn append_step_summary(analysis: &Analysis, settle: render::Settle, gate: &rowdiet_core::GateOutcome) {
     let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
         return;
     };
     if path.is_empty() {
         return;
     }
-    let summary = render::github_step_summary(analysis, gate);
+    let summary = render::github_step_summary(analysis, settle, gate);
     let written = std::fs::OpenOptions::new()
         .append(true)
         .create(true)

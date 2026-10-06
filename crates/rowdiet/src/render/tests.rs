@@ -42,7 +42,13 @@ fn baselined(analysis: &Analysis, entries: &[(&str, &str)]) -> GateOutcome {
 #[test]
 fn text_report_mentions_the_essentials() {
     let analysis = sample();
-    let rendered = text(&analysis, Some(1_000_000), true, &gate(&analysis, Some(0.0)));
+    let rendered = text(
+        &analysis,
+        Some(1_000_000),
+        true,
+        Settle::Reader,
+        &gate(&analysis, Some(0.0)),
+    );
     assert!(rendered.contains("account"));
     assert!(rendered.contains("V1__init.sql:1"));
     assert!(rendered.contains("B/row avoidable"));
@@ -55,7 +61,7 @@ fn text_report_mentions_the_essentials() {
 #[test]
 fn optimal_table_is_a_checkmark_line() {
     let analysis = analyze("CREATE TABLE ok (id bigint NOT NULL, n integer NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("✓ ok"));
     assert!(rendered.contains("optimal: zero padding"));
     assert!(!rendered.contains("FAIL:"));
@@ -64,7 +70,7 @@ fn optimal_table_is_a_checkmark_line() {
 #[test]
 fn empty_modeled_tables_are_not_called_optimal() {
     let analysis = analyze("CREATE TABLE c PARTITION OF elsewhere FOR VALUES FROM (1) TO (2);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("◌ c"), "{rendered}");
     assert!(rendered.contains("not analyzable"), "{rendered}");
     assert!(!rendered.contains("✓ c"), "{rendered}");
@@ -76,7 +82,7 @@ fn partition_children_with_known_parent_render_real_analysis() {
     let analysis = analyze(
         "CREATE TABLE p (flag boolean NOT NULL, id bigint NOT NULL) PARTITION BY RANGE (id);\nCREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (2);",
     );
-    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, None));
     assert!(rendered.contains("✓ c") || rendered.contains("■ c"), "{rendered}");
     assert!(!rendered.contains("◌ c"), "{rendered}");
 }
@@ -85,18 +91,31 @@ fn partition_children_with_known_parent_render_real_analysis() {
 fn baseline_verdicts_in_text_output() {
     let analysis = sample();
     let sig = &analysis.tables[0].layout_signature;
-    let committed = text(&analysis, None, false, &baselined(&analysis, &[("account", sig)]));
+    let committed = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("account", sig)]),
+    );
     assert!(
         !committed.contains("FAIL"),
         "a committed layout is not judged again: {committed}"
     );
-    let modified = text(&analysis, None, false, &baselined(&analysis, &[("account", "f16c")]));
+    let modified = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("account", "f16c")]),
+    );
     assert!(modified.contains("✗ modified since baseline"), "{modified}");
     assert!(modified.contains("--accept account"), "{modified}");
     let orphanish = text(
         &analysis,
         None,
         false,
+        Settle::Reader,
         &baselined(&analysis, &[("account", sig), ("ghost", "vi")]),
     );
     assert!(
@@ -120,7 +139,13 @@ fn grown() -> Analysis {
 #[test]
 fn a_wasteful_block_prints_its_block_order() {
     let analysis = grown();
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    let rendered = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("t", "f4i,f8d")]),
+    );
     assert!(
         rendered.contains(
             "✗ appended block (V1__init.sql:2, 4 column(s) after a committed prefix of 2) is not dominance-optimal"
@@ -139,6 +164,7 @@ fn a_wasteful_block_prints_its_block_order() {
         &analysis,
         None,
         false,
+        Settle::Reader,
         &baselined(&analysis, &[("t", &analysis.tables[0].layout_signature)]),
     );
     assert!(!accepted.contains("FAIL"), "{accepted}");
@@ -150,7 +176,13 @@ fn an_optimal_block_says_so() {
         "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL);
          ALTER TABLE t ADD COLUMN c bigint NOT NULL, ADD COLUMN d integer NOT NULL;",
     );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    let rendered = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("t", "f4i,f8d")]),
+    );
     assert!(
         rendered.contains("✓ appended block (V1__init.sql:2, 2 column(s) after a committed prefix of 2): no dominating block order exists"),
         "{rendered}"
@@ -172,6 +204,7 @@ fn legacy_allowances_are_reported_as_ignored() {
         &analysis,
         None,
         false,
+        Settle::Reader,
         &baseline::evaluate(&analysis, None, false, Some(&base)),
     );
     assert!(
@@ -268,7 +301,7 @@ fn github_step_summary_carries_the_full_report() {
         })
         .collect();
     let analysis = analyze(&sql);
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let summary = github_step_summary(&analysis, Settle::Reader, &gate(&analysis, Some(0.0)));
     for i in 0..13 {
         assert!(
             summary.contains(&format!("| t{i:02} | 8.0 | - | complete | exact | **new violation** |")),
@@ -280,7 +313,7 @@ fn github_step_summary_carries_the_full_report() {
         "{summary}"
     );
     let grown = grown();
-    let baselined_summary = github_step_summary(&grown, &baselined(&grown, &[("t", "f4i,f8d")]));
+    let baselined_summary = github_step_summary(&grown, Settle::Reader, &baselined(&grown, &[("t", "f4i,f8d")]));
     assert!(
         baselined_summary.contains("**block not dominance-optimal** (block order: f, h, e, g)"),
         "{baselined_summary}"
@@ -290,13 +323,13 @@ fn github_step_summary_carries_the_full_report() {
 #[test]
 fn an_unverified_payload_model_reads_as_found_everywhere() {
     let analysis = analyze("CREATE TABLE i (a inet NOT NULL, b smallint NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
         rendered.contains("no dominating reorder found (payload lengths unverified for inet)"),
         "{rendered}"
     );
     assert!(!rendered.contains("exists"), "{rendered}");
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let summary = github_step_summary(&analysis, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(summary.contains("complete (payload model unverified)"), "{summary}");
     let json = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -320,7 +353,7 @@ fn text_identifiers_cannot_open_workflow_commands() {
         "CREATE TABLE n (a \"t\n::error::TYPE\" NOT NULL);\n",
         "ALTER TABLE \"ghost\r::warning::G\" ADD COLUMN z int;",
     ));
-    let rendered = text(&analysis, None, true, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, true, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(command_lines(&rendered).is_empty(), "{rendered}");
     assert!(!rendered.contains('\r'), "{rendered}");
     assert!(
@@ -349,7 +382,7 @@ fn a_source_path_cannot_open_a_note_line_as_a_command() {
         }],
         &Config::default(),
     );
-    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, None));
     assert!(command_lines(&rendered).is_empty(), "{rendered}");
     assert!(
         rendered.contains(r"   \u{3a}:error::x.sql:1 [unknown-type]"),
@@ -376,7 +409,7 @@ fn escaping_leaves_ordinary_names_alone() {
 fn step_summary_cells_hold_one_line() {
     let analysis =
         analyze("CREATE TABLE \"a\r|b\" (x int NOT NULL, y bigint NOT NULL, z int NOT NULL, w bigint NOT NULL);");
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let summary = github_step_summary(&analysis, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(!summary.contains('\r'), "{summary}");
     assert!(summary.contains(r#"| "a \|b" | 8.0 |"#), "{summary}");
 }
@@ -397,7 +430,7 @@ fn suggested_ddl_keeps_hostile_table_and_type_names() {
         "CREATE TABLE \"t\n::error::T\" (a boolean NOT NULL, b \"dom\n::error::D\" NOT NULL, ",
         "c boolean NOT NULL, d bigint NOT NULL);",
     ));
-    let rendered = text(&analysis, None, true, &gate(&analysis, None));
+    let rendered = text(&analysis, None, true, Settle::Reader, &gate(&analysis, None));
     assert!(command_lines(&rendered).is_empty(), "{rendered}");
     assert!(
         rendered.contains(r#"  CREATE TABLE U&"t\000A::error::T" ("#),
@@ -412,7 +445,7 @@ fn suggested_ddl_keeps_hostile_table_and_type_names() {
 #[test]
 fn a_backslash_prints_doubled_so_it_never_reads_as_an_escape() {
     let analysis = analyze("CREATE TABLE \"lit\\n\" (a int NOT NULL); CREATE TABLE \"real\n\" (a int NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, None));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, None));
     assert!(rendered.contains(r#"✓ "lit\\n" "#), "{rendered}");
     assert!(rendered.contains(r#"✓ "real\n" "#), "{rendered}");
 }
@@ -433,7 +466,7 @@ fn a_capped_search_never_prints_a_checkmark_over_certain_padding() {
     assert_eq!(t.current.padding, 7);
     t.avoidable_bytes_per_row = 0.0;
     t.search_scope = SearchScope::SortOnly;
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.starts_with("◐ f "), "{rendered}");
     assert!(!rendered.contains("nothing to gain"), "{rendered}");
     assert!(
@@ -452,8 +485,14 @@ fn step_summary_cells_render_no_html_or_markdown_from_names() {
     ]
     .concat();
     let analysis = analyze(&sql);
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
-    let unescaped = summary.replace("\\<", "");
+    let summary = github_step_summary(&analysis, Settle::Reader, &gate(&analysis, Some(0.0)));
+    // The settling sections' own fences are the only lines that may open a code block.
+    let unescaped = summary
+        .lines()
+        .filter(|l| !matches!(*l, "```sql" | "```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("\\<", "");
     for raw in ["<img", "<a ", "<b>", "```sql", "**rowdiet"] {
         assert!(!unescaped.contains(raw), "{raw} reached the summary:\n{summary}");
     }
@@ -473,7 +512,7 @@ fn exact_tier_with_nulls_prints_both_row_scenarios() {
         "CREATE TABLE t (b1 boolean NOT NULL, b2 boolean NOT NULL, n integer, z timetz NOT NULL);
          CREATE TABLE cols9 (c1 int8,c2 int8,c3 int8,c4 int8,c5 int8,c6 int8,c7 int8,c8 int8,c9 int8);",
     );
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
         rendered.contains("current  : 2 B padding, 48 B/row footprint, 157 rows/8kB page without NULLs; 2-6 B padding, 48 B/row with NULLs (24 B header)"),
         "{rendered}"
@@ -493,7 +532,7 @@ fn exact_tier_with_nulls_prints_both_row_scenarios() {
 #[test]
 fn frontier_prints_the_rows_without_nulls() {
     let analysis = analyze("CREATE TABLE t (m macaddr, t text NOT NULL, s smallint NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("frontier : m, s, t"), "{rendered}");
     assert!(
         rendered.contains("in rows without NULLs the alternative wins (saves 0-3 B/row)"),
@@ -511,7 +550,7 @@ fn an_exact_tier_frontier_names_nulls_and_row_size() {
     // Four nullable fixed columns: the reorder saves a row-size rung when every column is
     // stored and loses one in some NULL patterns, so it is a frontier decided by NULLs alone.
     let analysis = analyze("CREATE TABLE t (c0 macaddr, c1 macaddr, c2 boolean, c3 smallint);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.contains("frontier : c0, c3, c1, c2"), "{rendered}");
     assert!(
         rendered.contains("winner in row size depends on which columns hold NULL (-8 to 8 B/row)"),
@@ -527,7 +566,7 @@ fn an_exact_tier_frontier_names_nulls_and_row_size() {
 #[test]
 fn estimate_line_shows_the_no_null_range_when_it_differs() {
     let analysis = analyze("CREATE TABLE t (s smallint NOT NULL, n smallint, i integer NOT NULL, t text NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
         rendered.contains(
             "current  : 0.0 B/row expected padding (0 B deterministic, range 0-2, 0-0 without NULLs, data-dependent)"
@@ -550,7 +589,7 @@ fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
     let mut outcome = gate(&analysis, Some(1000.0));
     assert_eq!(outcome.budgeted_tables, 1);
     assert!(!outcome.degraded(), "a budget is not a parse degradation");
-    let rendered = text(&analysis, None, false, &outcome);
+    let rendered = text(&analysis, None, false, Settle::Reader, &outcome);
     assert!(
         rendered.contains("budgeted: 1 table(s) where the dominance search hit its budget"),
         "{rendered}"
@@ -562,7 +601,7 @@ fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
     assert!(!outcome.exceeded);
     outcome.fail_on_budgeted();
     assert!(outcome.exceeded, "--fail-on-budgeted fails on a budgeted search");
-    let rendered = text(&analysis, None, false, &outcome);
+    let rendered = text(&analysis, None, false, Settle::Reader, &outcome);
     assert!(
         rendered.contains("FAIL: 1 table(s) with a budgeted dominance search (--fail-on-budgeted)"),
         "{rendered}"
@@ -580,7 +619,7 @@ fn a_budgeted_clean_table_that_can_pad_is_not_checked_off() {
     );
     let t = &analysis.tables[0];
     assert!(t.budgeted() && t.avoidable_bytes_per_row == 0.0 && t.current.padding > 0);
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(rendered.starts_with("◐ g990"), "{rendered}");
 }
 
@@ -607,7 +646,7 @@ fn json_carries_the_null_model() {
 #[test]
 fn null_variable_names_print_escaped() {
     let analysis = analyze("CREATE TABLE t (\"n\n::error::NULLVAR\" smallint, i integer NOT NULL, x text NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
         rendered.contains("NULLs move later offsets in: n\\n::error::NULLVAR"),
         "{rendered}"
@@ -644,7 +683,7 @@ fn block_lines_print_no_workflow_command() {
     base.tables
         .insert("ghost\n::warning file=y.sql,line=1::injected".to_string(), ghost);
     let outcome = baseline::evaluate(&analysis, None, false, Some(&base));
-    let rendered = text(&analysis, None, false, &outcome);
+    let rendered = text(&analysis, None, false, Settle::Reader, &outcome);
     assert!(rendered.contains("block order: f, h, x\\n::error"), "{rendered}");
     assert!(rendered.contains("ghost\\n::warning"), "{rendered}");
     let commands = rendered.lines().filter(|l| l.trim_start().starts_with("::")).count();
@@ -661,7 +700,13 @@ fn a_block_from_two_migrations_names_both() {
         ],
         &Config::default(),
     );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    let rendered = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("t", "f4i,f8d")]),
+    );
     assert!(
         rendered.contains("appended block (V2__u.sql:1, V3__w.sql:1, 2 column(s) after a committed prefix of 2)"),
         "{rendered}"
@@ -675,7 +720,13 @@ fn drop_then_add_reports_the_block_behind_the_dropped_slot() {
          ALTER TABLE t DROP COLUMN n;
          ALTER TABLE t ADD COLUMN x smallint NOT NULL, ADD COLUMN y integer NOT NULL, ADD COLUMN z boolean NOT NULL;",
     );
-    let rendered = text(&analysis, None, false, &baselined(&analysis, &[("t", "f8d,f1c,f2s")]));
+    let rendered = text(
+        &analysis,
+        None,
+        false,
+        Settle::Reader,
+        &baselined(&analysis, &[("t", "f8d,f1c,f2s")]),
+    );
     assert!(
         rendered.contains("3 column(s) after a committed prefix of 2 and 1 dropped slot(s)) is not dominance-optimal"),
         "{rendered}"
@@ -695,7 +746,7 @@ fn a_block_order_cell_renders_names_as_text() {
          ALTER TABLE t ADD COLUMN g boolean NOT NULL;
          ALTER TABLE t ADD COLUMN h bigint NOT NULL;",
     );
-    let summary = github_step_summary(&analysis, &baselined(&analysis, &[("t", "f4i,f8d")]));
+    let summary = github_step_summary(&analysis, Settle::Reader, &baselined(&analysis, &[("t", "f4i,f8d")]));
     let cell = summary
         .lines()
         .find(|l| l.contains("block not dominance-optimal"))
@@ -706,19 +757,22 @@ fn a_block_order_cell_renders_names_as_text() {
 #[test]
 fn a_frontier_prints_the_query_that_settles_it() {
     let analysis = analyze("CREATE TABLE t (t text NOT NULL, m macaddr NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
-        rendered.contains("settle it on rows like yours (pageinspect, superuser):"),
+        rendered.contains("settle it on rows like yours (any role that can read the table):"),
         "{rendered}"
     );
-    assert!(
-        rendered.contains("               WITH RECURSIVE rel AS ("),
-        "{rendered}"
-    );
+    assert!(rendered.contains("pg_catalog.query_to_xml"), "{rendered}");
     assert!(
         rendered.contains("bytes_saved totals current minus alternative"),
         "{rendered}"
     );
+    let exact = text(&analysis, None, false, Settle::Pageinspect, &gate(&analysis, Some(0.0)));
+    assert!(
+        exact.contains("settle it on rows like yours (pageinspect, superuser):"),
+        "{exact}"
+    );
+    assert!(exact.contains("heap_page_item_attrs"), "{exact}");
 }
 
 #[test]
@@ -728,17 +782,17 @@ fn a_table_name_cannot_close_the_summary_fence() {
     let analysis = analyze(
         "CREATE TABLE \"x\n```\n<img src=https://example.invalid/p.png>\" (t text NOT NULL, m macaddr NOT NULL);",
     );
-    let summary = github_step_summary(&analysis, &gate(&analysis, Some(0.0)));
+    let summary = github_step_summary(&analysis, Settle::Reader, &gate(&analysis, Some(0.0)));
     let section = &summary[summary.find("### Settling").expect("a settling section")..];
     assert!(section.contains("\\<img"), "the heading escapes the name: {section}");
     let fences: Vec<&str> = section.lines().filter(|l| l.starts_with("```")).collect();
     assert_eq!(
         fences,
-        vec!["````sql", "````"],
-        "a fence longer than the name's backticks: {section}"
+        vec!["```sql", "```"],
+        "the name's backticks reach the query only as escapes: {section}"
     );
-    let open = section.find("````sql").unwrap();
-    let close = section[open + 7..].find("\n````").unwrap() + open + 7;
+    let open = section.find("```sql").unwrap();
+    let close = section[open + 6..].find("\n```").unwrap() + open + 6;
     let outside = format!("{}{}", &section[..open], &section[close..]);
     assert!(!outside.replace("\\<", "").contains("<img"), "{outside}");
 }
@@ -747,9 +801,9 @@ fn a_table_name_cannot_close_the_summary_fence() {
 fn a_settling_query_prints_no_workflow_command() {
     let analysis =
         analyze("CREATE TABLE \"q\n::error::QUERY ##[error]BRACKET\" (t text NOT NULL, m macaddr NOT NULL);");
-    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    let rendered = text(&analysis, None, false, Settle::Reader, &gate(&analysis, Some(0.0)));
     assert!(
-        rendered.contains("c.relname = U&'q\\000A::error::QUERY ##\\005Berror]BRACKET'"),
+        rendered.contains("pg_catalog.format('%I', U&'q\\000A::error::QUERY ##\\005Berror]BRACKET')"),
         "{rendered}"
     );
     assert!(!rendered.contains("##["), "{rendered}");

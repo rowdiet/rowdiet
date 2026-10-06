@@ -160,6 +160,8 @@ impl TableReport {
 pub struct ColumnReport {
     /// Column name (display spelling).
     pub name: String,
+    /// The name PostgreSQL stores: case-folded unless the DDL quoted it.
+    pub key: String,
     /// Declared type as written.
     pub type_display: String,
     /// Declared or implied NOT NULL.
@@ -830,7 +832,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
             .columns
             .iter()
             .zip(&kinds)
-            .map(|(c, &kind)| crate::resolve::QueryColumn { attnum: c.attnum, kind })
+            .map(|(c, &kind)| crate::resolve::QueryColumn::new(&c.key, kind, &c.type_display))
             .collect();
         let written: Vec<usize> = (0..kinds.len()).collect();
         frontier.query = Some(crate::resolve::query(
@@ -856,6 +858,7 @@ pub(crate) fn build(table: FoldedTable) -> TableReport {
         .zip(&current_walk.columns)
         .map(|(c, w)| ColumnReport {
             name: c.display.clone(),
+            key: c.key.clone(),
             type_display: c.type_display.clone(),
             not_null: c.not_null,
             known_type: c.known_type,
@@ -1043,10 +1046,7 @@ pub fn block_finding(table: &TableReport, committed_slots: usize) -> Option<Bloc
         let query_columns: Vec<crate::resolve::QueryColumn> = table
             .columns
             .iter()
-            .map(|c| crate::resolve::QueryColumn {
-                attnum: c.attnum,
-                kind: c.kind,
-            })
+            .map(|c| crate::resolve::QueryColumn::new(&c.key, c.kind, &c.type_display))
             .collect();
         let current: Vec<usize> = (0..table.columns.len()).collect();
         let whole: Vec<usize> = (0..prefix_columns)

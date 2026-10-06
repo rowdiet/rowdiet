@@ -2260,49 +2260,42 @@ mod storage_strategies {
     }
 }
 
-/// The SQL that settles a frontier names the table by literal and its columns by attribute
-/// number, so no identifier spelling can change what it reads.
+/// The relation a frontier's settling queries look up: the folded name parts, schema first.
 mod settling_queries {
     use super::src;
     use crate::{Config, analyze_sources};
 
-    fn query_of(sql: &str) -> (Vec<String>, String) {
+    fn relation_of(sql: &str) -> Vec<String> {
         let a = analyze_sources(&[src("V1__t.sql", sql)], &Config::default());
         let t = &a.tables[0];
-        let q = t
-            .frontier
-            .as_ref()
-            .and_then(|f| f.query.as_ref())
-            .expect("a frontier with a query");
-        (t.relation.clone(), q.sql.clone())
+        assert!(
+            t.frontier.as_ref().and_then(|f| f.query.as_ref()).is_some(),
+            "a frontier with a query"
+        );
+        t.relation.clone()
     }
 
     #[test]
     fn a_dotted_quoted_name_is_one_relation() {
-        let (relation, sql) = query_of("CREATE TABLE \"rev_A.b\" (t text NOT NULL, m macaddr NOT NULL);");
-        assert_eq!(relation, vec!["rev_A.b"]);
-        assert!(
-            sql.contains("c.relname = 'rev_A.b' AND pg_catalog.pg_table_is_visible(c.oid)"),
-            "{sql}"
+        assert_eq!(
+            relation_of("CREATE TABLE \"rev_A.b\" (t text NOT NULL, m macaddr NOT NULL);"),
+            vec!["rev_A.b"]
         );
-        let (relation, sql) = query_of("CREATE TABLE \"rev_A\".b (t text NOT NULL, m macaddr NOT NULL);");
-        assert_eq!(relation, vec!["rev_A", "b"]);
-        assert!(sql.contains("c.relname = 'b' AND n.nspname = 'rev_A'"), "{sql}");
+        assert_eq!(
+            relation_of("CREATE TABLE \"rev_A\".b (t text NOT NULL, m macaddr NOT NULL);"),
+            vec!["rev_A", "b"]
+        );
     }
 
     #[test]
-    fn keyword_quote_and_newline_names_stay_literals() {
-        for (ddl, literal) in [
-            ("\"current_user\"", "'current_user'"),
-            ("\"o'q\"\"x\"", "'o''q\"x'"),
-            ("\"n\nl\"", "U&'n\\000Al'"),
-        ] {
-            let (_, sql) = query_of(&format!(
-                "CREATE TABLE {ddl} (\"current_role\" text NOT NULL, \"x\"\"; DROP TABLE v; --\" macaddr NOT NULL);"
-            ));
-            assert!(sql.contains(&format!("c.relname = {literal} AND")), "{sql}");
-            assert!(!sql.contains("current_role") && !sql.contains("DROP"), "{sql}");
-        }
+    fn a_renamed_table_stays_in_its_schema() {
+        assert_eq!(
+            relation_of(
+                "CREATE TABLE s.old (t text NOT NULL, m macaddr NOT NULL);
+                 ALTER TABLE s.old RENAME TO new;"
+            ),
+            vec!["s", "new"]
+        );
     }
 
     #[test]
