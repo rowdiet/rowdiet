@@ -71,6 +71,7 @@ rowdiet migrations/                          # report
 rowdiet migrations/ --fail-over 0            # CI gate: exit 1 on any avoidable byte/row (fractions allowed)
 rowdiet migrations/ --fail-over 0 --fail-on-degraded   # also fail when statements were skipped
 rowdiet migrations/ --fail-over 0 --fail-on-budgeted   # also fail when a dominance search hit its budget
+rowdiet migrations/ --settle-exact          # print the pageinspect replay under each frontier (superuser)
 rowdiet migrations/ --format github          # GitHub Actions annotations
 rowdiet migrations/ --format json | jq .     # full structured report
 rowdiet - < schema.sql                       # stdin
@@ -179,10 +180,11 @@ rowdiet therefore reports per table:
   dominance-proven worst-case waste, shown with its guaranteed-to-maximum range. When neither
   order dominates — say a text and a `float8[]` competing for the one guaranteed-aligned slot,
   where payload sizes decide the winner — the table shows a **frontier** instead: both orders,
-  both worst cases, and the storage-form band each one wins, plus a query that settles it: run
-  on a copy of your data (it needs `pageinspect` and superuser), it reads every stored row off
-  its page, lays the same values out in the other order, and counts the rows each order stores
-  smaller and the bytes the switch saves. Frontiers never gate. Expected
+  both worst cases, and the storage-form band each one wins, plus a query that settles it: any
+  role that can read the table runs it, it sizes every stored value with `pg_column_size` and
+  friends, lays each row out in both orders, and counts the rows each order stores smaller and
+  the bytes the switch saves (`--settle-exact` prints a pageinspect replay of the stored bytes
+  instead, for a superuser). Frontiers never gate. Expected
   values and ranges are still shown for orientation: the min/max bounds hold for every storage
   form; the expectation is a display-only figure under a stated model (varlena pads scored at
   the short/TOAST form, which stores unaligned; offset residues taken uniform) and decides

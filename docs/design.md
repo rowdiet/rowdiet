@@ -330,22 +330,56 @@ row was written under PLAIN. pg-exact reads `STORAGE` on column definitions and 
 table makes no claim. The layout signature keeps the declared kinds, so a strategy change
 expires no baseline entry.
 
-**The settling query.** A frontier's winner turns on payload lengths, storage forms and NULLs,
-and all of them are on the heap page. Every frontier carries one read-only `SELECT` (`query.sql`
-in the JSON, printed under the frontier in the text, in a fenced block in the step summary)
-that reads each stored row with pageinspect (`heap_page_item_attrs`), replays the written order
-from the attributes (checking the replay against the tuple's own length), lays the same
-attributes out in the alternative order the way `heap_fill_tuple` places them (a 1-byte header
-or a TOAST pointer unaligned, a 4-byte header and every fixed-width value aligned, a NULL
-nowhere), and returns the rows each order stores smaller and the bytes the switch saves, in
-padding at the estimate tier and in row size at the exact tier. Every row is decided, whatever
-band it sits in, which earlier band-by-band counts could not do for a quarter of frontiers. The
-statement names the table by a string literal (`U&'...'` with escapes when the name holds a
-backslash or a line break) looked up in `pg_class`, and every column by its attribute number,
-so no identifier spelling can make it read anything else. It needs the pageinspect extension
-and superuser, reads every page, and counts dead row versions until VACUUM. The harness runs
-every printed query on its workloads and holds the answer to the paired measurement: the same
-rows, no replay mismatch, the same bytes saved.
+**The settling queries.** A frontier's winner turns on payload lengths, storage forms and
+NULLs the DDL does not carry. Every frontier carries two read-only `SELECT`s (`query.reader` and
+`query.pageinspect` in the JSON; the text and the step summary print the reader query, or the
+pageinspect one under `--settle-exact`). Both lay every row out in both orders the way
+`heap_fill_tuple` places values (a 1-byte header or a TOAST pointer unaligned, a 4-byte header
+and every fixed-width value aligned, a NULL nowhere) and return the rows each order stores
+smaller and the bytes the switch saves, in padding at the estimate tier and in row size at the
+exact tier. Each walk is one nested expression per order over per-row values computed once
+(`LATERAL ... OFFSET 0`), so both queries are linear in rows and write no temp files.
+
+The reader query runs as any role that can read the table, managed PostgreSQL included. It
+takes each value's form from `pg_column_size`, `pg_column_compression` and, for the text and
+bytea families, `octet_length`, none of which detoast, and counts the form a rewrite in either
+order would store. A form it cannot know is a guess counted in `approximate_rows`: a compressed
+or long non-text value in a row over the TOAST threshold (in line or out of line), or a short
+non-text value in a `PLAIN` column (either header). The per-row SQL is built by `format` over
+the column names the catalog confirmed and run through `query_to_xml`, so a missing table or
+column answers "cannot settle" with the reason instead of an error. The pageinspect query reads
+every row version off the page (`heap_page_item_attrs`, superuser), replays its stored bytes
+exactly, and checks the written-order replay against the tuple's own length.
+
+Neither answers silently wrong. Both look the table up by the schema the DDL names (or the
+search path when it names none) and the columns by name, so an attached partition or a `LIKE`
+copy with its own attribute numbers reads right. A table or a column the database does not have
+yet (a block whose migration has not run) gives a "cannot settle" row with the reason and no
+counts. A partitioned parent reads every partition (the pageinspect query every leaf); an
+inheritance parent reads its own rows and the note names the children left out. A column with a
+fast default is counted as a rewrite stores it by the reader query and noted; the pageinspect
+query skips the row versions written before it (`t_infomask2` holds fewer attributes) and counts
+them in `skipped_rows`. Rows that still hold a dropped column's value, and partitions in another
+column order, are left out of the replay check only. The pageinspect query counts dead row
+versions until pruning or VACUUM removes them. Names reach either query only as string literals
+(`U&'...'` escapes for a backslash, a line break, `##[`, and the characters markdown or HTML
+would read). The harness runs both printed queries on every frontier workload and holds them to
+the paired measurement (the same rows, winners and bytes saved, nothing approximate, mismatched
+or skipped), and runs both on a table outside the search path, hostile names, an absent table
+and column, a fast default before and after a rewrite, dropped-column rows, dead versions, a
+partitioned parent with an attached partition in its own order, and an inheritance parent.
+
+Measured on PostgreSQL 16 (`(m macaddr, t text NOT NULL, s smallint NOT NULL)`, texts of 0 to
+200 B, one row in ten NULL; seconds include the client):
+
+| rows | table | reader | pageinspect, JIT on | pageinspect, JIT off | temp files |
+|---|---|---|---|---|---|
+| 10,000 | 1.4 MB | 0.07 s | 0.54 s | 0.09 s | 0 |
+| 100,000 | 14 MB | 0.16 s | 0.73 s | 0.28 s | 0 |
+| 1,000,000 | 136 MB | 1.1 s | 2.5 s | 2.2 s | 0 |
+
+The pageinspect query's fixed 0.4 s under JIT is compilation; both queries agree on every
+count at every size.
 
 ## Suggested order
 
