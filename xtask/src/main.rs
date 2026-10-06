@@ -1816,8 +1816,14 @@ fn settling_queries(binary: &std::path::Path, relation: &str) -> (String, String
 }
 
 fn settling_queries_named(binary: &std::path::Path, relation: &str, [n, a, m]: [&str; 3]) -> (String, String) {
-    let ddl = format!("CREATE TABLE {relation} ({n} int4 NOT NULL, {a} text NOT NULL, {m} macaddr NOT NULL);");
-    let value = analyze(binary, &ddl, &[]);
+    settling_queries_for(
+        binary,
+        &format!("CREATE TABLE {relation} ({n} int4 NOT NULL, {a} text NOT NULL, {m} macaddr NOT NULL);"),
+    )
+}
+
+fn settling_queries_for(binary: &std::path::Path, ddl: &str) -> (String, String) {
+    let value = analyze(binary, ddl, &[]);
     let query = &value["analysis"]["tables"][0]["frontier"]["query"];
     let sql = |variant: &str| query[variant]["sql"].as_str().expect("a settling query").to_string();
     (sql("reader"), sql("pageinspect"))
@@ -1877,24 +1883,19 @@ fn run_settling_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<Str
     let (reader, exact) = settling_queries(binary, &base);
     check("plain", "reader", &reader, expect(1, 1000), &[Some(0)], "");
     check("plain", "pageinspect", &exact, expect(1, 1000), &[Some(0), Some(0)], "");
-    // A schema outside the search path, found by the schema the DDL names.
+    // A schema outside the search path, found by the schema the DDL names: its table has a name
+    // and rows no table in the search path has.
     let schema = format!("{p}schema");
+    let elsewhere = format!("{schema}.{p}settle_elsewhere");
     pg.query(&format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE;\nCREATE SCHEMA {schema};\n\
-         CREATE TABLE {schema}.{base} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL);\n{}",
-        fill(&format!("{schema}.{base}"), 1, 1000)
+         CREATE TABLE {elsewhere} (n int4 NOT NULL, a text NOT NULL, m macaddr NOT NULL);\n{}",
+        fill(&elsewhere, 1, 700)
     ))
     .expect("schema table");
-    let (reader, exact) = settling_queries(binary, &format!("{schema}.{base}"));
-    check("schema", "reader", &reader, expect(1, 1000), &[Some(0)], "");
-    check(
-        "schema",
-        "pageinspect",
-        &exact,
-        expect(1, 1000),
-        &[Some(0), Some(0)],
-        "",
-    );
+    let (reader, exact) = settling_queries(binary, &elsewhere);
+    check("schema", "reader", &reader, expect(1, 700), &[Some(0)], "");
+    check("schema", "pageinspect", &exact, expect(1, 700), &[Some(0), Some(0)], "");
     pg.query(&format!("DROP SCHEMA {schema} CASCADE;"))
         .expect("drop schema");
     // Names that are keywords or hold quotes reach the queries as literals only.
@@ -1919,22 +1920,9 @@ fn run_settling_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<Str
     pg.query(&format!("DROP TABLE {hostile};")).expect("drop hostile");
     // A table, then a column, the database does not have yet.
     let (reader, exact) = settling_queries(binary, &format!("{p}settle_absent"));
-    check(
-        "absent table",
-        "reader",
-        &reader,
-        none,
-        &[None],
-        "cannot settle: no relation",
-    );
-    check(
-        "absent table",
-        "pageinspect",
-        &exact,
-        none,
-        &[None, Some(0)],
-        "cannot settle: no relation",
-    );
+    let absent = format!("cannot settle: no relation {p}settle_absent on the search path (");
+    check("absent table", "reader", &reader, none, &[None], &absent);
+    check("absent table", "pageinspect", &exact, none, &[None, Some(0)], &absent);
     let t = format!("{p}settle_t");
     pg.query(&format!(
         "DROP TABLE IF EXISTS {t} CASCADE;\nCREATE TABLE {t} (n int4 NOT NULL, a text NOT NULL);\n\
@@ -2050,4 +2038,138 @@ fn run_settling_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<Str
     pg.query(&format!("DROP TABLE {t} CASCADE;\nDROP TABLE {base}, {base}_alt;"))
         .expect("settling cleanup");
     failures.extend(problems);
+    run_toast_settling_checks(pg, binary, failures);
+}
+
+/// What copies of `table` in the written and in the frontier order measure on the page once
+/// `VACUUM FULL` has rewritten them, paired by the unique `key` column: rows, rows each copy
+/// stores smaller and bytes saved over the rows both store alike, then the rows the toaster
+/// stored differently (`column`'s header differs). An INSERT in the same column order copies
+/// tuples as they are, so only the rewrite shortens a 4-byte header.
+fn copies_expectation(pg: &Pg, table: &str, written: &str, frontier: &str, column: &str, key: &str) -> (Settled, i64) {
+    let rows = |copy: &str| {
+        format!(
+            "SELECT t.{key} AS k, h.lp_len - h.t_hoff AS len, \
+                    CASE WHEN v IS NULL THEN 'n' WHEN get_byte(v, 0) = 1 THEN 'e' WHEN get_byte(v, 0) & 1 = 1 THEN 's' \
+                         WHEN get_byte(v, 0) & 3 = 2 THEN 'c' ELSE 'l' END AS form \
+             FROM generate_series(0, pg_relation_size('{copy}') / 8192 - 1) p, \
+                  heap_page_item_attrs(get_raw_page('{copy}', p::int), '{copy}') h, \
+                  LATERAL (SELECT h.t_attrs[(SELECT attnum FROM pg_attribute \
+                                             WHERE attrelid = '{copy}'::regclass AND attname = '{column}')] AS v) x, \
+                  {copy} t \
+             WHERE h.lp_flags = 1 AND t.ctid = format('(%s,%s)', p, h.lp)::tid"
+        )
+    };
+    let out = pg
+        .query(&format!(
+            "DROP TABLE IF EXISTS {table}_c, {table}_a;\n\
+             CREATE TABLE {table}_c AS SELECT {written} FROM {table} WHERE false;\n\
+             INSERT INTO {table}_c SELECT {written} FROM {table};\n\
+             CREATE TABLE {table}_a AS SELECT {frontier} FROM {table} WHERE false;\n\
+             INSERT INTO {table}_a SELECT {frontier} FROM {table};\n\
+             VACUUM FULL {table}_c;\nVACUUM FULL {table}_a;\n\
+             WITH c AS ({}), a AS ({}), j AS (SELECT c.len AS cl, a.len AS al, c.form = a.form AS same FROM c JOIN a USING (k)) \
+             SELECT count(*), count(*) FILTER (WHERE same AND al < cl), count(*) FILTER (WHERE same AND al > cl), \
+                    coalesce(sum(cl - al) FILTER (WHERE same), 0), count(*) FILTER (WHERE NOT same) FROM j;\n\
+             DROP TABLE {table}_c, {table}_a;",
+            rows(&format!("{table}_c")),
+            rows(&format!("{table}_a"))
+        ))
+        .expect("copies");
+    let line = out.lines().find(|l| l.contains('|')).expect("copies row");
+    let f: Vec<i64> = line.split('|').map(|v| v.parse().expect("count")).collect();
+    ([Some(f[0]), Some(f[1]), Some(f[2]), Some(f[3])], f[4])
+}
+
+/// The reader query's out-of-line call for non-text values and its threshold-crossing count, on
+/// jsonb in every storage form: the review's five-form mix with values just past the TOAST
+/// threshold, values on both sides of the 127-byte short limit, and rows the frontier order would
+/// push over the threshold.
+fn run_toast_settling_checks(pg: &Pg, binary: &std::path::Path, failures: &mut Vec<String>) {
+    let t = format!("{}settle_toast", prefix());
+    let (reader, exact) = settling_queries_for(
+        binary,
+        &format!("CREATE TABLE {t} (m macaddr, j jsonb NOT NULL, s smallint NOT NULL);"),
+    );
+    let jsonb = "CASE g % 6 WHEN 0 THEN jsonb_build_object('k', left(md5(g::text), g % 30)) \
+          WHEN 1 THEN jsonb_build_object('k', (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 5 + g % 40) i)) \
+          WHEN 2 THEN jsonb_build_object('k', repeat('ab' || (g % 9)::text, 900 + g % 13)) \
+          WHEN 3 THEN jsonb_build_object('k', (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 120 + g % 7) i)) \
+          WHEN 4 THEN jsonb_build_object('k', (SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 58 + g % 6) i)) \
+          ELSE jsonb_build_object('k', repeat('zz' || (g % 5)::text, 40000 + g)) END";
+    // Rows written while the column was PLAIN keep a 4-byte header a rewrite now shortens.
+    let plain_rows: String = (1..=300)
+        .map(|g| {
+            let m = if g % 3 == 0 { "\\N" } else { "08:00:2b:01:02:03" };
+            format!("{m}\t{{\"k\": \"{}\"}}\t{g}\n", "y".repeat(g % 40))
+        })
+        .collect();
+    let workloads = [
+        (
+            "plain era",
+            format!(
+                "ALTER TABLE {t} ALTER COLUMN j SET STORAGE PLAIN;\nCOPY {t} FROM STDIN;\n{plain_rows}\\.\n\
+                 ALTER TABLE {t} ALTER COLUMN j SET STORAGE EXTENDED;"
+            ),
+        ),
+        (
+            "forms",
+            format!(
+                "INSERT INTO {t} SELECT CASE WHEN g % 3 = 0 THEN NULL ELSE '08:00:2b:01:02:03'::macaddr END, {jsonb}, \
+                 g FROM generate_series(1, 1200) g;\n\
+                 INSERT INTO {t} SELECT '08:00:2b:01:02:03', jsonb_build_object('k', repeat('y', 105 + g % 16)), 2000 + g \
+                 FROM generate_series(1, 320) g;"
+            ),
+        ),
+        (
+            "update",
+            // Written with m, so j went out of line; an UPDATE that clears m keeps the pointer, and
+            // a rewrite brings j back in line where the row then fits in both orders.
+            format!(
+                "INSERT INTO {t} SELECT '08:00:2b:01:02:03', jsonb_build_object('k', \
+                 left((SELECT string_agg(md5(g::text || i::text), '') FROM generate_series(1, 70) i), 1970 + g % 30)), g \
+                 FROM generate_series(1, 300) g;\n\
+                 UPDATE {t} SET m = NULL WHERE s % 2 = 0;"
+            ),
+        ),
+        (
+            "threshold",
+            format!(
+                "INSERT INTO {t} SELECT CASE WHEN g % 2 = 0 THEN NULL ELSE '08:00:2b:01:02:03'::macaddr END, \
+                 jsonb_build_object('k', repeat('x', 1960 + g % 60)), g FROM generate_series(1, 480) g;"
+            ),
+        ),
+    ];
+    for (workload, insert) in workloads {
+        pg.query(&format!(
+            "DROP TABLE IF EXISTS {t};\nCREATE TABLE {t} (m macaddr, j jsonb NOT NULL, s smallint NOT NULL);\n{insert}"
+        ))
+        .expect("toast workload");
+        let (want, differently) = copies_expectation(pg, &t, "m, j, s", "m, s, j", "j", "s");
+        let (counts, flags, note) = run_settling(pg, &reader);
+        let (exact_counts, exact_flags, _) = run_settling(pg, &exact);
+        println!(
+            "| settle toast {workload} | reader | - | {counts:?} approximate {flags:?} | copies {want:?}, {differently} stored differently; pageinspect {exact_counts:?} {exact_flags:?} | {note} |"
+        );
+        let approximate = flags[0].unwrap_or(-1);
+        // The pageinspect query replays the stored forms (and dead versions), which a rewrite
+        // changes after a PLAIN era or an UPDATE.
+        let exact_agrees = differently > 0 || matches!(workload, "plain era" | "update") || exact_counts == want;
+        let crossing = if matches!(workload, "threshold" | "update") {
+            differently > 0
+        } else {
+            differently == 0
+        };
+        if counts != want
+            || approximate != differently
+            || !exact_agrees
+            || !crossing
+            || exact_flags != [Some(0), Some(0)]
+        {
+            failures.push(format!(
+                "settle toast {workload}: reader {counts:?} approximate {approximate}, pageinspect {exact_counts:?} {exact_flags:?}; copies {want:?} with {differently} stored differently"
+            ));
+        }
+    }
+    pg.query(&format!("DROP TABLE {t};")).expect("toast cleanup");
 }
