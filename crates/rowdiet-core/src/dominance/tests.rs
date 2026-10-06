@@ -1,5 +1,5 @@
 use super::*;
-use crate::layout::{Align, Payload};
+use crate::layout::{Align, Payload, Start};
 
 fn fixed(len: u64, align: Align) -> Column {
     Column::not_null(ColumnKind::Fixed { len, align })
@@ -38,12 +38,12 @@ fn nullable(column: Column) -> Column {
 
 /// Padding bounds over every realization, NULLs included.
 fn cmp(columns: &[Column], a: &[usize], b: &[usize]) -> Option<DiffBounds> {
-    compare(columns, a, b, Nulls::Vary, Measure::Padding)
+    compare(Start::TABLE, columns, a, b, Nulls::Vary, Measure::Padding)
 }
 
 /// The joint walk alone, when it applies to the pair.
 fn via_joint_walk(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> Option<DiffBounds> {
-    let pair = Pair::new(columns, a, b, Nulls::Vary, measure);
+    let pair = Pair::new(Start::TABLE, columns, a, b, Nulls::Vary, measure);
     let va = varlena_sequence(columns, a);
     if va != varlena_sequence(columns, b) {
         return None;
@@ -54,7 +54,7 @@ fn via_joint_walk(columns: &[Column], a: &[usize], b: &[usize], measure: Measure
 
 /// The enumeration alone.
 fn via_enumeration(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> DiffBounds {
-    let pair = Pair::new(columns, a, b, Nulls::Vary, measure);
+    let pair = Pair::new(Start::TABLE, columns, a, b, Nulls::Vary, measure);
     pair.enumerate(&varlena_sequence(columns, a), None)
 }
 
@@ -186,7 +186,7 @@ fn band_pair_is_incomparable_with_form_bands() {
     let diff = cmp(&kinds, &text_first, &array_first).unwrap();
     assert!(!diff.b_dominates(), "{diff:?}");
     assert!(!diff.a_dominates(), "{diff:?}");
-    let bands = bands(&kinds, &text_first, &array_first, Measure::Padding).unwrap();
+    let bands = bands(Start::TABLE, &kinds, &text_first, &array_first, Measure::Padding).unwrap();
     assert_eq!(bands.len(), 4);
     let by_combo = |long: &[usize]| bands.iter().find(|b| b.long_form == long).unwrap().diff;
     assert!(by_combo(&[]).equal(), "all short: both orders pad zero");
@@ -205,7 +205,7 @@ fn band_pair_is_incomparable_with_form_bands() {
 #[test]
 fn proven_short_columns_stay_short_in_every_band() {
     let kinds = [fixed(8, Align::Double), short(), varlena(Align::Int)];
-    let bands = bands(&kinds, &[0, 1, 2], &[0, 2, 1], Measure::Padding).unwrap();
+    let bands = bands(Start::TABLE, &kinds, &[0, 1, 2], &[0, 2, 1], Measure::Padding).unwrap();
     assert_eq!(bands.len(), 2, "only the long-capable text splits bands");
     assert!(bands.iter().all(|b| !b.long_form.contains(&1)));
 }
@@ -354,24 +354,16 @@ mod independent_oracle {
         out
     }
 
-    fn oracle_bounds(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> DiffBounds {
+    /// Call `f` with every realization of `columns`, one value per column.
+    fn each_realization(columns: &[Column], mut f: impl FnMut(&[Value])) {
         let domains: Vec<Vec<Value>> = columns.iter().map(|&c| values(c)).collect();
-        let mut bounds: Option<DiffBounds> = None;
         let mut current = vec![Value::Present; columns.len()];
         let mut index = vec![0usize; columns.len()];
         loop {
             for (c, domain) in domains.iter().enumerate() {
                 current[c] = domain[index[c]];
             }
-            let size = |order: &[usize]| {
-                let (padding, end) = oracle_walk(columns, order, &current);
-                match measure {
-                    Measure::Padding => padding as i64,
-                    Measure::RowSize => end.div_ceil(8) as i64 * 8,
-                }
-            };
-            let d = size(a) - size(b);
-            merge_into(&mut bounds, DiffBounds { min: d, max: d });
+            f(&current);
             let mut k = 0;
             while k < index.len() {
                 index[k] += 1;
@@ -385,7 +377,90 @@ mod independent_oracle {
                 break;
             }
         }
+    }
+
+    fn oracle_bounds(columns: &[Column], a: &[usize], b: &[usize], measure: Measure) -> DiffBounds {
+        let mut bounds: Option<DiffBounds> = None;
+        each_realization(columns, |current| {
+            let size = |order: &[usize]| {
+                let (padding, end) = oracle_walk(columns, order, current);
+                match measure {
+                    Measure::Padding => padding as i64,
+                    Measure::RowSize => end.div_ceil(8) as i64 * 8,
+                }
+            };
+            let d = size(a) - size(b);
+            merge_into(&mut bounds, DiffBounds { min: d, max: d });
+        });
         bounds.expect("at least one realization")
+    }
+
+    /// Bounds of what `order` of a block costs behind `prefix`: its own padding, or the bytes its
+    /// rows spend over the same rows with the block unpadded.
+    fn oracle_block_cost(prefix: &[Column], block: &[Column], order: &[usize], measure: Measure) -> (u64, u64) {
+        let whole: Vec<Column> = prefix.iter().chain(block).copied().collect();
+        let head: Vec<usize> = (0..prefix.len()).collect();
+        let lifted: Vec<usize> = head
+            .iter()
+            .copied()
+            .chain(order.iter().map(|&i| prefix.len() + i))
+            .collect();
+        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        each_realization(&whole, |current| {
+            let (prefix_padding, _) = oracle_walk(&whole, &head, current);
+            let (padding, end) = oracle_walk(&whole, &lifted, current);
+            let block_padding = padding - prefix_padding;
+            let cost = match measure {
+                Measure::Padding => block_padding,
+                Measure::RowSize => end.div_ceil(8) * 8 - (end - block_padding).div_ceil(8) * 8,
+            };
+            lo = lo.min(cost);
+            hi = hi.max(cost);
+        });
+        (lo, hi)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn block_summaries_match_the_independent_oracle(
+            prefix in columns(0..=3),
+            block in columns(1..=3),
+            row_size in any::<bool>(),
+        ) {
+            let varlenas = prefix.iter().chain(&block).filter(|c| !c.kind.is_fixed()).count();
+            prop_assume!(varlenas <= 3);
+            prop_assume!(!row_size || varlenas == 0);
+            let measure = if row_size { Measure::RowSize } else { Measure::Padding };
+            let order: Vec<usize> = (0..block.len()).rev().collect();
+            let got = summary(Start::after(&prefix), &block, &order, Nulls::Vary, measure);
+            let want = oracle_block_cost(&prefix, &block, &order, measure);
+            prop_assert_eq!((got.min, got.max), want, "{:?} after {:?} {:?}", block, prefix, measure);
+        }
+
+        #[test]
+        fn a_block_compares_like_the_whole_table(
+            prefix in columns(0..=3),
+            block in columns(1..=4),
+            rotation in 0usize..24,
+            row_size in any::<bool>(),
+        ) {
+            let varlenas = prefix.iter().chain(&block).filter(|c| !c.kind.is_fixed()).count();
+            prop_assume!(varlenas <= 3);
+            let n = block.len();
+            let a: Vec<usize> = (0..n).collect();
+            let b: Vec<usize> = (0..n).map(|i| (i + rotation) % n).collect();
+            let whole: Vec<Column> = prefix.iter().chain(&block).copied().collect();
+            let lift = |order: &[usize]| -> Vec<usize> {
+                (0..prefix.len()).chain(order.iter().map(|&i| prefix.len() + i)).collect()
+            };
+            let measure = if row_size { Measure::RowSize } else { Measure::Padding };
+            for nulls in [Nulls::Vary, Nulls::Stored] {
+                let scoped = compare(Start::after(&prefix), &block, &a, &b, nulls, measure);
+                let full = compare(Start::TABLE, &whole, &lift(&a), &lift(&b), nulls, measure);
+                prop_assert_eq!(scoped, full, "{:?} after {:?} b {:?} {:?}", block, prefix, b, nulls);
+            }
+        }
     }
 
     proptest! {
@@ -402,7 +477,7 @@ mod independent_oracle {
             let a: Vec<usize> = (0..n).collect();
             let b: Vec<usize> = (0..n).map(|i| (i + 1 + rotation % n.max(1)) % n).collect();
             let measure = if row_size { Measure::RowSize } else { Measure::Padding };
-            let engine = compare(&cols, &a, &b, Nulls::Vary, measure).expect("within budget");
+            let engine = compare(Start::TABLE, &cols, &a, &b, Nulls::Vary, measure).expect("within budget");
             let oracle = oracle_bounds(&cols, &a, &b, measure);
             prop_assert_eq!(engine, oracle, "{:?} b {:?} {:?}", cols, b, measure);
         }
@@ -422,7 +497,15 @@ fn a_nullable_filler_is_no_longer_a_proven_fix() {
     let with_nulls = cmp(&columns, &[0, 1, 2], &[2, 0, 1]).unwrap();
     assert!(!with_nulls.b_dominates() && !with_nulls.a_dominates(), "{with_nulls:?}");
     assert_eq!((with_nulls.min, with_nulls.max), (-2, 2));
-    let stored = compare(&columns, &[0, 1, 2], &[2, 0, 1], Nulls::Stored, Measure::Padding).unwrap();
+    let stored = compare(
+        Start::TABLE,
+        &columns,
+        &[0, 1, 2],
+        &[2, 0, 1],
+        Nulls::Stored,
+        Measure::Padding,
+    )
+    .unwrap();
     assert!(stored.b_dominates(), "{stored:?}");
     // The regular desc-aligned order pads zero under every NULL pattern and dominates both.
     let sorted = cmp(&columns, &[0, 1, 2], &[1, 0, 2]).unwrap();
@@ -442,7 +525,7 @@ fn null_bits_cross_varlenas_in_the_joint_walk() {
     ];
     let a = [0usize, 1, 2, 3, 4];
     let b = [2usize, 1, 4, 0, 3];
-    let pair = Pair::new(&columns, &a, &b, Nulls::Vary, Measure::Padding);
+    let pair = Pair::new(Start::TABLE, &columns, &a, &b, Nulls::Vary, Measure::Padding);
     let schedule = Schedule::build(&pair, &varlena_sequence(&columns, &a));
     assert!(schedule.slots >= 1, "a NULL bit must be in flight");
     let walked = via_joint_walk(&columns, &a, &b, Measure::Padding).unwrap();
@@ -492,10 +575,10 @@ fn row_size_decides_where_padding_does_not() {
     let b = [0usize, 2, 1];
     let padding = cmp(&columns, &a, &b).unwrap();
     assert!(!padding.b_dominates() && !padding.a_dominates(), "{padding:?}");
-    let rows = compare(&columns, &a, &b, Nulls::Vary, Measure::RowSize).unwrap();
+    let rows = compare(Start::TABLE, &columns, &a, &b, Nulls::Vary, Measure::RowSize).unwrap();
     assert!(rows.b_dominates(), "{rows:?}");
     assert_eq!((rows.min, rows.max), (0, 8));
-    let stored = compare(&columns, &a, &b, Nulls::Stored, Measure::RowSize).unwrap();
+    let stored = compare(Start::TABLE, &columns, &a, &b, Nulls::Stored, Measure::RowSize).unwrap();
     assert!(stored.equal(), "rows without NULLs tie: {stored:?}");
 }
 
@@ -515,13 +598,13 @@ fn an_order_that_never_pads_costs_nothing_in_either_measure() {
     let mut sorted = written.clone();
     sorted.sort_by_key(|&i| std::cmp::Reverse(columns[i].kind.align()));
     for measure in [Measure::Padding, Measure::RowSize] {
-        let cost = summary(&columns, &sorted, Nulls::Vary, measure);
+        let cost = summary(Start::TABLE, &columns, &sorted, Nulls::Vary, measure);
         assert_eq!((cost.min, cost.max), (0, 0), "{measure:?}");
-        let current = summary(&columns, &written, Nulls::Vary, measure);
+        let current = summary(Start::TABLE, &columns, &written, Nulls::Vary, measure);
         assert!(current.max > 0, "{measure:?}: {current:?}");
     }
     assert_eq!(
-        compare(&columns, &written, &sorted, Nulls::Vary, Measure::RowSize),
+        compare(Start::TABLE, &columns, &written, &sorted, Nulls::Vary, Measure::RowSize),
         None
     );
 }
@@ -657,8 +740,8 @@ mod summaries {
             })
         ) {
             let order: Vec<usize> = (0..cols.len()).collect();
-            let got = summary(&cols, &order, Nulls::Vary, Measure::Padding);
-            let stored = summary(&cols, &order, Nulls::Stored, Measure::Padding);
+            let got = summary(Start::TABLE, &cols, &order, Nulls::Vary, Measure::Padding);
+            let stored = summary(Start::TABLE, &cols, &order, Nulls::Stored, Measure::Padding);
             let ((lo, hi, mean), (stored_lo, stored_hi)) = brute(&cols, &order);
             prop_assert_eq!((got.min, got.max, got.short_mean_eighths), (lo, hi, mean), "{:?}", cols);
             prop_assert_eq!((stored.min, stored.max), (stored_lo, stored_hi), "{:?}", cols);
@@ -682,7 +765,7 @@ mod summaries {
             cols in columns(1..=7).prop_map(|cols| cols.into_iter().filter(|c| c.kind.is_fixed()).collect::<Vec<_>>())
         ) {
             let order: Vec<usize> = (0..cols.len()).collect();
-            let got = summary(&cols, &order, Nulls::Vary, Measure::RowSize);
+            let got = summary(Start::TABLE, &cols, &order, Nulls::Vary, Measure::RowSize);
             let (mut lo, mut hi) = (u64::MAX, 0u64);
             let mut stored_cost = 0;
             for pattern in 0u32..(1 << cols.len()) {

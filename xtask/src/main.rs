@@ -641,6 +641,9 @@ fn measure() {
     for fixture in fixtures() {
         run_fixture(&pg, &binary, &fixture, &mut failures);
     }
+    for fixture in block_fixtures() {
+        run_block_fixture(&pg, &binary, &fixture, &mut failures);
+    }
     run_report_only_checks(&binary, &mut failures);
     let pattern = format!("{}%", prefix().replace('_', "\\_"));
     pg.query(&format!(
@@ -654,6 +657,7 @@ fn measure() {
         .expect("count");
     assert_eq!(remaining.trim(), "0", "{} tables must all be dropped", prefix());
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rowdiet-xtask-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rowdiet-xtask-{}-blocks", std::process::id())));
     if failures.is_empty() {
         println!("\nmeasure: all model claims hold against real tuples");
     } else {
@@ -1253,15 +1257,21 @@ fn insert_sql(
 /// of another order, and its stored sizes (`forms`, same order, -1 for NULL) to tell whether the
 /// toaster stored it the same way there.
 fn row_pads_sql(table: &str, columns: &[Col<'_>]) -> String {
-    let mut by_name: Vec<(usize, &str)> = columns.iter().enumerate().map(|(i, (n, _, _))| (i, *n)).collect();
-    by_name.sort_by_key(|(_, n)| *n);
+    let mut by_name: Vec<&str> = columns.iter().map(|(n, _, _)| *n).collect();
+    by_name.sort_unstable();
     let key: Vec<String> = by_name
         .iter()
-        .map(|(_, n)| format!("coalesce(t.{n}::text, '\\N')"))
+        .map(|n| format!("coalesce(t.{n}::text, '\\N')"))
         .collect();
+    // Attribute numbers come from the catalog, which counts dropped columns.
     let forms: Vec<String> = by_name
         .iter()
-        .map(|(i, _)| format!("coalesce(length(h.t_attrs[{}]), -1)", i + 1))
+        .map(|n| {
+            format!(
+                "coalesce(length(h.t_attrs[(SELECT attnum FROM pg_attribute \
+                 WHERE attrelid = '{table}'::regclass AND attname = '{n}')]), -1)"
+            )
+        })
         .collect();
     format!(
         "SELECT k.key, row_number() OVER (PARTITION BY k.key ORDER BY h.p, h.lp) AS dup, \
@@ -1339,6 +1349,244 @@ fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Pa
         size_saving_min: f[11].parse().expect("size saving min"),
         size_saving_max: f[12].parse().expect("size saving max"),
         stored_differently: f[13].parse().expect("differing rows"),
+    }
+}
+
+/// A committed prefix, columns a later migration drops, and the block it then appends.
+struct BlockFixture {
+    name: &'static str,
+    prefix: Vec<Column>,
+    dropped: Vec<Column>,
+    block: Vec<Column>,
+}
+
+fn block_fixtures() -> Vec<BlockFixture> {
+    // The two false negatives the #11 reviews measured, as a committed prefix plus a block.
+    let mut wide = numbered("w", 21, "bigint");
+    wide.push(col("t1", "timetz"));
+    let mut cliff_prefix = numbered("b", 4, "bigint");
+    cliff_prefix.extend(numbered("i", 4, "int4_alias_integer"));
+    let mut cliff_block = Vec::new();
+    for (stem, ty) in [("tz", "timetz"), ("m", "macaddr"), ("s", "smallint"), ("f", "boolean")] {
+        cliff_block.extend(numbered(stem, 4, ty));
+    }
+    cliff_block.push(col("note", "text"));
+    vec![
+        BlockFixture {
+            name: "blkwide25",
+            prefix: wide,
+            dropped: Vec::new(),
+            block: vec![col("t2", "timetz"), col("s", "smallint"), col("note", "text")],
+        },
+        BlockFixture {
+            name: "blkcliff25",
+            prefix: cliff_prefix,
+            dropped: Vec::new(),
+            block: cliff_block,
+        },
+        // A nullable prefix column leaves the block two possible start residues.
+        BlockFixture {
+            name: "blknull",
+            prefix: vec![col("id", "bigint"), ncol("flag", "boolean")],
+            dropped: Vec::new(),
+            block: vec![col("s", "smallint"), col("x", "bigint"), col("i", "int4_alias_integer")],
+        },
+        // The stack review's drop-then-add: n is dropped, its slot stays, and (x, y, z) is the
+        // block behind it.
+        BlockFixture {
+            name: "blkdrop",
+            prefix: vec![col("id", "bigint"), col("flag", "boolean")],
+            dropped: vec![col("n", "smallint")],
+            block: vec![
+                col("x", "smallint"),
+                col("y", "int4_alias_integer"),
+                col("z", "boolean"),
+            ],
+        },
+    ]
+}
+
+/// Run the tool over migration files written in order.
+fn run_files(binary: &std::path::Path, files: &[(&str, String)], extra_args: &[&str]) -> std::process::Output {
+    let dir = std::env::temp_dir().join(format!("rowdiet-xtask-{}-blocks", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    for (name, sql) in files {
+        std::fs::write(dir.join(name), sql).expect("write migration");
+    }
+    Command::new(binary)
+        .arg(&dir)
+        .args(extra_args)
+        .output()
+        .expect("run rowdiet")
+}
+
+/// The migration after the committed one: drop the dropped columns, then append `block`.
+fn append_sql(table: &str, dropped: &[Col<'_>], block: &[Col<'_>]) -> String {
+    let mut parts: Vec<String> = dropped
+        .iter()
+        .map(|(name, _, _)| format!("DROP COLUMN {name}"))
+        .collect();
+    parts.extend(block.iter().map(|(name, ty, nullable)| {
+        let constraint = if *nullable { "" } else { " NOT NULL" };
+        format!("ADD COLUMN {name} {}{constraint}", sql_type_name(ty))
+    }));
+    format!("ALTER TABLE {table} {};", parts.join(", "))
+}
+
+/// Commit the prefix in a baseline, append the block, and hold the tool's block order to the
+/// disk: built the same way after the same prefix, the suggested block must measure no worse
+/// than the written one on any row (padding, or row size at the exact tier), and every row's
+/// saving must sit inside the reported range.
+#[allow(clippy::too_many_lines)]
+fn run_block_fixture(pg: &Pg, binary: &std::path::Path, fixture: &BlockFixture, failures: &mut Vec<String>) {
+    let cols = |columns: &[Column]| -> Vec<Col<'static>> {
+        columns.iter().map(|c| (c.name, c.sql_type, c.nullable)).collect()
+    };
+    let head = cols(&fixture.prefix);
+    let dropped = cols(&fixture.dropped);
+    let block = cols(&fixture.block);
+    let committed_cols: Vec<Col<'_>> = head.iter().chain(&dropped).copied().collect();
+    let table = format!("{}{}", prefix(), fixture.name);
+    let baseline = std::env::temp_dir().join(format!("rowdiet-xtask-{}-{}.json", std::process::id(), fixture.name));
+    let baseline_arg = baseline.to_str().expect("utf-8 path");
+    let create = create_table_sql(&table, &committed_cols);
+    let committed = run_files(
+        binary,
+        &[("V1__create.sql", create.clone())],
+        &["--fail-over", "0", "--update-baseline", "--baseline", baseline_arg],
+    );
+    assert!(committed.status.success(), "baseline write failed for {}", fixture.name);
+    let gated = run_files(
+        binary,
+        &[
+            ("V1__create.sql", create),
+            ("V2__append.sql", append_sql(&table, &dropped, &block)),
+        ],
+        &["--format", "json", "--baseline", baseline_arg],
+    );
+    let report: serde_json::Value = serde_json::from_slice(&gated.stdout).expect("rowdiet JSON");
+    let _ = std::fs::remove_file(&baseline);
+    let found = &report["gate"]["blocks"][&table];
+    if !found.is_object() {
+        failures.push(format!("{}: no appended-block finding in the gate", fixture.name));
+        return;
+    }
+    let avoidable = found["avoidable_bytes_per_row"].as_f64().expect("avoidable");
+    let verdict = report["gate"]["verdicts"][&table]["verdict"].as_str().unwrap_or("-");
+    if avoidable <= 0.0 || verdict != "block_not_dominance_optimal" {
+        failures.push(format!(
+            "{}: the wasteful block passed ({avoidable} B/row, verdict {verdict})",
+            fixture.name
+        ));
+        return;
+    }
+    let suggested: Vec<Col<'_>> = found["suggested_order"]
+        .as_array()
+        .expect("block order")
+        .iter()
+        .map(|v| {
+            let name = v.as_str().expect("name");
+            block
+                .iter()
+                .copied()
+                .find(|(c, _, _)| *c == name)
+                .expect("block column")
+        })
+        .collect();
+    let (saving_min, saving_max) = (
+        found["dominance_saving"]["min"].as_i64().expect("saving min"),
+        found["dominance_saving"]["max"].as_i64().expect("saving max"),
+    );
+    let written_table = format!("{table}_w");
+    let suggested_table = format!("{table}_s");
+    let build = |name: &str, order: &[Col<'_>]| {
+        format!(
+            "{}\n{}",
+            create_table_sql(name, &committed_cols),
+            append_sql(name, &dropped, order)
+        )
+    };
+    let ddl = format!(
+        "{}\n{}",
+        build(&written_table, &block),
+        build(&suggested_table, &suggested)
+    );
+    let model = analyze(binary, &ddl, &[]);
+    pg.query(&format!(
+        "DROP TABLE IF EXISTS {written_table}, {suggested_table};\n{ddl}"
+    ))
+    .expect("apply prefix and blocks");
+    let written_all: Vec<Col<'_>> = head.iter().chain(&block).copied().collect();
+    let suggested_all: Vec<Col<'_>> = head.iter().chain(&suggested).copied().collect();
+    let exact = model["analysis"]["tables"][0]["tier"].as_str() == Some("exact");
+    let null_order: Vec<&str> = written_all.iter().filter(|(_, _, n)| *n).map(|(n, _, _)| *n).collect();
+    let long: Workload = written_all
+        .iter()
+        .filter(|(_, ty, _)| is_varlena(ty))
+        .map(|(name, ty, _)| (*name, type_spec(ty, column_seed(name)).1))
+        .collect();
+    let stored = NullFill::Stored;
+    let mut workloads: Vec<(&str, Workload, NullFill<'_>)> =
+        vec![("short", Vec::new(), stored), ("long", long.clone(), stored)];
+    if !null_order.is_empty() {
+        let patterned = NullFill::Pattern {
+            order: &null_order,
+            first_bit: 0,
+        };
+        workloads.push(("short+nulls", Vec::new(), patterned));
+        workloads.push(("long+nulls", long, patterned));
+    }
+    for (workload, overrides, nulls) in &workloads {
+        let insert_w = insert_sql(&written_table, &written_all, workload, overrides, *nulls, 1200);
+        let insert_s = insert_sql(&suggested_table, &suggested_all, workload, overrides, *nulls, 1200);
+        pg.query(&format!(
+            "TRUNCATE {written_table}, {suggested_table};\n{insert_w}\n{insert_s}"
+        ))
+        .expect("block insert");
+        let paired = measure_pair(pg, (&written_table, &written_all), (&suggested_table, &suggested_all));
+        for (index, measured) in [paired.current, paired.alternative].into_iter().enumerate() {
+            let (lo, hi) = model_bounds(
+                &model["analysis"]["tables"][index]["current"],
+                *nulls != NullFill::Stored,
+            );
+            println!(
+                "| {} | {} | {workload} | [{lo},{hi}] | {:.3} ({}-{}) | {} |",
+                fixture.name,
+                if index == 0 { "written block" } else { "suggested block" },
+                measured.mean,
+                measured.min,
+                measured.max,
+                measured.rows
+            );
+            if measured.min < lo || measured.max > hi {
+                failures.push(format!(
+                    "{}/{workload}: measured [{}-{}] outside model [{lo},{hi}]",
+                    fixture.name, measured.min, measured.max
+                ));
+            }
+        }
+        let (lo, hi, unit) = if exact {
+            (paired.size_saving_min, paired.size_saving_max, "row size")
+        } else {
+            (paired.saving_min, paired.saving_max, "padding")
+        };
+        println!(
+            "| {} | block saving | {workload} | [{saving_min},{saving_max}] {unit} | {lo}..{hi} per row | - |",
+            fixture.name
+        );
+        if lo < 0 {
+            failures.push(format!(
+                "{}/{workload}: the suggested block measures worse in {unit} on some row ({lo}..{hi})",
+                fixture.name
+            ));
+        }
+        if lo < saving_min || hi > saving_max {
+            failures.push(format!(
+                "{}/{workload}: per-row {unit} savings {lo}..{hi} outside the reported [{saving_min},{saving_max}]",
+                fixture.name
+            ));
+        }
     }
 }
 

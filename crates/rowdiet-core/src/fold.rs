@@ -168,6 +168,11 @@ pub struct FoldedColumn {
     pub known_type: bool,
     /// Declared or implied NOT NULL (explicit, PRIMARY KEY, identity, serial).
     pub not_null: bool,
+    /// The statement that added the column: its CREATE TABLE or its ADD COLUMN.
+    pub origin: Origin,
+    /// Physical attribute number, 1-based: dropped columns keep theirs, so a column added after a
+    /// drop is numbered past the dropped slot, as PostgreSQL numbers it.
+    pub attnum: usize,
 }
 
 /// One table's modeled state after the replay — what [`Folder::finish`] hands to reporting.
@@ -368,13 +373,10 @@ impl Folder {
         // columns) — inherit the parent's modeled columns when the parent is in the set.
         let mut incomplete = incomplete_columns;
         let mut inherited: Vec<FoldedColumn> = Vec::new();
-        let mut inherited_dropped = 0usize;
         if let Some(parent) = &partition_of {
             match self.tables.get(&parent.key) {
                 Some(parent_table) => {
                     inherited.clone_from(&parent_table.columns);
-                    // Children share the parent's attribute numbering, dropped slots included.
-                    inherited_dropped = parent_table.dropped_count;
                     incomplete = incomplete || parent_table.incomplete;
                 }
                 None => {
@@ -395,7 +397,6 @@ impl Folder {
                 match self.tables.get(&source.key) {
                     Some(src) => {
                         inherited.clone_from(&src.columns);
-                        inherited_dropped = src.dropped_count;
                         incomplete = incomplete || src.incomplete;
                     }
                     None => {
@@ -423,8 +424,18 @@ impl Folder {
             altered_in: Vec::new(),
             ignored: ignore_marker,
             incomplete,
-            columns: inherited,
-            dropped_count: inherited_dropped,
+            // A partition or a LIKE copy gets the live columns only, numbered afresh: PostgreSQL
+            // copies no dropped attribute into a new table.
+            columns: inherited
+                .into_iter()
+                .enumerate()
+                .map(|(i, column)| FoldedColumn {
+                    attnum: i + 1,
+                    origin: origin.clone(),
+                    ..column
+                })
+                .collect(),
+            dropped_count: 0,
         };
         let mut seen: std::collections::HashSet<String> = table.columns.iter().map(|c| c.key.clone()).collect();
         for raw in columns {
@@ -445,6 +456,7 @@ impl Folder {
                 table.incomplete = true;
                 continue;
             }
+            column.attnum = table.columns.len() + table.dropped_count + 1;
             table.columns.push(column);
         }
         self.ghosts.remove(&name.key);
@@ -467,8 +479,9 @@ impl Folder {
             }
             return;
         }
-        let folded = self.resolve_column(column, origin);
+        let mut folded = self.resolve_column(column, origin);
         let entry = self.tables.get_mut(&table.key).expect("checked above");
+        folded.attnum = entry.columns.len() + entry.dropped_count + 1;
         entry.columns.push(folded);
         mark_altered(entry, origin);
     }
@@ -660,6 +673,8 @@ impl Folder {
             kind: resolved.kind,
             known_type: resolved.known,
             not_null: raw.not_null || resolved.implicit_not_null,
+            origin: origin.clone(),
+            attnum: 0,
         }
     }
 

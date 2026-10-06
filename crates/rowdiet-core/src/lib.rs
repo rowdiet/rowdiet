@@ -34,7 +34,7 @@ pub mod report;
 pub mod split;
 pub mod version;
 
-pub use baseline::{Baseline, BaselineEntry, GateOutcome, TableVerdict};
+pub use baseline::{Baseline, BaselineEntry, CommittedLayout, GateOutcome, TableVerdict};
 pub use catalog::AssumedKind;
 pub use fold::{Note, NoteKind, Origin};
 pub use layout::{Align, ColumnKind, Tier};

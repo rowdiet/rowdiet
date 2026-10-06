@@ -58,18 +58,28 @@ fn packed_return_layout() {
 
 #[test]
 fn baseline_input_gates_and_reports_verdicts() {
-    let baselined = r#"{
+    let committed = r#"{
       "sources": [{"name": "V1__m.sql", "sql": "CREATE TABLE m (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);"}],
-      "baseline": {"fail_over": 0, "tables": {"m": {"bytes": 8, "layout": "f4i,f8d,f4i,f8d"}}}
+      "baseline": {"fail_over": 0, "tables": {"m": {"layout": "f4i,f8d,f4i,f8d"}}}
     }"#;
-    let out: serde_json::Value = serde_json::from_str(&lint_json(baselined)).unwrap();
+    let out: serde_json::Value = serde_json::from_str(&lint_json(committed)).unwrap();
     assert_eq!(out["gate_exceeded"], false);
     assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "pass");
     assert_eq!(out["fail_over"], 0.0);
     assert_eq!(out["analysis"]["tables"][0]["layout_signature"], "f4i,f8d,f4i,f8d");
-    let tightened = baselined.replace("\"bytes\": 8", "\"bytes\": 4");
-    let out: serde_json::Value = serde_json::from_str(&lint_json(&tightened)).unwrap();
+    let legacy = committed.replace("{\"layout\"", "{\"bytes\": 4, \"layout\"");
+    let out: serde_json::Value = serde_json::from_str(&lint_json(&legacy)).unwrap();
+    assert_eq!(out["gate_exceeded"], false);
+    assert_eq!(out["gate"]["ignored_allowances"], serde_json::json!(["m"]));
+    let grown = committed.replace(
+        "d bigint NOT NULL);",
+        "d bigint NOT NULL); ALTER TABLE m ADD COLUMN e boolean NOT NULL, ADD COLUMN f bigint NOT NULL, ADD COLUMN g boolean NOT NULL, ADD COLUMN h bigint NOT NULL;",
+    );
+    let out: serde_json::Value = serde_json::from_str(&lint_json(&grown)).unwrap();
     assert_eq!(out["gate_exceeded"], true);
-    assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "regression");
-    assert_eq!(out["gate"]["verdicts"]["m"]["allowed"], 4.0);
+    assert_eq!(out["gate"]["verdicts"]["m"]["verdict"], "block_not_dominance_optimal");
+    assert_eq!(
+        out["gate"]["blocks"]["m"]["suggested_order"],
+        serde_json::json!(["f", "h", "e", "g"])
+    );
 }

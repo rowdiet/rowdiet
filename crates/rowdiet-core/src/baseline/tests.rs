@@ -15,23 +15,34 @@ fn analysis(sql: &str) -> Analysis {
     )
 }
 
-fn baseline(fail_over: f64, tables: &[(&str, f64, &str)]) -> Baseline {
+fn layout(signature: &str) -> CommittedLayout {
+    CommittedLayout::parse(signature).expect("a layout")
+}
+
+fn entry(signature: &str) -> BaselineEntry {
+    BaselineEntry::new(layout(signature))
+}
+
+fn baseline(fail_over: f64, tables: &[(&str, &str)]) -> Baseline {
     Baseline {
         rowdiet: "test".into(),
         fail_over,
         tables: tables
             .iter()
-            .map(|(name, bytes, layout)| {
-                (
-                    name.to_string(),
-                    BaselineEntry {
-                        bytes: *bytes,
-                        layout: layout.to_string(),
-                    },
-                )
-            })
+            .map(|(name, layout)| (name.to_string(), entry(layout)))
             .collect(),
     }
+}
+
+/// A prefix migration plus an appended block, as two files in apply order.
+fn migrations(prefix: &str, block: &str) -> Analysis {
+    analyze_sources(
+        &[
+            SqlSource::new("V1__create.sql", prefix),
+            SqlSource::new("V2__append.sql", block),
+        ],
+        &Config::default(),
+    )
 }
 
 #[test]
@@ -59,80 +70,138 @@ fn fail_over_alone_flags_new_violation() {
 }
 
 #[test]
-fn baselined_table_passes_at_its_allowance() {
-    let base = baseline(0.0, &[("t", 8.0, WASTEFUL_SIG)]);
+fn a_committed_layout_is_never_judged_again() {
+    // The whole table is the committed prefix: nothing is free to reorder, so 8 B/row of
+    // committed waste passes at fail-over 0.
+    let base = baseline(0.0, &[("t", WASTEFUL_SIG)]);
     let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
+    assert!(outcome.blocks.is_empty());
     assert!(outcome.orphaned.is_empty());
     assert!(outcome.expired.is_empty());
 }
 
 #[test]
-fn tightened_allowance_flags_regression() {
-    let base = baseline(0.0, &[("t", 4.0, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
-    assert!(outcome.exceeded);
-    assert_eq!(
-        outcome.verdicts["t"],
-        TableVerdict::Regression {
-            avoidable: 8.0,
-            allowed: 4.0
-        }
-    );
-}
-
-#[test]
-fn improvement_is_a_ratchet_opportunity_not_auto_tightened() {
-    let base = baseline(0.0, &[("t", 12.0, WASTEFUL_SIG)]);
-    let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
-    assert!(!outcome.exceeded);
-    assert_eq!(
-        outcome.verdicts["t"],
-        TableVerdict::RatchetOpportunity {
-            avoidable: 8.0,
-            allowed: 12.0
-        }
-    );
-}
-
-#[test]
-fn appended_column_keeps_the_allowance_alive() {
-    // The brownfield ADD COLUMN scenario: the applied table cannot be rewritten, and the aligned
-    // append adds no avoidable waste — the entry must keep passing, not expire into a failure.
+fn an_aligned_append_passes() {
     let grown = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
         ALTER TABLE t ADD COLUMN e bigint NOT NULL;";
     let a = analysis(grown);
     assert_eq!(a.tables[0].layout_signature, "f4i,f8d,f4i,f8d,f8d");
-    let base = baseline(0.0, &[("t", 8.0, WASTEFUL_SIG)]);
+    let base = baseline(0.0, &[("t", WASTEFUL_SIG)]);
     let outcome = evaluate(&a, None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
+    let block = &outcome.blocks["t"];
+    assert_eq!(block.prefix_columns, 4);
+    assert_eq!(block.columns, vec!["e"]);
+    assert_eq!(block.avoidable_bytes_per_row, 0.0);
     assert!(outcome.expired.is_empty());
 }
 
 #[test]
-fn wasteful_append_flags_grown_not_modified() {
+fn a_wasteful_block_fails_with_its_block_order() {
+    // (bool, bigint, bool, bigint) appended after a prefix ending at offset 32: the written
+    // block pads 14 bytes; (bigint, bigint, bool, bool) pads none and the row shrinks from 88
+    // to 80 bytes, the exact-tier saving. The prefix is not reordered.
     let grown = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
         ALTER TABLE t ADD COLUMN e boolean NOT NULL;
         ALTER TABLE t ADD COLUMN f bigint NOT NULL;
         ALTER TABLE t ADD COLUMN g boolean NOT NULL;
         ALTER TABLE t ADD COLUMN h bigint NOT NULL;";
-    let base = baseline(0.0, &[("t", 8.0, WASTEFUL_SIG)]);
+    let base = baseline(0.0, &[("t", WASTEFUL_SIG)]);
     let outcome = evaluate(&analysis(grown), None, false, Some(&base));
     assert!(outcome.exceeded);
     assert_eq!(
         outcome.verdicts["t"],
-        TableVerdict::GrownSinceBaseline {
-            avoidable: 16.0,
-            allowed: 8.0
+        TableVerdict::BlockNotDominanceOptimal {
+            avoidable: 8.0,
+            appended: 4
         }
+    );
+    let block = &outcome.blocks["t"];
+    assert_eq!(block.suggested_order, vec!["f", "h", "e", "g"]);
+    assert_eq!(block.avoidable_deterministic, 8);
+    assert_eq!(block.origins.len(), 4, "one origin per appending statement");
+    assert_eq!(
+        block.origins[0].line, 2,
+        "points at the statements that appended the block"
     );
 }
 
+/// The two false negatives the #11 reviews measured, as committed prefixes with an appended
+/// block: the block-scoped search finds each fix without touching the prefix.
+mod review_false_negatives {
+    use super::*;
+
+    #[test]
+    fn wide25_block_takes_the_deterministic_two_byte_fix() {
+        // 21 bigints and a timetz committed; (timetz, smallint, text) appended. Written, the
+        // second timetz pads 4 behind the first and the text may pad 2 more; (smallint, timetz,
+        // text) pads a deterministic 2 and leaves the text aligned.
+        let prefix_cols: Vec<String> = (0..21)
+            .map(|i| format!("b{i} bigint NOT NULL"))
+            .chain(["t1 timetz NOT NULL".to_string()])
+            .collect();
+        let prefix = format!("CREATE TABLE wide25 ({});", prefix_cols.join(", "));
+        let block = "ALTER TABLE wide25 ADD COLUMN t2 timetz NOT NULL, ADD COLUMN s smallint NOT NULL, ADD COLUMN note text NOT NULL;";
+        let committed = analysis(&prefix);
+        let base = build_from(&committed, 0.0, "test");
+        let a = migrations(&prefix, block);
+        let outcome = evaluate(&a, None, false, Some(&base));
+        let found = &outcome.blocks["wide25"];
+        assert_eq!(found.prefix_columns, 22);
+        assert_eq!(found.suggested_order, vec!["s", "t2", "note"]);
+        assert_eq!(
+            found.dominance_saving,
+            Some(crate::report::SavingRange { min: 2, max: 4 })
+        );
+        assert_eq!((found.avoidable_deterministic, found.avoidable_dominance), (2, 2));
+        assert_eq!(found.dominance_search, crate::report::DominanceScope::Exhaustive);
+        assert!(outcome.exceeded);
+    }
+
+    #[test]
+    fn cliff25_block_takes_the_full_fix() {
+        // 24 fixed columns and a text, 25 in all: the aligned bigints and ints committed, the
+        // timetz, macaddr, smallint, and boolean columns appended grouped by type, which pads 18
+        // deterministic bytes (and 0-2 at the text). The block's order space is too large to
+        // sweep, so the search poles find the 12-byte repack and the clean claim is "found".
+        let mut prefix_cols: Vec<String> = Vec::new();
+        for i in 0..4 {
+            prefix_cols.push(format!("b{i} bigint NOT NULL"));
+        }
+        for i in 0..4 {
+            prefix_cols.push(format!("i{i} integer NOT NULL"));
+        }
+        let prefix = format!("CREATE TABLE cliff25 ({});", prefix_cols.join(", "));
+        let mut block_cols: Vec<String> = Vec::new();
+        for (name, ty) in [("tz", "timetz"), ("m", "macaddr"), ("s", "smallint"), ("f", "boolean")] {
+            for i in 0..4 {
+                block_cols.push(format!("ADD COLUMN {name}{i} {ty} NOT NULL"));
+            }
+        }
+        block_cols.push("ADD COLUMN note text NOT NULL".into());
+        let block = format!("ALTER TABLE cliff25 {};", block_cols.join(", "));
+        let base = build_from(&analysis(&prefix), 0.0, "test");
+        let a = migrations(&prefix, &block);
+        assert_eq!(a.tables[0].natts, 25);
+        let outcome = evaluate(&a, None, false, Some(&base));
+        let found = &outcome.blocks["cliff25"];
+        assert_eq!(found.prefix_columns, 8);
+        assert_eq!(found.avoidable_deterministic, 12, "{found:#?}");
+        assert_eq!(
+            found.dominance_saving,
+            Some(crate::report::SavingRange { min: 12, max: 12 })
+        );
+        assert_eq!(found.search_scope, crate::layout::SearchScope::Complete);
+        assert!(outcome.exceeded);
+    }
+}
+
 #[test]
-fn non_append_change_expires_the_allowance() {
-    let base = baseline(0.0, &[("t", 8.0, "f16c")]);
+fn non_append_change_expires_the_entry() {
+    let base = baseline(0.0, &[("t", "f16c")]);
     let outcome = evaluate(&analysis(WASTEFUL), None, false, Some(&base));
     assert!(outcome.exceeded);
     assert_eq!(
@@ -145,7 +214,7 @@ fn non_append_change_expires_the_allowance() {
 #[test]
 fn reordered_to_clean_reports_expired_entry() {
     let reordered = "CREATE TABLE t (b bigint NOT NULL, d bigint NOT NULL, a int NOT NULL, c int NOT NULL);";
-    let base = baseline(0.0, &[("t", 8.0, WASTEFUL_SIG)]);
+    let base = baseline(0.0, &[("t", WASTEFUL_SIG)]);
     let outcome = evaluate(&analysis(reordered), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
@@ -163,7 +232,7 @@ fn explicit_fail_over_overrides_the_files() {
 
 #[test]
 fn orphaned_entries_reported_not_failed() {
-    let base = baseline(0.0, &[("ghost", 4.0, "f4i")]);
+    let base = baseline(0.0, &[("ghost", "f4i")]);
     let sql = "CREATE TABLE t (b bigint NOT NULL, a int NOT NULL, c int NOT NULL);";
     let outcome = evaluate(&analysis(sql), None, false, Some(&base));
     assert!(!outcome.exceeded);
@@ -174,7 +243,7 @@ fn orphaned_entries_reported_not_failed() {
 fn ignored_tables_stay_outside_gate_and_baseline() {
     let sql = "CREATE TABLE ig ( -- rowdiet:ignore
         a int NOT NULL, b bigint NOT NULL);";
-    let base = baseline(0.0, &[("ig", 0.0, "f4i,f8d")]);
+    let base = baseline(0.0, &[("ig", "f4i,f8d")]);
     let outcome = evaluate(&analysis(sql), None, false, Some(&base));
     assert!(!outcome.exceeded);
     assert!(!outcome.verdicts.contains_key("ig"));
@@ -182,54 +251,134 @@ fn ignored_tables_stay_outside_gate_and_baseline() {
 }
 
 #[test]
-fn build_from_records_only_debt() {
+fn build_from_commits_every_modeled_table() {
     let sql = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
-        CREATE TABLE u (a bigint NOT NULL);";
+        CREATE TABLE u (a bigint NOT NULL);
+        CREATE TABLE w (LIKE elsewhere);";
     let base = build_from(&analysis(sql), 0.0, "1.2.3");
     assert_eq!(base.rowdiet, "1.2.3");
     assert_eq!(base.fail_over, 0.0);
-    assert_eq!(base.tables.len(), 1);
     assert_eq!(
-        base.tables["t"],
-        BaselineEntry {
-            bytes: 8.0,
-            layout: WASTEFUL_SIG.into()
-        }
+        base.tables.len(),
+        2,
+        "incomplete tables have no committed layout to record"
     );
+    assert_eq!(base.tables["t"].layout, layout(WASTEFUL_SIG));
+    assert_eq!(base.tables["t"].columns, vec!["a", "b", "c", "d"]);
+    assert_eq!(base.tables["u"].layout, layout("f8d"));
 }
 
 #[test]
-fn accept_refreshes_named_entries_and_prunes_clean_ones() {
+fn accept_records_the_written_block() {
     let sql = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
         CREATE TABLE u (a bigint NOT NULL);";
     let a = analysis(sql);
-    let mut base = baseline(0.0, &[("t", 99.0, "stale"), ("u", 5.0, "stale"), ("ghost", 1.0, "f4i")]);
+    let mut base = baseline(0.0, &[("t", "f1c"), ("u", "f1c"), ("ghost", "f4i")]);
     accept_tables(&mut base, &a, &["t".into(), "u".into()]).unwrap();
-    assert_eq!(
-        base.tables["t"],
-        BaselineEntry {
-            bytes: 8.0,
-            layout: WASTEFUL_SIG.into()
-        }
-    );
-    assert!(!base.tables.contains_key("u"));
+    assert_eq!(base.tables["t"].layout, layout(WASTEFUL_SIG));
+    assert_eq!(base.tables["t"].columns, vec!["a", "b", "c", "d"]);
+    assert_eq!(base.tables["u"].layout, layout("f8d"));
     assert!(base.tables.contains_key("ghost"));
     let err = accept_tables(&mut base, &a, &["nope".into()]).unwrap_err();
     assert!(err.contains("nope"));
 }
 
 #[test]
-fn prefix_relation_respects_comma_boundaries() {
-    assert!(matches!(relation("f8d,f4i", "f8d,f4i"), SignatureRelation::Match));
-    assert!(matches!(relation("f8d", "f8d,f4i"), SignatureRelation::Grown));
-    assert!(matches!(relation("f8d,vi", "f8d,vi,f4i"), SignatureRelation::Grown));
-    // `vi` → `vip` is a typmod change on the last column, not an append.
+fn an_accepted_block_becomes_the_next_prefix() {
+    let grown = "CREATE TABLE t (a int NOT NULL, b bigint NOT NULL, c int NOT NULL, d bigint NOT NULL);
+        ALTER TABLE t ADD COLUMN e boolean NOT NULL, ADD COLUMN f bigint NOT NULL,
+            ADD COLUMN g boolean NOT NULL, ADD COLUMN h bigint NOT NULL;";
+    let a = analysis(grown);
+    let mut base = baseline(0.0, &[("t", WASTEFUL_SIG)]);
+    assert!(evaluate(&a, None, false, Some(&base)).exceeded);
+    accept_tables(&mut base, &a, &["t".into()]).unwrap();
+    let outcome = evaluate(&a, None, false, Some(&base));
+    assert!(!outcome.exceeded);
+    assert!(outcome.blocks.is_empty());
+}
+
+#[test]
+fn relation_compares_slot_by_slot() {
+    let rel = |a: &str, b: &str| relation(&layout(a), &layout(b));
+    assert!(matches!(rel("f8d,f4i", "f8d,f4i"), SignatureRelation::Match));
     assert!(matches!(
-        relation("f8d,vi", "f8d,vip,f4i"),
-        SignatureRelation::Different
+        rel("f8d", "f8d,f4i"),
+        SignatureRelation::Grown { committed_slots: 1 }
     ));
-    assert!(matches!(relation("", "vi"), SignatureRelation::Different));
-    assert!(matches!(relation("f8d,f4i", "f8d"), SignatureRelation::Different));
+    assert!(matches!(
+        rel("f8d,vi", "f8d,vi,f4i"),
+        SignatureRelation::Grown { committed_slots: 2 }
+    ));
+    // `vi` → `vip` is a typmod change on a committed column, not an append.
+    assert!(matches!(rel("f8d,vi", "f8d,vip,f4i"), SignatureRelation::Different));
+    assert!(matches!(rel("", "vi"), SignatureRelation::Grown { committed_slots: 0 }));
+    assert!(matches!(rel("f8d,f4i", "f8d"), SignatureRelation::Different));
+    // A committed column dropped since keeps its slot: still the committed prefix.
+    assert!(matches!(rel("f8d,f1c,f2s", "f8d,f1c,-"), SignatureRelation::Match));
+    assert!(matches!(
+        rel("f8d,f1c,f2s", "f8d,f1c,-,f2s,f4i,f1c"),
+        SignatureRelation::Grown { committed_slots: 3 }
+    ));
+    // A dropped slot never comes back.
+    assert!(matches!(rel("f8d,-", "f8d,f4i"), SignatureRelation::Different));
+}
+
+#[test]
+fn layouts_parse_or_fail_loudly() {
+    assert_eq!(layout("f8d,-,vip,vc").slots(), ["f8d", "-", "vip", "vc"]);
+    for bad in ["garbage", "f8", "fxd", "v", "vq", "f8d,", "vpi", "f8d,,f4i"] {
+        assert!(CommittedLayout::parse(bad).is_err(), "{bad}");
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_file_that_lists_a_table_twice_is_rejected() {
+    let json = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d"}, "t": {"layout": "f8d,f4i"}}}"#;
+    let err = serde_json::from_str::<Baseline>(json).unwrap_err().to_string();
+    assert!(err.contains("listed twice"), "{err}");
+    let garbage = r#"{"fail_over": 0, "tables": {"t": {"layout": "garbage"}}}"#;
+    assert!(serde_json::from_str::<Baseline>(garbage).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn an_entry_whose_names_do_not_match_its_layout_is_rejected() {
+    // The delta review's lie2.json: five committed slots naming two columns silenced a block.
+    let lie = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,f1c,f4i,f2s,f1c", "columns": ["id", "flag"]}}}"#;
+    let err = serde_json::from_str::<Baseline>(lie).unwrap_err().to_string();
+    assert!(err.contains("commits 5 live column(s) but `columns` names 2"), "{err}");
+    let dropped = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,-,f4i", "columns": ["id", "x"]}}}"#;
+    assert!(
+        serde_json::from_str::<Baseline>(dropped).is_ok(),
+        "a dropped slot has no name"
+    );
+    let unnamed = r#"{"fail_over": 0, "tables": {"t": {"layout": "f8d,f4i"}}}"#;
+    assert!(
+        serde_json::from_str::<Baseline>(unnamed).is_ok(),
+        "older entries carry no names"
+    );
+}
+
+#[test]
+fn drop_then_add_is_judged_as_the_appended_block() {
+    // The stack review's D3-1: (id, flag, n) committed, then n dropped and (x, y, z) added.
+    // PostgreSQL keeps n's slot, so x, y and z are the block, behind (id, flag) and the dropped
+    // slot. Written, the row pads 1 before y; (z, x, y) pads nothing (measured 41 B tuples and
+    // 48 B page spacing as written, 40 B and 40 B reordered).
+    let sql = "CREATE TABLE t (id bigint NOT NULL, flag boolean NOT NULL, n smallint NOT NULL);
+        ALTER TABLE t DROP COLUMN n;
+        ALTER TABLE t ADD COLUMN x smallint NOT NULL, ADD COLUMN y integer NOT NULL, ADD COLUMN z boolean NOT NULL;";
+    let a = analysis(sql);
+    assert_eq!(a.tables[0].layout_signature, "f8d,f1c,-,f2s,f4i,f1c");
+    let base = baseline(0.0, &[("t", "f8d,f1c,f2s")]);
+    let outcome = evaluate(&a, None, false, Some(&base));
+    assert!(outcome.exceeded, "{:?}", outcome.verdicts);
+    let block = &outcome.blocks["t"];
+    assert_eq!(block.columns, vec!["x", "y", "z"]);
+    assert_eq!((block.committed_slots, block.prefix_columns), (3, 2));
+    assert_eq!(block.suggested_order, vec!["z", "x", "y"]);
+    assert_eq!(block.avoidable_bytes_per_row, 8.0);
 }
 
 #[test]
@@ -287,19 +436,11 @@ fn verdict_display_matches_serde_tag() {
         TableVerdict::Pass,
         TableVerdict::Incomplete,
         TableVerdict::NewViolation { avoidable: 1.0 },
-        TableVerdict::Regression {
+        TableVerdict::BlockNotDominanceOptimal {
             avoidable: 2.0,
-            allowed: 1.0,
-        },
-        TableVerdict::GrownSinceBaseline {
-            avoidable: 2.0,
-            allowed: 1.0,
+            appended: 3,
         },
         TableVerdict::ModifiedSinceBaseline { avoidable: 2.0 },
-        TableVerdict::RatchetOpportunity {
-            avoidable: 1.0,
-            allowed: 2.0,
-        },
     ];
     for verdict in all {
         let json = serde_json::to_value(verdict).unwrap();
@@ -307,7 +448,7 @@ fn verdict_display_matches_serde_tag() {
     }
 }
 
-mod fractional_allowances {
+mod fractional_fail_over {
     use super::*;
 
     /// Fixed columns interleaved among varlenas: grouping them first dominates (never worse in
@@ -329,68 +470,26 @@ mod fractional_allowances {
         assert!(fractional_gate.exceeded, "fail-over accepts fractions");
     }
 
-    #[test]
-    fn acceptance_stores_the_exact_value() {
-        let a = analysis(VARLENA_WASTE);
-        let base = build_from(&a, 0.0, "test");
-        assert_eq!(base.tables["t"].bytes, 10.0, "stored exactly, no rounding");
-        let outcome = evaluate(&a, None, false, Some(&base));
-        assert!(!outcome.exceeded);
-        assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
-    }
-
-    #[test]
-    fn any_exceedance_of_an_exact_entry_is_a_regression() {
-        // The sub-byte window a ceiled entry used to open: a fractional allowance must fail
-        // the moment the table reports more, not only past the next whole byte.
-        let a = analysis(VARLENA_WASTE);
-        let sig = a.tables[0].layout_signature.as_str();
-        let base = baseline(0.0, &[("t", 9.5, sig)]);
-        let outcome = evaluate(&a, None, false, Some(&base));
-        assert!(outcome.exceeded);
-        assert_eq!(
-            outcome.verdicts["t"],
-            TableVerdict::Regression {
-                avoidable: 10.0,
-                allowed: 9.5
-            }
-        );
-    }
-
-    #[test]
-    fn genuinely_tighter_fraction_still_ratchets() {
-        let a = analysis(VARLENA_WASTE);
-        let sig = a.tables[0].layout_signature.as_str();
-        let base = baseline(0.0, &[("t", 10.5, sig)]);
-        let outcome = evaluate(&a, None, false, Some(&base));
-        assert_eq!(
-            outcome.verdicts["t"],
-            TableVerdict::RatchetOpportunity {
-                avoidable: 10.0,
-                allowed: 10.5
-            }
-        );
-    }
-
     #[cfg(feature = "serde")]
     #[test]
-    fn whole_byte_legacy_entries_keep_working() {
-        // Files written before fractional entries hold integers; 10.0 under a legacy 11
-        // passes and surfaces the tighter value as a ratchet opportunity.
+    fn old_files_with_allowances_load_and_the_allowance_is_ignored() {
+        // A file from before block gating: its byte allowance no longer decides anything, the
+        // gate says so, and the next write drops it.
         let a = analysis(VARLENA_WASTE);
         let sig = a.tables[0].layout_signature.as_str();
         let base: Baseline = serde_json::from_str(&format!(
-            "{{\"rowdiet\":\"old\",\"fail_over\":0,\"tables\":{{\"t\":{{\"bytes\":11,\"layout\":\"{sig}\"}}}}}}"
+            "{{\"rowdiet\":\"old\",\"fail_over\":0,\"tables\":{{\"t\":{{\"bytes\":9.5,\"layout\":\"{sig}\"}}}}}}"
         ))
         .unwrap();
+        assert_eq!(base.tables["t"].legacy_bytes, Some(9.5));
         let outcome = evaluate(&a, None, false, Some(&base));
-        assert!(!outcome.exceeded);
-        assert_eq!(
-            outcome.verdicts["t"],
-            TableVerdict::RatchetOpportunity {
-                avoidable: 10.0,
-                allowed: 11.0
-            }
+        assert!(
+            !outcome.exceeded,
+            "the committed layout passes whatever the allowance said"
         );
+        assert_eq!(outcome.verdicts["t"], TableVerdict::Pass);
+        assert_eq!(outcome.ignored_allowances, vec!["t".to_string()]);
+        let written = serde_json::to_string(&base).unwrap();
+        assert!(!written.contains("bytes"), "{written}");
     }
 }

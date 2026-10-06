@@ -274,73 +274,66 @@ fn baseline_lifecycle() {
     let dir = std::env::temp_dir().join(format!("rowdiet-cli-baseline-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("baseline.json");
+    let gate = |extra: &[&str]| {
+        bin()
+            .arg(fixtures("wasteful"))
+            .args(extra)
+            .arg("--baseline")
+            .arg(&file)
+            .output()
+            .unwrap()
+    };
+    // Commit the table as V1 created it; V2's appended columns become the judged block.
     let boot = bin()
-        .arg(fixtures("wasteful"))
+        .arg(format!("{}/V1__init.sql", fixtures("wasteful")))
         .args(["--fail-over", "0", "--update-baseline", "--baseline"])
         .arg(&file)
         .output()
         .unwrap();
     assert_eq!(boot.status.code(), Some(0), "{}", String::from_utf8_lossy(&boot.stderr));
     assert!(String::from_utf8_lossy(&boot.stdout).contains("baseline written"));
-    let green = bin()
-        .arg(fixtures("wasteful"))
-        .arg("--baseline")
-        .arg(&file)
-        .output()
-        .unwrap();
-    assert_eq!(
-        green.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&green.stdout)
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert!(!written.contains("bytes"), "no allowance is stored: {written}");
+    let block = gate(&[]);
+    assert_eq!(block.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&block.stdout);
+    assert!(
+        stdout.contains("appended block (") && stdout.contains("is not dominance-optimal"),
+        "{stdout}"
     );
-    let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    value["tables"]["account"]["bytes"] = 0.into();
-    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
-    let regressed = bin()
-        .arg(fixtures("wasteful"))
-        .arg("--baseline")
-        .arg(&file)
-        .output()
-        .unwrap();
-    assert_eq!(regressed.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&regressed.stdout).contains("regression"));
-    // Not a comma-boundary prefix of the real signature — a true non-append change. (A prefix
-    // value here, e.g. "f1c", would legitimately pass via the grown-since-baseline rule.)
-    value["tables"]["account"]["layout"] = "f16c".into();
-    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
-    let modified = bin()
-        .arg(fixtures("wasteful"))
-        .arg("--baseline")
-        .arg(&file)
-        .output()
-        .unwrap();
-    assert_eq!(modified.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&modified.stdout).contains("modified since baseline"));
-    let accepted = bin()
-        .arg(fixtures("wasteful"))
-        .args(["--accept", "account", "--baseline"])
-        .arg(&file)
-        .output()
-        .unwrap();
+    assert!(stdout.contains("block order: flags, note"), "{stdout}");
+    let accepted = gate(&["--accept", "account"]);
     assert_eq!(
         accepted.status.code(),
         Some(0),
         "{}",
         String::from_utf8_lossy(&accepted.stderr)
     );
-    let regated = bin()
-        .arg(fixtures("wasteful"))
-        .arg("--baseline")
-        .arg(&file)
-        .output()
-        .unwrap();
+    let green = gate(&[]);
     assert_eq!(
-        regated.status.code(),
+        green.status.code(),
         Some(0),
         "{}",
-        String::from_utf8_lossy(&regated.stdout)
+        String::from_utf8_lossy(&green.stdout)
     );
+    // An older file's allowance loads and is ignored, loudly.
+    let mut value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    value["tables"]["account"]["bytes"] = 0.into();
+    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
+    let legacy = gate(&[]);
+    assert_eq!(legacy.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&legacy.stdout).contains("byte allowances ignored for account"),
+        "{}",
+        String::from_utf8_lossy(&legacy.stdout)
+    );
+    // Not a comma-boundary prefix of the real signature: a true non-append change.
+    value["tables"]["account"]["layout"] = "f16c".into();
+    value["tables"]["account"]["columns"] = serde_json::json!(["id"]);
+    std::fs::write(&file, serde_json::to_string(&value).unwrap()).unwrap();
+    let modified = gate(&[]);
+    assert_eq!(modified.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&modified.stdout).contains("modified since baseline"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
