@@ -10,7 +10,15 @@
 //!     inside the band: each row's saving lies inside the band's bounds, the declared winner
 //!     matches the signs measured, and where every residue is controllable the measured extremes
 //!     equal the bounds; every declared boundary pair flips the measured winner;
-//! (d) the gated headline never exceeds the dominance engine's proven maximum saving.
+//! (d) the gated headline never exceeds the dominance engine's proven maximum saving;
+//! (e) at the exact tier, which decides in row size, every row takes the reported size: rows
+//!     without NULLs the footprint, rows with one the bitmap header and the reported range.
+//!
+//! Fixtures with nullable columns also run workloads that hold NULL in them, one bit of the row
+//! counter per nullable column, so every NULL pattern over up to ten columns occurs; those rows
+//! are held to the bounds over every NULL pattern and the rows without NULLs to the bounds in
+//! rows that store every column. At the exact tier property (b) and the band checks compare
+//! row sizes (the tuple length rounded up to 8), which is what the tool reports there.
 //!
 //! Rows are generated deterministically, so the current and the alternative table hold the same
 //! values row for row and pair by insertion order. Padding is the tuple length minus the header
@@ -93,14 +101,16 @@ struct Measured {
     max: i64,
 }
 
-/// Two tables holding the same rows, paired by insertion order. `saving` is current minus
-/// alternative padding per row.
+/// Two tables holding the same rows, paired by their values. `saving` is current minus
+/// alternative padding per row, `size_saving` the same for row sizes.
 #[derive(Debug, Clone, Copy)]
 struct Paired {
     current: Measured,
     alternative: Measured,
     saving_min: i64,
     saving_max: i64,
+    size_saving_min: i64,
+    size_saving_max: i64,
     /// Rows the toaster stored differently in the two orders, left out of the savings.
     stored_differently: u64,
 }
@@ -108,7 +118,11 @@ struct Paired {
 struct Column {
     name: &'static str,
     sql_type: &'static str,
+    nullable: bool,
 }
+
+/// (name, SQL type, nullable) as the table DDL and the workload generators see a column.
+type Col<'a> = (&'a str, &'a str, bool);
 
 /// The table-name prefix every created table carries.
 fn prefix() -> String {
@@ -242,18 +256,30 @@ struct Fixture {
     /// The named text column is STORAGE EXTERNAL; its long workload is a toasted 4 kB payload
     /// measured as the 18-byte pointer.
     toast_column: Option<&'static str>,
+    /// An order the tool must not recommend, and a workload on which it measures worse than the
+    /// written order on some row.
+    witness: Option<(Vec<&'static str>, Workload)>,
 }
 
 fn col(name: &'static str, sql_type: &'static str) -> Column {
-    Column { name, sql_type }
+    Column {
+        name,
+        sql_type,
+        nullable: false,
+    }
+}
+
+fn ncol(name: &'static str, sql_type: &'static str) -> Column {
+    Column {
+        name,
+        sql_type,
+        nullable: true,
+    }
 }
 
 fn numbered(prefix: &str, count: u32, sql_type: &'static str) -> Vec<Column> {
     (0..count)
-        .map(|i| Column {
-            name: Box::leak(format!("{prefix}{i}").into_boxed_str()),
-            sql_type,
-        })
+        .map(|i| col(Box::leak(format!("{prefix}{i}").into_boxed_str()), sql_type))
         .collect()
 }
 
@@ -264,6 +290,7 @@ fn fixtures() -> Vec<Fixture> {
         columns,
         boundary: None,
         toast_column: None,
+        witness: None,
     };
     let mut out = vec![
         // Issue #1's control table: measured flat zero, must pass clean.
@@ -309,6 +336,7 @@ fn fixtures() -> Vec<Fixture> {
                 ],
             )),
             toast_column: None,
+            witness: None,
         },
         // (float8[], int4): the old model demanded a swap that measures 4 B/row worse; the
         // policy keeps the order. Bounds still checked under both loads.
@@ -325,6 +353,7 @@ fn fixtures() -> Vec<Fixture> {
                 vec![("arr", float_array("25 + g % 16", column_seed("arr")))],
             )),
             toast_column: None,
+            witness: None,
         },
         // (timetz, timetz, text): the certainty trade. Text width 4 keeps the current order
         // ahead (flat 4 vs flat 7); width 2 favors the interposed alternative (flat 1).
@@ -336,6 +365,7 @@ fn fixtures() -> Vec<Fixture> {
                 vec![("v", "repeat('x', 2)".into())],
             )),
             toast_column: None,
+            witness: None,
         },
         // (text, macaddr): frontier; short payloads favor macaddr-first, 128-byte texts favor
         // text-first (the text pads 0 at offset 0 and the macaddr lands aligned).
@@ -347,6 +377,7 @@ fn fixtures() -> Vec<Fixture> {
                 vec![("t", "repeat('x', (g % 16)::int)".into())],
             )),
             toast_column: None,
+            witness: None,
         },
         // (text, boolean, bigint): dominance finding via the aligned slot and the char tail.
         plain("frac", vec![col("t", "text"), col("b", "boolean"), col("x", "bigint")]),
@@ -373,6 +404,7 @@ fn fixtures() -> Vec<Fixture> {
             columns: vec![col("t", "text"), col("x", "float8")],
             boundary: None,
             toast_column: Some("t"),
+            witness: None,
         },
         // Array residues: a short uncompressed float8[] stores payload 4 mod 8, which makes
         // (macaddr, smallint, a2, a1) dominate; any-residue modeling called this table clean.
@@ -475,6 +507,107 @@ fn fixtures() -> Vec<Fixture> {
     wide.push(col("s", "smallint"));
     wide.push(col("note", "text"));
     out.push(plain("wide25", wide));
+    out.extend(null_fixtures());
+    out
+}
+
+/// Fixtures whose verdicts depend on NULLs in nullable columns.
+#[allow(clippy::too_many_lines)]
+fn null_fixtures() -> Vec<Fixture> {
+    let plain = |name, columns| Fixture {
+        name,
+        columns,
+        boundary: None,
+        toast_column: None,
+        witness: None,
+    };
+    let long_text = || "repeat('x', (130 + (g * 7) % 110)::int)".to_string();
+    let mut out = vec![
+        // The written order pads zero when every column is stored, which read as clean without
+        // NULLs; rows with n NULL pad 2 before i, and (i, s, n, t) never does.
+        plain(
+            "nullfill",
+            vec![
+                col("s", "smallint"),
+                ncol("n", "smallint"),
+                col("i", "integer"),
+                col("t", "text"),
+            ],
+        ),
+        // Exact tier: both orders round to 48 bytes when every column is stored, but rows with
+        // n NULL shrink to 40 under (z, n, b1, b2).
+        plain(
+            "nullexact",
+            vec![
+                col("b1", "boolean"),
+                col("b2", "boolean"),
+                ncol("n", "integer"),
+                col("z", "timetz"),
+            ],
+        ),
+        // Exact tier decided in row size: (c0, c2, c1) pads 2 more when every column is stored,
+        // where both orders round to 56 bytes, and saves 8 in rows where c0 is NULL.
+        plain(
+            "nulltz",
+            vec![ncol("c0", "timetz"), col("c1", "smallint"), ncol("c2", "timetz")],
+        ),
+        // An exact-tier frontier decided by NULLs alone.
+        plain(
+            "nullmac",
+            vec![
+                ncol("c0", "macaddr"),
+                ncol("c1", "macaddr"),
+                ncol("c2", "boolean"),
+                ncol("c3", "smallint"),
+            ],
+        ),
+        // Without NULLs (m, s, t) is never worse; with m NULL a long text pads 2 behind the
+        // smallint while the written order pads at most 1.
+        Fixture {
+            name: "nullslot",
+            columns: vec![ncol("m", "macaddr"), col("t", "text"), col("s", "smallint")],
+            boundary: None,
+            toast_column: None,
+            witness: Some((vec!["m", "s", "t"], vec![("m", "NULL".into()), ("t", long_text())])),
+        },
+        // A NULL float8[] advances 0 bytes where every stored short array advances 5: (a, s, i)
+        // dominates when the array is NOT NULL and pads 2 before i in the rows where it is NULL.
+        Fixture {
+            name: "nullarr",
+            columns: vec![col("i", "integer"), ncol("a", "float8[]"), col("s", "smallint")],
+            boundary: None,
+            toast_column: None,
+            witness: Some((vec!["a", "s", "i"], vec![("a", "NULL".into())])),
+        },
+        // A realistic shape with five nullable columns of four widths.
+        plain(
+            "nullreal",
+            vec![
+                col("id", "bigint"),
+                col("created_at", "timestamptz"),
+                ncol("deleted", "boolean"),
+                ncol("owner_id", "bigint"),
+                ncol("score", "integer"),
+                col("name", "text"),
+                ncol("kind", "smallint"),
+                ncol("updated_at", "timestamptz"),
+                col("payload", "jsonb"),
+                ncol("rank", "integer"),
+            ],
+        ),
+    ];
+    // Issue #4's cols9: rows holding a NULL carry a 32-byte header.
+    let cols9 = (0..9u32)
+        .map(|i| ncol(Box::leak(format!("c{i}").into_boxed_str()), "bigint"))
+        .collect();
+    out.push(plain("nullcols9", cols9));
+    // 24 nullable regular columns written in a padding order: no pair comparison fits a budget,
+    // and the sorted order, which pads zero in every NULL pattern, must still be recommended.
+    let types = ["boolean", "bigint", "smallint", "integer"];
+    let reg24 = (0..24usize)
+        .map(|i| ncol(Box::leak(format!("c{i}").into_boxed_str()), types[i % 4]))
+        .collect();
+    out.push(plain("nullreg24", reg24));
     out
 }
 
@@ -586,21 +719,48 @@ fn analyze(binary: &std::path::Path, sql: &str, extra_args: &[&str]) -> serde_js
     serde_json::from_slice(&out.stdout).expect("rowdiet JSON")
 }
 
-fn create_table_sql(table: &str, columns: &[(&str, &str)]) -> String {
+fn create_table_sql(table: &str, columns: &[Col<'_>]) -> String {
     let cols: Vec<String> = columns
         .iter()
-        .map(|(name, ty)| format!("{name} {} NOT NULL", sql_type_name(ty)))
+        .map(|(name, ty, nullable)| {
+            let constraint = if *nullable { "" } else { " NOT NULL" };
+            format!("{name} {}{constraint}", sql_type_name(ty))
+        })
         .collect();
     format!("CREATE TABLE {table} ({});", cols.join(", "))
 }
 
+/// The padding bounds a workload's rows are held to: over every NULL pattern when it stores
+/// NULLs, else in rows that store every column.
+fn model_bounds(stats: &serde_json::Value, nulls: bool) -> (i64, i64) {
+    let without = &stats["without_nulls"];
+    if !nulls && without.is_object() {
+        (
+            without["min"].as_i64().expect("min"),
+            without["max"].as_i64().expect("max"),
+        )
+    } else {
+        (
+            stats["padding_min"].as_i64().expect("min"),
+            stats["padding_max"].as_i64().expect("max"),
+        )
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &mut Vec<String>) {
-    let current: Vec<(&str, &str)> = fixture.columns.iter().map(|c| (c.name, c.sql_type)).collect();
+    let current: Vec<Col<'_>> = fixture
+        .columns
+        .iter()
+        .map(|c| (c.name, c.sql_type, c.nullable))
+        .collect();
+    let null_order: Vec<&str> = fixture.columns.iter().filter(|c| c.nullable).map(|c| c.name).collect();
     let cur_table = format!("{}{}", prefix(), fixture.name);
     let report = analyze(binary, &create_table_sql(&cur_table, &current), &[]);
     let table_report = &report["analysis"]["tables"][0];
     let avoidable = table_report["avoidable_bytes_per_row"].as_f64().expect("avoidable");
+    // The exact tier decides and reports in row size; the estimate tier in padding.
+    let exact = table_report["tier"].as_str() == Some("exact");
     // Property (d): the gated headline never exceeds the engine's proven maximum saving.
     if table_report["dominance_saving"].is_object() {
         let max_saving = table_report["dominance_saving"]["max"].as_f64().expect("saving max");
@@ -628,10 +788,10 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
     } else {
         None
     };
-    let alt: Option<Vec<(&str, &str)>> = alt_names.as_ref().map(|names| {
+    let alt: Option<Vec<Col<'_>>> = alt_names.as_ref().map(|names| {
         names
             .iter()
-            .map(|n| current.iter().copied().find(|(c, _)| c == n).expect("known column"))
+            .map(|n| current.iter().copied().find(|(c, _, _)| c == n).expect("known column"))
             .collect()
     });
     let alt_table = format!("{}{}_alt", prefix(), fixture.name);
@@ -641,13 +801,7 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
         combined.push_str(&create_table_sql(&alt_table, alt));
     }
     let both = analyze(binary, &combined, &[]);
-    let model_bounds = |index: usize| {
-        let t = &both["analysis"]["tables"][index];
-        (
-            t["current"]["padding_min"].as_i64().expect("min"),
-            t["current"]["padding_max"].as_i64().expect("max"),
-        )
-    };
+    let stats_of = |index: usize| both["analysis"]["tables"][index]["current"].clone();
     pg.query(&format!("DROP TABLE IF EXISTS {cur_table}, {alt_table};\n{combined}"))
         .expect("create tables");
     if let Some(toast) = fixture.toast_column {
@@ -659,33 +813,13 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
         }
         pg.query(&alter).expect("set storage");
     }
-    let workloads: Vec<(String, Workload)> = {
-        let mut w = vec![("short".to_string(), Vec::new())];
-        if let Some(toast) = fixture.toast_column {
-            w.push(("toast".to_string(), vec![(toast, "repeat('y', 4096)".to_string())]));
-        } else {
-            w.push((
-                "long".to_string(),
-                fixture
-                    .columns
-                    .iter()
-                    .filter(|c| is_varlena(c.sql_type))
-                    .map(|c| (c.name, type_spec(c.sql_type, column_seed(c.name)).1))
-                    .collect(),
-            ));
-        }
-        if let Some((cur_wins, alt_wins)) = &fixture.boundary {
-            w.push(("boundary-current".to_string(), cur_wins.clone()));
-            w.push(("boundary-alt".to_string(), alt_wins.clone()));
-        }
-        w
-    };
+    let workloads = workloads(fixture, &null_order);
     let mut means: std::collections::BTreeMap<(String, bool), f64> = std::collections::BTreeMap::new();
-    for (workload, overrides) in &workloads {
+    for (workload, overrides, nulls) in &workloads {
         let measured: Vec<(bool, Measured)> = match &alt {
             Some(alt_cols) => {
-                let insert_cur = insert_sql(&cur_table, &current, workload, overrides, 1200);
-                let insert_alt = insert_sql(&alt_table, alt_cols, workload, overrides, 1200);
+                let insert_cur = insert_sql(&cur_table, &current, workload, overrides, *nulls, 1200);
+                let insert_alt = insert_sql(&alt_table, alt_cols, workload, overrides, *nulls, 1200);
                 pg.query(&format!(
                     "TRUNCATE {cur_table}, {alt_table};\n{insert_cur}\n{insert_alt}"
                 ))
@@ -697,24 +831,55 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
                         fixture.name, paired.stored_differently
                     );
                 }
-                // Property (b): a recommendation is pointwise, so no row may measure worse.
-                if avoidable > 0.0 && paired.saving_min < 0 {
+                // Property (b): a recommendation is pointwise, so no row may measure worse, in
+                // the measure the tier decides in.
+                let (worst, unit) = if exact {
+                    (paired.size_saving_min, "row size")
+                } else {
+                    (paired.saving_min, "padding")
+                };
+                if avoidable > 0.0 && worst < 0 {
                     failures.push(format!(
-                        "{}/{workload}: the recommended order measures worse on some row (saving {}..{}, means {:.3} vs {:.3})",
-                        fixture.name, paired.saving_min, paired.saving_max, paired.alternative.mean, paired.current.mean
+                        "{}/{workload}: the recommended order measures worse in {unit} on some row (padding saving {}..{}, row size saving {}..{})",
+                        fixture.name, paired.saving_min, paired.saving_max, paired.size_saving_min, paired.size_saving_max
                     ));
+                }
+                if exact {
+                    check_row_sizes(
+                        pg,
+                        &cur_table,
+                        &stats_of(0),
+                        &format!("{}/{workload}", fixture.name),
+                        failures,
+                    );
+                    check_row_sizes(
+                        pg,
+                        &alt_table,
+                        &stats_of(1),
+                        &format!("{}/{workload}/alt", fixture.name),
+                        failures,
+                    );
                 }
                 vec![(false, paired.current), (true, paired.alternative)]
             }
             None => {
-                let insert = insert_sql(&cur_table, &current, workload, overrides, 1200);
+                let insert = insert_sql(&cur_table, &current, workload, overrides, *nulls, 1200);
                 pg.query(&format!("TRUNCATE {cur_table};\n{insert}")).expect("insert");
+                if exact {
+                    check_row_sizes(
+                        pg,
+                        &cur_table,
+                        &stats_of(0),
+                        &format!("{}/{workload}", fixture.name),
+                        failures,
+                    );
+                }
                 vec![(false, measure_table(pg, &cur_table, &current))]
             }
         };
         for (is_alt, measured) in measured {
             means.insert((workload.clone(), is_alt), measured.mean);
-            let (model_min, model_max) = model_bounds(usize::from(is_alt));
+            let (model_min, model_max) = model_bounds(&stats_of(usize::from(is_alt)), *nulls != NullFill::Stored);
             println!(
                 "| {} | {} | {} | [{model_min},{model_max}] | {:.3} ({}-{}) | {} |",
                 fixture.name,
@@ -738,16 +903,7 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
         }
     }
     if fixture.boundary.is_some() {
-        let cur_a = means[&("boundary-current".to_string(), false)];
-        let alt_a = means[&("boundary-current".to_string(), true)];
-        let cur_b = means[&("boundary-alt".to_string(), false)];
-        let alt_b = means[&("boundary-alt".to_string(), true)];
-        if !(cur_a < alt_a - 0.01 && alt_b < cur_b - 0.01) {
-            failures.push(format!(
-                "{}: boundary does not flip the winner (current {cur_a:.3} vs alt {alt_a:.3}; then current {cur_b:.3} vs alt {alt_b:.3})",
-                fixture.name
-            ));
-        }
+        check_boundary(fixture, &means, failures);
     }
     // Property (c), band half: every declared band holds row by row on a residue sweep inside it.
     if let (Some(alt_cols), true) = (&alt, table_report["frontier"].is_object()) {
@@ -755,12 +911,165 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
             pg,
             fixture,
             table_report,
-            &current,
-            alt_cols,
-            &cur_table,
-            &alt_table,
+            (&current, alt_cols),
+            (&cur_table, &alt_table),
+            &null_order,
             failures,
         );
+    }
+    if let Some((order, workload)) = &fixture.witness {
+        verify_witness(pg, fixture, table_report, &current, order, workload, failures);
+    }
+}
+
+/// A fixture's workloads: short and long payloads with every column stored, the same with NULL
+/// patterns when a column is nullable, and the boundary pair.
+fn workloads<'a>(fixture: &Fixture, null_order: &'a [&'a str]) -> Vec<(String, Workload, NullFill<'a>)> {
+    let stored = NullFill::Stored;
+    let patterned = NullFill::Pattern {
+        order: null_order,
+        first_bit: 0,
+    };
+    let mut w = vec![("short".to_string(), Vec::new(), stored)];
+    let long: Workload = if let Some(toast) = fixture.toast_column {
+        vec![(toast, "repeat('y', 4096)".to_string())]
+    } else {
+        fixture
+            .columns
+            .iter()
+            .filter(|c| is_varlena(c.sql_type))
+            .map(|c| (c.name, type_spec(c.sql_type, column_seed(c.name)).1))
+            .collect()
+    };
+    let long_name = if fixture.toast_column.is_some() {
+        "toast"
+    } else {
+        "long"
+    };
+    w.push((long_name.to_string(), long.clone(), stored));
+    if !null_order.is_empty() {
+        w.push(("short+nulls".to_string(), Vec::new(), patterned));
+        w.push((format!("{long_name}+nulls"), long, patterned));
+    }
+    if let Some((cur_wins, alt_wins)) = &fixture.boundary {
+        w.push(("boundary-current".to_string(), cur_wins.clone(), stored));
+        w.push(("boundary-alt".to_string(), alt_wins.clone(), stored));
+    }
+    w
+}
+
+/// The boundary pair must flip the measured winner across the frontier boundary.
+fn check_boundary(
+    fixture: &Fixture,
+    means: &std::collections::BTreeMap<(String, bool), f64>,
+    failures: &mut Vec<String>,
+) {
+    let cur_a = means[&("boundary-current".to_string(), false)];
+    let alt_a = means[&("boundary-current".to_string(), true)];
+    let cur_b = means[&("boundary-alt".to_string(), false)];
+    let alt_b = means[&("boundary-alt".to_string(), true)];
+    if !(cur_a < alt_a - 0.01 && alt_b < cur_b - 0.01) {
+        failures.push(format!(
+            "{}: boundary does not flip the winner (current {cur_a:.3} vs alt {alt_a:.3}; then current {cur_b:.3} vs alt {alt_b:.3})",
+            fixture.name
+        ));
+    }
+}
+
+/// Exact tier: rows that store every column take exactly the reported footprint, and rows
+/// holding a NULL carry the reported bitmap header and stay inside the reported size range.
+fn check_row_sizes(pg: &Pg, table: &str, stats: &serde_json::Value, label: &str, failures: &mut Vec<String>) {
+    let sql = format!(
+        "SELECT (h.t_infomask & 1) <> 0, min(h.t_hoff), max(h.t_hoff), min(((h.lp_len + 7) / 8) * 8), max(((h.lp_len + 7) / 8) * 8) \
+         FROM (SELECT p, (heap_page_items(get_raw_page('{table}', p::int))).* \
+               FROM generate_series(0, pg_relation_size('{table}') / 8192 - 1) p) h \
+         WHERE h.lp_len > 0 GROUP BY 1 ORDER BY 1;"
+    );
+    let out = pg.query(&sql).expect("row sizes");
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split('|').collect();
+        let has_null = f[0] == "t";
+        let (hoff_min, hoff_max): (u64, u64) = (f[1].parse().expect("hoff"), f[2].parse().expect("hoff"));
+        let (size_min, size_max): (u64, u64) = (f[3].parse().expect("size"), f[4].parse().expect("size"));
+        let rows = if has_null { "with NULLs" } else { "without NULLs" };
+        let (want_hoff, want_min, want_max) = if has_null {
+            let with_nulls = &stats["with_nulls"];
+            if !with_nulls.is_object() {
+                failures.push(format!(
+                    "{label}: rows with NULLs exist but the report has no with_nulls"
+                ));
+                continue;
+            }
+            (
+                with_nulls["t_hoff"].as_u64().expect("t_hoff"),
+                with_nulls["footprint_min"].as_u64().expect("min"),
+                with_nulls["footprint_max"].as_u64().expect("max"),
+            )
+        } else {
+            let fp = stats["footprint"].as_u64().expect("footprint");
+            (24, fp, fp)
+        };
+        println!(
+            "| {label} | rows {rows} | t_hoff {hoff_min}-{hoff_max} (model {want_hoff}) | [{want_min},{want_max}] | {size_min}-{size_max} B/row | - |"
+        );
+        if hoff_min != want_hoff || hoff_max != want_hoff || size_min < want_min || size_max > want_max {
+            failures.push(format!(
+                "{label}: rows {rows} measure t_hoff {hoff_min}-{hoff_max}, {size_min}-{size_max} B against model t_hoff {want_hoff}, [{want_min},{want_max}]"
+            ));
+        }
+    }
+}
+
+/// An order the tool must not recommend: check the report, then measure the order against the
+/// written one on its witness workload, where some row must come out worse.
+fn verify_witness(
+    pg: &Pg,
+    fixture: &Fixture,
+    table_report: &serde_json::Value,
+    current: &[Col<'_>],
+    order: &[&str],
+    workload: &Workload,
+    failures: &mut Vec<String>,
+) {
+    let suggested: Vec<&str> = table_report["suggested_order"]
+        .as_array()
+        .expect("order")
+        .iter()
+        .map(|v| v.as_str().expect("name"))
+        .collect();
+    if table_report["avoidable_bytes_per_row"].as_f64().expect("avoidable") > 0.0 && suggested == order {
+        failures.push(format!("{}: the order {order:?} is recommended", fixture.name));
+    }
+    let witness: Vec<Col<'_>> = order
+        .iter()
+        .map(|n| current.iter().copied().find(|(c, _, _)| c == n).expect("known column"))
+        .collect();
+    let cur_table = format!("{}{}_wcur", prefix(), fixture.name);
+    let wit_table = format!("{}{}_wit", prefix(), fixture.name);
+    let insert_cur = insert_sql(&cur_table, current, "witness", workload, NullFill::Stored, 1200);
+    let insert_wit = insert_sql(&wit_table, &witness, "witness", workload, NullFill::Stored, 1200);
+    pg.query(&format!(
+        "DROP TABLE IF EXISTS {cur_table}, {wit_table};\n{}\n{}\n{insert_cur}\n{insert_wit}",
+        create_table_sql(&cur_table, current),
+        create_table_sql(&wit_table, &witness)
+    ))
+    .expect("witness tables");
+    let paired = measure_pair(pg, (&cur_table, current), (&wit_table, &witness));
+    println!(
+        "| {} | witness {} | - | - | saving {}..{}, cur {:.3} vs witness {:.3} | {} |",
+        fixture.name,
+        order.join(","),
+        paired.saving_min,
+        paired.saving_max,
+        paired.current.mean,
+        paired.alternative.mean,
+        paired.current.rows
+    );
+    if paired.saving_min >= 0 {
+        failures.push(format!(
+            "{}: the witness order {order:?} measures no worse on any row of its workload",
+            fixture.name
+        ));
     }
 }
 
@@ -769,23 +1078,35 @@ fn run_fixture(pg: &Pg, binary: &std::path::Path, fixture: &Fixture, failures: &
 const BAND_ROWS: u64 = 2048;
 
 /// Measure each declared frontier band on a workload that keeps exactly its `long_form` columns
-/// long and sweeps every varlena's payload residue, then hold the band to its claim row by row:
-/// each row's saving inside the band's bounds, the declared winner's signs (alternative never
-/// worse and better somewhere, current the reverse, tie all zero, mixed both signs), and, where
-/// no long array leaves a residue to compression, the bounds attained exactly.
-#[allow(clippy::too_many_arguments)]
+/// long and sweeps every varlena's payload residue (and, with nullable columns, the NULL
+/// patterns the remaining bits of the row counter reach), then hold the band to its claim row by
+/// row: each row's
+/// saving inside the band's bounds, the declared winner's signs (alternative never worse and
+/// better somewhere, current the reverse, tie all zero, mixed both signs), and, where no long
+/// array leaves a residue to compression and no column is nullable, the bounds attained exactly.
+/// Savings count padding, or row size when the frontier was decided in row size.
 fn verify_bands(
     pg: &Pg,
     fixture: &Fixture,
     table_report: &serde_json::Value,
-    current: &[(&str, &str)],
-    alt_cols: &[(&str, &str)],
-    cur_table: &str,
-    alt_table: &str,
+    (current, alt_cols): (&[Col<'_>], &[Col<'_>]),
+    (cur_table, alt_table): (&str, &str),
+    null_order: &[&str],
     failures: &mut Vec<String>,
 ) {
     let bands = table_report["frontier"]["bands"].as_array().expect("bands");
+    let row_size = table_report["frontier"]["measure"].as_str() == Some("row_size");
     let varlenas: Vec<&Column> = fixture.columns.iter().filter(|c| is_varlena(c.sql_type)).collect();
+    // The residue sweep takes three bits of the row counter per varlena, up to nine; NULL
+    // patterns take the next ones.
+    let nulls = if null_order.is_empty() {
+        NullFill::Stored
+    } else {
+        NullFill::Pattern {
+            order: null_order,
+            first_bit: 3 * varlenas.len().min(3) as u32,
+        }
+    };
     for band in bands {
         let winner = band["winner"].as_str().expect("winner");
         let (min_saving, max_saving) = (
@@ -798,7 +1119,7 @@ fn verify_bands(
             .iter()
             .map(|v| v.as_str().expect("column name"))
             .collect();
-        let mut controllable = true;
+        let mut controllable = null_order.is_empty();
         let overrides: Workload = varlenas
             .iter()
             .enumerate()
@@ -814,8 +1135,8 @@ fn verify_bands(
                 (c.name, generator)
             })
             .collect();
-        let insert_cur = insert_sql(cur_table, current, "band", &overrides, BAND_ROWS);
-        let insert_alt = insert_sql(alt_table, alt_cols, "band", &overrides, BAND_ROWS);
+        let insert_cur = insert_sql(cur_table, current, "band", &overrides, nulls, BAND_ROWS);
+        let insert_alt = insert_sql(alt_table, alt_cols, "band", &overrides, nulls, BAND_ROWS);
         pg.query(&format!(
             "TRUNCATE {cur_table}, {alt_table};\n{insert_cur}\n{insert_alt}"
         ))
@@ -826,16 +1147,19 @@ fn verify_bands(
         } else {
             long_form.join("+")
         };
+        let (lo, hi) = if row_size {
+            (paired.size_saving_min, paired.size_saving_max)
+        } else {
+            (paired.saving_min, paired.saving_max)
+        };
         println!(
-            "| {} | band | {band_label} -> {winner} [{min_saving},{max_saving}] | - | saving {}..{}, cur {:.3} vs alt {:.3} | {} |",
+            "| {} | band | {band_label} -> {winner} [{min_saving},{max_saving}]{} | - | saving {lo}..{hi}, cur {:.3} vs alt {:.3} | {} |",
             fixture.name,
-            paired.saving_min,
-            paired.saving_max,
+            if row_size { " row size" } else { "" },
             paired.current.mean,
             paired.alternative.mean,
             paired.current.rows
         );
-        let (lo, hi) = (paired.saving_min, paired.saving_max);
         if lo < min_saving || hi > max_saving {
             failures.push(format!(
                 "{}: band [{band_label}] measures savings {lo}..{hi} outside its bounds [{min_saving},{max_saving}]",
@@ -867,25 +1191,52 @@ fn verify_bands(
     }
 }
 
+/// What nullable columns hold in a workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NullFill<'a> {
+    /// A value in every row.
+    Stored,
+    /// NULL by a per-column bit of the row counter, numbered by the column's place in `order`
+    /// (the fixture's nullable columns) so every order of a table holds the same rows.
+    Pattern { order: &'a [&'a str], first_bit: u32 },
+}
+
 fn insert_sql(
     table: &str,
-    columns: &[(&str, &str)],
+    columns: &[Col<'_>],
     workload: &str,
     overrides: &[(&str, String)],
+    nulls: NullFill<'_>,
     rows: u64,
 ) -> String {
-    let names: Vec<&str> = columns.iter().map(|(n, _)| *n).collect();
+    let names: Vec<&str> = columns.iter().map(|(n, _, _)| *n).collect();
     let exprs: Vec<String> = columns
         .iter()
-        .map(|(name, ty)| {
-            if let Some((_, expr)) = overrides.iter().find(|(n, _)| n == name) {
-                return expr.clone();
-            }
-            let (short, long) = type_spec(ty, column_seed(name));
-            if workload != "short" && is_varlena(ty) {
-                long
+        .map(|(name, ty, _)| {
+            let expr = if let Some((_, expr)) = overrides.iter().find(|(n, _)| n == name) {
+                expr.clone()
             } else {
-                short
+                let (short, long) = type_spec(ty, column_seed(name));
+                if !workload.starts_with("short") && is_varlena(ty) {
+                    long
+                } else {
+                    short
+                }
+            };
+            let bit = match nulls {
+                NullFill::Pattern { order, first_bit } => order
+                    .iter()
+                    .position(|n| n == name)
+                    .map(|k| first_bit + (k as u32) % 10),
+                NullFill::Stored => None,
+            };
+            match bit {
+                Some(bit) => format!(
+                    "CASE WHEN (g / {}) % 2 = 1 THEN NULL ELSE ({expr})::{} END",
+                    1u64 << bit,
+                    sql_type_name(ty)
+                ),
+                None => expr,
             }
         })
         .collect();
@@ -896,22 +1247,27 @@ fn insert_sql(
     )
 }
 
-/// Per-row padding: the tuple length minus the header and every attribute's stored bytes. Each
-/// row also carries its values (`key`, in column-name order, numbered within duplicates) to pair
-/// it with the same row of another order, and its stored sizes (`forms`, same order) to tell
-/// whether the toaster stored it the same way there.
-fn row_pads_sql(table: &str, columns: &[(&str, &str)]) -> String {
-    let mut by_name: Vec<(usize, &str)> = columns.iter().enumerate().map(|(i, (n, _))| (i, *n)).collect();
+/// Per-row padding: the tuple length minus the header and every attribute's stored bytes, and
+/// the row size (the tuple length rounded up to 8). Each row also carries its values (`key`, in
+/// column-name order, numbered within duplicates, NULL spelled out) to pair it with the same row
+/// of another order, and its stored sizes (`forms`, same order, -1 for NULL) to tell whether the
+/// toaster stored it the same way there.
+fn row_pads_sql(table: &str, columns: &[Col<'_>]) -> String {
+    let mut by_name: Vec<(usize, &str)> = columns.iter().enumerate().map(|(i, (n, _, _))| (i, *n)).collect();
     by_name.sort_by_key(|(_, n)| *n);
-    let key: Vec<String> = by_name.iter().map(|(_, n)| format!("t.{n}::text")).collect();
+    let key: Vec<String> = by_name
+        .iter()
+        .map(|(_, n)| format!("coalesce(t.{n}::text, '\\N')"))
+        .collect();
     let forms: Vec<String> = by_name
         .iter()
-        .map(|(i, _)| format!("length(h.t_attrs[{}])", i + 1))
+        .map(|(i, _)| format!("coalesce(length(h.t_attrs[{}]), -1)", i + 1))
         .collect();
     format!(
         "SELECT k.key, row_number() OVER (PARTITION BY k.key ORDER BY h.p, h.lp) AS dup, \
                 ARRAY[{forms}] AS forms, \
-                h.lp_len - h.t_hoff - (SELECT sum(length(a)) FROM unnest(h.t_attrs) a) AS pad \
+                h.lp_len - h.t_hoff - (SELECT coalesce(sum(length(a)), 0) FROM unnest(h.t_attrs) a) AS pad, \
+                ((h.lp_len + 7) / 8) * 8 AS size \
          FROM (SELECT p, (heap_page_item_attrs(get_raw_page('{table}', p::int), '{table}'::regclass)).* \
                FROM generate_series(0, pg_relation_size('{table}') / 8192 - 1) p) h \
          JOIN {table} t ON t.ctid = format('(%s,%s)', h.p, h.lp)::tid \
@@ -922,7 +1278,7 @@ fn row_pads_sql(table: &str, columns: &[(&str, &str)]) -> String {
     )
 }
 
-fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)]) -> Measured {
+fn measure_table(pg: &Pg, table: &str, columns: &[Col<'_>]) -> Measured {
     let sql = format!(
         "SELECT count(*), round(avg(pad)::numeric, 3), min(pad), max(pad) FROM ({}) x;",
         row_pads_sql(table, columns)
@@ -941,14 +1297,16 @@ fn measure_table(pg: &Pg, table: &str, columns: &[(&str, &str)]) -> Measured {
 /// stored the same way in both orders: it compresses or moves out the largest attribute first
 /// and breaks ties by attribute number, so a row near its size threshold or with tied sizes can
 /// realize differently in two orders, and the model's claims are per realization.
-fn measure_pair(pg: &Pg, cur: (&str, &[(&str, &str)]), alt: (&str, &[(&str, &str)])) -> Paired {
+fn measure_pair(pg: &Pg, cur: (&str, &[Col<'_>]), alt: (&str, &[Col<'_>])) -> Paired {
     let sql = format!(
-        "WITH c AS ({}), a AS ({}), j AS (SELECT c.pad AS cp, a.pad AS ap, c.forms = a.forms AS same \
+        "WITH c AS ({}), a AS ({}), j AS (SELECT c.pad AS cp, a.pad AS ap, c.size AS cs, a.size AS asz, \
+                                            c.forms = a.forms AS same \
                                      FROM c JOIN a USING (key, dup)) \
          SELECT (SELECT count(*) FROM j), (SELECT count(*) FROM c), (SELECT count(*) FROM a), \
                 round(avg(cp)::numeric, 3), min(cp), max(cp), \
                 round(avg(ap)::numeric, 3), min(ap), max(ap), \
                 min(cp - ap) FILTER (WHERE same), max(cp - ap) FILTER (WHERE same), \
+                min(cs - asz) FILTER (WHERE same), max(cs - asz) FILTER (WHERE same), \
                 count(*) FILTER (WHERE NOT same) \
          FROM j;",
         row_pads_sql(cur.0, cur.1),
@@ -978,7 +1336,9 @@ fn measure_pair(pg: &Pg, cur: (&str, &[(&str, &str)]), alt: (&str, &[(&str, &str
         alternative: measured(f[6], f[7], f[8]),
         saving_min: f[9].parse().expect("saving min"),
         saving_max: f[10].parse().expect("saving max"),
-        stored_differently: f[11].parse().expect("differing rows"),
+        size_saving_min: f[11].parse().expect("size saving min"),
+        size_saving_max: f[12].parse().expect("size saving max"),
+        stored_differently: f[13].parse().expect("differing rows"),
     }
 }
 

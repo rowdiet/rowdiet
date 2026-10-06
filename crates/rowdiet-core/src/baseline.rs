@@ -141,6 +141,15 @@ pub struct GateOutcome {
     pub skipped_statements: usize,
     /// Non-ignored tables marked incomplete (skipped or unexpanded DDL touched them).
     pub incomplete_tables: usize,
+    /// Non-ignored complete tables whose dominance search ran out of budget: findings there
+    /// stand, but a clean verdict says only that the searched candidates hold no dominating
+    /// reorder. [`fail_on_budgeted`](Self::fail_on_budgeted) turns them into a failure.
+    pub budgeted_tables: usize,
+    /// The gate failed because the analysis degraded under `fail_on_degraded`.
+    pub failed_on_degraded: bool,
+    /// The gate failed because a dominance search was budgeted, under
+    /// [`fail_on_budgeted`](Self::fail_on_budgeted).
+    pub failed_on_budgeted: bool,
     /// Scanned paths that matched no SQL files at all — a typo'd migrations directory would
     /// otherwise gate green forever having analyzed nothing.
     pub empty_scans: usize,
@@ -160,6 +169,14 @@ impl GateOutcome {
     /// green.
     pub fn degraded(&self) -> bool {
         self.skipped_statements > 0 || self.incomplete_tables > 0 || self.empty_scans > 0
+    }
+
+    /// Fail the gate when some table's dominance search was budgeted. Separate from
+    /// `fail_on_degraded` because a budget binds on ordinary tables (42% of a 3,000-table corpus
+    /// of 4 to 8 realistic columns), while a parser skip is rare and fixable.
+    pub fn fail_on_budgeted(&mut self) {
+        self.failed_on_budgeted = self.budgeted_tables > 0;
+        self.exceeded |= self.failed_on_budgeted;
     }
 }
 
@@ -201,6 +218,7 @@ pub fn evaluate(
         .filter(|n| n.kind == crate::fold::NoteKind::SkippedStatement)
         .count();
     let incomplete_tables = analysis.gated_tables().filter(|t| t.incomplete).count();
+    let budgeted_tables = analysis.gated_tables().filter(|t| t.budgeted()).count();
     let empty_scans = analysis
         .notes
         .iter()
@@ -210,12 +228,16 @@ pub fn evaluate(
         exceeded: false,
         skipped_statements,
         incomplete_tables,
+        budgeted_tables,
+        failed_on_degraded: false,
+        failed_on_budgeted: false,
         empty_scans,
         verdicts,
         orphaned,
         expired,
     };
-    outcome.exceeded = outcome.verdicts.values().any(|v| v.failing()) || (fail_on_degraded && outcome.degraded());
+    outcome.failed_on_degraded = fail_on_degraded && outcome.degraded();
+    outcome.exceeded = outcome.verdicts.values().any(|v| v.failing()) || outcome.failed_on_degraded;
     outcome
 }
 

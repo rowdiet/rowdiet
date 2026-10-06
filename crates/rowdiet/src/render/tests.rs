@@ -422,3 +422,154 @@ fn step_summary_cells_render_no_html_or_markdown_from_names() {
         "{summary}"
     );
 }
+
+#[test]
+fn exact_tier_with_nulls_prints_both_row_scenarios() {
+    let analysis = analyze(
+        "CREATE TABLE t (b1 boolean NOT NULL, b2 boolean NOT NULL, n integer, z timetz NOT NULL);
+         CREATE TABLE cols9 (c1 int8,c2 int8,c3 int8,c4 int8,c5 int8,c6 int8,c7 int8,c8 int8,c9 int8);",
+    );
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("current  : 2 B padding, 48 B/row footprint, 157 rows/8kB page without NULLs; 2-6 B padding, 48 B/row with NULLs (24 B header)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("saves 0-8 B/row in every realization"), "{rendered}");
+    assert!(
+        rendered.contains("NULLs move later offsets in: n (NOT NULL removes that variable)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains(EXACT_NULLS_LABEL), "{rendered}");
+    assert!(
+        rendered.contains("✓ cols9 (V1__init.sql:2) — optimal: zero padding in every NULL pattern; 0 B padding, 96 B/row footprint, 81 rows/8kB page without NULLs; 0 B padding, 32-96 B/row with NULLs (32 B header)"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn frontier_prints_the_rows_without_nulls() {
+    let analysis = analyze("CREATE TABLE t (m macaddr, t text NOT NULL, s smallint NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.contains("frontier : m, s, t"), "{rendered}");
+    assert!(
+        rendered.contains("in rows without NULLs the alternative wins (saves 0-3 B/row)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("depends on payload lengths mod 8 and which columns hold NULL"),
+        "a NULL variable is named as what decides: {rendered}"
+    );
+    assert!(!rendered.contains("FAIL:"), "a frontier never gates: {rendered}");
+}
+
+#[test]
+fn an_exact_tier_frontier_names_nulls_and_row_size() {
+    // Four nullable fixed columns: the reorder saves a row-size rung when every column is
+    // stored and loses one in some NULL patterns, so it is a frontier decided by NULLs alone.
+    let analysis = analyze("CREATE TABLE t (c0 macaddr, c1 macaddr, c2 boolean, c3 smallint);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.contains("frontier : c0, c3, c1, c2"), "{rendered}");
+    assert!(
+        rendered.contains("winner in row size depends on which columns hold NULL (-8 to 8 B/row)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("in rows without NULLs the alternative wins in row size (saves 8-8 B/row)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("payload"), "no varlena here: {rendered}");
+}
+
+#[test]
+fn estimate_line_shows_the_no_null_range_when_it_differs() {
+    let analysis = analyze("CREATE TABLE t (s smallint NOT NULL, n smallint, i integer NOT NULL, t text NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains(
+            "current  : 0.0 B/row expected padding (0 B deterministic, range 0-2, 0-0 without NULLs, data-dependent)"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains(ESTIMATE_LABEL), "{rendered}");
+    assert!(ESTIMATE_LABEL.contains("NULL"));
+}
+
+#[test]
+fn a_budgeted_search_is_counted_and_can_fail_the_gate() {
+    let cols: Vec<String> = (0..12).map(|i| format!("t{i} text, i{i} integer NOT NULL")).collect();
+    let analysis = analyze(&format!("CREATE TABLE wide ({});", cols.join(", ")));
+    assert!(
+        analysis.tables[0].budgeted(),
+        "{:?}",
+        analysis.tables[0].dominance_search
+    );
+    let mut outcome = gate(&analysis, Some(1000.0));
+    assert_eq!(outcome.budgeted_tables, 1);
+    assert!(!outcome.degraded(), "a budget is not a parse degradation");
+    let rendered = text(&analysis, None, false, &outcome);
+    assert!(
+        rendered.contains("budgeted: 1 table(s) where the dominance search hit its budget"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("pass --fail-on-budgeted to gate on this"),
+        "{rendered}"
+    );
+    assert!(!outcome.exceeded);
+    outcome.fail_on_budgeted();
+    assert!(outcome.exceeded, "--fail-on-budgeted fails on a budgeted search");
+    let rendered = text(&analysis, None, false, &outcome);
+    assert!(
+        rendered.contains("FAIL: 1 table(s) with a budgeted dominance search (--fail-on-budgeted)"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("--fail-on-degraded)"), "{rendered}");
+    assert!(!rendered.contains("pass --fail-on-budgeted"), "{rendered}");
+}
+
+#[test]
+fn a_budgeted_clean_table_that_can_pad_is_not_checked_off() {
+    // Certain padding left behind a budgeted dominance search, as behind a capped order search.
+    let analysis = analyze(
+        "CREATE TABLE g990 (c0 int2, c1 varchar(20) NOT NULL, c2 int8, c3 text, c4 timestamptz, \
+         c5 uuid, c6 int2, c7 int4);",
+    );
+    let t = &analysis.tables[0];
+    assert!(t.budgeted() && t.avoidable_bytes_per_row == 0.0 && t.current.padding > 0);
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(rendered.starts_with("◐ g990"), "{rendered}");
+}
+
+#[test]
+fn json_carries_the_null_model() {
+    let analysis = analyze("CREATE TABLE t (b1 boolean NOT NULL, b2 boolean NOT NULL, n integer, z timetz NOT NULL);");
+    let rendered = json(&analysis, Some(0.0), &gate(&analysis, Some(0.0))).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let t = &value["analysis"]["tables"][0];
+    assert_eq!(t["null_variables"], serde_json::json!(["n"]));
+    assert_eq!(
+        t["current"]["with_nulls"],
+        serde_json::json!({"t_hoff": 24, "footprint_min": 48, "footprint_max": 48})
+    );
+    assert_eq!(t["current"]["without_nulls"], serde_json::json!({"min": 2, "max": 2}));
+    assert_eq!(t["current"]["padding"], 2);
+    assert_eq!(
+        (t["current"]["padding_min"].clone(), t["current"]["padding_max"].clone()),
+        (2.into(), 6.into())
+    );
+    assert_eq!(t["dominance_saving"], serde_json::json!({"min": 0, "max": 8}));
+}
+
+#[test]
+fn null_variable_names_print_escaped() {
+    let analysis = analyze("CREATE TABLE t (\"n\n::error::NULLVAR\" smallint, i integer NOT NULL, x text NOT NULL);");
+    let rendered = text(&analysis, None, false, &gate(&analysis, Some(0.0)));
+    assert!(
+        rendered.contains("NULLs move later offsets in: n\\n::error::NULLVAR"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.lines().any(|l| l.trim_start().starts_with("::")),
+        "{rendered}"
+    );
+}

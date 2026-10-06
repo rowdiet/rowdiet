@@ -36,7 +36,8 @@ split (tolerant, hand-rolled)  →  extract (sqlparser 0.62, the ONLY AST-touchi
 
 ## The offset model (what the numbers mean)
 
-All row numbers assume every column non-NULL. Varlena payload bytes are never counted toward
+A realization fixes what the DDL leaves open: each varlena's storage form and payload length,
+and whether each nullable column holds a NULL. Varlena payload bytes are never counted toward
 sizes (they are unknowable from DDL), but they determine the offset residue mod 8 that every
 later column aligns against — the total payload is order-invariant while its effect on
 downstream padding is order-dependent. The walk therefore carries the offset as a set of possible
@@ -54,7 +55,30 @@ A varlena has three on-disk forms, and only one of them pads. Postgres packs any
 `(float8, timestamp, int4, text×5)` table with short payloads is flat at zero padding, and
 4 kB `STORAGE EXTERNAL` payloads leave 18-byte unaligned pointers.
 
-Expected values rest on two stated assumptions, both printed in the estimate tier's label, and
+NULLs are realization variables too (issue #12). A NULL stores neither its value nor a pad
+(`heap_fill_tuple` skips the attribute and only clears its bitmap bit), so a nullable column
+moves later offsets by its pad and length in the rows that store it and by nothing in the rows
+that do not. For a fixed column that is a NULL bit of its own. For a varlena a NULL advances 0
+bytes mod 8, which is what a short value with a 7-byte payload advances. Text takes such
+payloads, so its NULL adds nothing. Numeric and array payloads never do (numeric payloads are
+even, so a short numeric advances an odd number of bytes; a short `float8[]` advances 5), so a
+nullable numeric or array gets the NULL as a realization of its own: the engine adds residue 7
+to a nullable varlena's short-form set, whatever its type narrows that set to.
+`(i int4, a float8[], s int2)` shows why it matters: `(a, s, i)` dominates while `a` is NOT
+NULL, and pads 2 before `i` in every row where a nullable `a` holds NULL (measured). The columns
+whose NULL is a step no value takes are listed in `null_variables`, and `NOT NULL` is a
+constraint that removes one.
+
+The walk (`layout::walk`) and the `padding`, `pad_before` and `offset` fields describe rows that
+store every column. Bounds come from `dominance::summary`, which walks the eight offset residues
+over every realization, NULLs included, because once a NULL can skip a column the per-column
+extremes stop composing (`(bool, int2 NULL, int4)` pads 1 or 3, never 0 or 4). Where the rows
+without NULLs have other bounds, they are reported beside them (`without_nulls`). A pad is
+deterministic in the gate's sense (`avoidable_deterministic`) only when it has one value in
+every row that stores its column under every NULL pattern (`layout::certain_padding`), so a pad
+behind a nullable fixed column stays deterministic only if an alignment restores it.
+
+Expected values rest on three stated assumptions, all printed in the estimate tier's label, and
 they are **display only** — nothing gates, recommends, or rewrites on them (see the decision
 policy below and the impossibility section for why):
 
@@ -64,17 +88,28 @@ policy below and the impossibility section for why):
 2. **Offset residues after a varlena are taken as uniformly likely.** Real payload-width
    distributions can be skewed mod 8 (fixed-length codes; a TOAST pointer pins the residue
    entirely), which moves later fixed-column pads inside the reported min/max range.
+3. **No column holds a NULL.** NULL frequencies are workload facts, so the expectation describes
+   the rows that store every column.
 
-The min/max bounds hold without either assumption: they range over every residue and every
-storage form, and both ends are jointly achievable across a walk (each varlena resets the
-reachable set to full, so per-column extremes compose; pinned by an enumeration test that
-simulates concrete tuples).
+The min/max bounds hold without any assumption: they range over every residue, storage form,
+and NULL pattern, and both ends are attained (pinned by enumeration tests that simulate concrete
+tuples, NULLs included, varlena NULLs among them).
 
 Tiers:
 
 - **Exact** — table has only fixed-width columns. Padding and footprint are byte-exact
   (fixed-width values are never toasted/compressed). Headline = MAXALIGN-rounded footprint delta;
   `avoidable == 0` whenever the reorder doesn't cross an 8-byte rung, even if raw padding drops.
+  With nullable columns every row is still byte-exact, but which columns a row stores varies:
+  the label reads `exact per NULL pattern`, the footprint is reported for rows that store every
+  column and as a range for rows holding a NULL (with their bitmap header, `with_nulls`), and
+  the decision policy below runs in row size instead of padding. A padding comparison would
+  miss reorders that pad more somewhere without ever adding a row-size rung:
+  `(c0 timetz NULL, c1 int2, c2 timetz NULL)` measures 56 vs 56 B with every column stored and
+  48 vs 40 B with `c0` NULL, so `(c0, c2, c1)` dominates in row size although it pads 2 more in
+  the first case. Searching, the absence claim, frontier bands and the no-NULL row all count row
+  size there. The headline is the largest row-size saving over NULL patterns, with the saving
+  every row gets as its deterministic part.
 - **Estimate** — any varlena present. Headline = deterministic plus dominance-proven avoidable
   padding (the decision policy below). The min/max range is the guaranteed envelope; expected
   values are display fields.
@@ -88,9 +123,13 @@ number presented alone would overclaim for the as-written order.
 
 Null bitmap: present per-row when the row has a NULL, sized by table natts
 (`t_hoff 24 → 32` at 9 columns, → 40 at 73). Order-invariant, so it never changes reorder
-advice. The all-non-NULL assumption uses `t_hoff = 24` — except after `DROP COLUMN`, where the
-bitmap is unconditionally present in new rows (dropped attributes are stored as NULL forever),
-so the walk uses `t_hoff = null_thoff(original natts)`; see Folding semantics.
+advice: both orders of one realization share the header, which is also why a row-size
+difference is the padding difference plus the trailing MAXALIGN rounding. Rows that store every
+column use `t_hoff = 24`, except after `DROP COLUMN`, where the bitmap is unconditionally
+present in new rows (dropped attributes are stored as NULL forever), so the walk uses
+`t_hoff = null_thoff(original natts)`; see Folding semantics. The exact tier reports the header
+of NULL-carrying rows beside their size range (`with_nulls`), which is where the 9-column cliff
+of issue #4 shows: in a nullable `cols9` a one-NULL row stays at 96 bytes.
 
 ## Why no point prior can rank varlena orders (issue #10, condensed)
 
@@ -114,9 +153,9 @@ realization-independent facts only.
 
 Three rungs, in order:
 
-1. **Dominance (gate + recommend).** Order A dominates order B when A's total padding is less
-   than or equal to B's in **every** realization of storage forms and payload lengths, and
-   strictly less in at least one. A reorder is recommended, and gates, only on dominance. Much
+1. **Dominance (gate + recommend).** Order A dominates order B when A's total padding (row size
+   at the exact tier) is less than or equal to B's in **every** realization of storage forms,
+   payload lengths, and NULLs, and strictly less in at least one. A reorder is recommended, and gates, only on dominance. Much
    resolves here: repacking the fixed block with the varlena tail preserved dominates (the
    never-negative-recovery induction), and the search finds stronger wins such as handing a
    varlena the one guaranteed-aligned slot with char-aligned columns parked behind it —
@@ -141,28 +180,51 @@ labeled on clean lines and finding lines alike.
 
 **The dominance engine** (`dominance.rs`) computes exact bounds of `pad(A) − pad(B)` over all
 realizations. Padding depends on a realization only through each varlena's (form, payload mod
-8), so: when both orders keep the varlenas in the same relative sequence, a joint walk over the
-pair of offset residues (64 states, extremes merged per state) is exact at any column count;
-otherwise exhaustive enumeration runs within a budget (about 2M assignments), and past it the
-pair is reported as undecided (`dominance_search: budgeted`), never a guess. Both engines walk
-each fixed run through a per-residue table, so a comparison costs a step per varlena at any
-width. Frontier bands fix each varlena's form (up to 6 long-capable varlenas, else the frontier
-prints without band detail) and reuse the same engines.
+8) and each nullable column's NULL, so: when both orders keep the varlenas in the same relative
+sequence, a joint walk over the pair of offset residues (64 states, extremes merged per state)
+is exact at any column count. A nullable fixed column the two orders place at different points
+carries its NULL bit in the state from its first placement to its second (the state then holds
+everything the rest of either walk depends on, so merging stays exact); each bit in flight
+doubles the states, and past 12 bits the pair goes to the enumeration. Otherwise exhaustive
+enumeration runs within a budget (about 2M assignments, counting up to 16 per varlena and 2 per
+nullable fixed column), and past it the pair is reported as undecided
+(`dominance_search: budgeted`), never a guess. Both engines walk each run of NOT NULL fixed
+columns through a per-residue table, so a comparison costs a step per varlena and per nullable
+column at any width. The same engines total row size (padding plus the trailing MAXALIGN
+rounding) for the exact tier. Frontier bands fix each varlena's form (up to 6 long-capable
+varlenas, else the frontier prints without band detail), range over every payload and NULL
+pattern, and reuse the same engines; a frontier also carries the comparison in rows without
+NULLs (`without_nulls`) where it differs, and names what a mixed band turns on (payload
+lengths, NULLs, or both).
 
-**The dominance sweep** is what makes the clean verdict a proof. Fixed columns of one padding
-class are pointwise interchangeable (they carry no realization variable, and their pads depend
-only on (alignment, len mod 8) and the offset residue), so one representative arrangement stands
-for all of them. Varlenas get no such collapse: a realization assigns each varlena column its
+One proof needs no pair at all. Nothing costs less than zero padding, so an order that pads
+zero in every realization (`dominance::summary` reports a maximum of 0) is never worse than any
+other order, and it saves exactly what the other order pads, realization by realization; in row
+size the same holds for an order whose rows are never larger than the same row unpadded. The
+sweep and the fallback candidates apply this before any comparison, which is what keeps wide
+nullable tables gated: past 12 NULL bits in flight and 2M realizations no pair comparison fits,
+while the alignment-sorted order of regular types pads zero under every NULL pattern. On the
+stack review's 300 random fixed-width tables of 15 to 40 columns, 80% nullable, every table is
+flagged (the previous revision of this change, without the proof, flagged 154), every suggestion pads zero in
+every NULL pattern, and the 24-column table measured on PostgreSQL 16 holds: the sorted order
+is never larger over 400 NULL patterns and smaller in 397.
+
+**The dominance sweep** is what makes the clean verdict a proof. `NOT NULL` fixed columns of one
+padding class are pointwise interchangeable (they carry no realization variable, and their pads
+depend only on (alignment, len mod 8) and the offset residue), so one representative arrangement
+stands for all of them. Nullable fixed columns carry their own NULL and stay individuals, like
+varlenas. Varlenas get no such collapse: a realization assigns each varlena column its
 own payload, so swapping two same-class varlena columns changes padding pointwise: in
 `(t1, m1, t2, m2)` the order `(m1, t2, t1, m2)` dominates while its class-sequence twin
 `(m1, t1, t2, m2)` measures 4 B/row worse at t1 = 132 B. `layout::order_space` therefore
-collapses fixed classes only and keeps every varlena an individual, which makes it
+collapses `NOT NULL` fixed classes only and keeps every varlena and every nullable column an
+individual, which makes it
 pointwise-complete: if any reorder dominates the current order, some member attains identical
 padding in every realization. The sweep tests every member against the current order (up to
 5,040 sequences, 4M materialized column slots, and a comparison-work budget), pruning candidates
 that fail a necessary condition for free: dominance implies <= on the worst case, the best case,
 and the mean over any sub- distribution of realizations, and `dominance::summary` computes all
-three over the same realization model the comparison uses. Members that keep same-class varlenas
+three over the same realization model the comparison uses. Members that keep same-class varlenas and same-class nullable fixed columns
 in written order (the class sequences an earlier, collapsed sweep tested) go first, in that
 sweep's order, then the rest by ascending worst case, so a trimmed sweep keeps every finding the
 collapsed sweep made. A completed sweep reports `dominance_search: exhaustive` and the clean
@@ -171,8 +233,17 @@ licenses; anything trimmed reports `budgeted` and says "found" instead. A trimme
 sweep still tests the search poles, the current order with its leading fixed run repacked, and
 every fixed column first with the varlenas in written order; the last two keep the varlena
 sequence, so the joint walk decides them exactly at any width, and a dominating pole is always
-recommended, never printed as a frontier. Scalar-objective poles alone were measured to miss
-11-19% of dominating reorders on 4-5 column varlena schemas, which is why the sweep exists.
+recommended, never printed as a frontier. After those it sweeps every order that keeps the
+written varlena sequence and moves only fixed columns (`layout::sequence_space`, `NOT NULL`
+classes collapsed, up to 40,320 orders), ranked by worst case behind the same prunes and bounded
+by the same work budget. On the stack delta review's 3,000 realistic tables of 4 to 8 columns, 378
+budgeted tables were clean before this sweep; 229 of them have a dominating order of that shape,
+226 are now findings (the 721 budgeted findings that an independent enumeration could check all
+dominate with the reported saving range), and the corpus takes 50 s, as before. `rev_g534`'s
+suggestion measures 21,884 B smaller over 4,000 rows on PostgreSQL 16 and never larger on a row.
+A clean budgeted table whose certain padding is above zero prints `◐`, like a capped one.
+Scalar-objective poles alone were measured to miss 11-19% of dominating reorders on 4-5 column
+varlena schemas, which is why the sweep exists.
 Coverage, measured on 40,733 random five-column tables over an 11-type pool and 6,000 random
 tables of 6 to 12 columns: the sweep completes for every table of up to six columns with at most
 three varlenas and every seven-column table with at most two; at five columns, 36% of tables
@@ -196,9 +267,12 @@ silent pass at exactly 25 columns. Past the budget the search degrades to the fi
 block search (bounded by `Π(count+1) × 8 <= 2^23` singleton states, 64 MB of memo, at any
 column count), and past that to the better of the plain sort and a greedy packing that takes,
 column by column, the class padding least from the current offset (it pairs `timetz` with
-`int4` and `macaddr` with `int2`, which the sort keeps apart). The exact tier takes the certainty
-pole, which is the padding minimum whenever the search completed, and labels a capped search
-`budgeted`; a capped table that still pads prints `◐` with what was searched, never `✓`.
+`int4` and `macaddr` with `int2`, which the sort keeps apart). The exact tier without nullable
+columns takes the certainty pole, which is the padding minimum whenever the search completed,
+and labels a capped search `budgeted`; a capped table that still pads prints `◐` with what was
+searched, never `✓`. The search does not see NULLs: its poles optimize the rows that store every
+column, and the decision policy verifies every pole over every NULL pattern like any other
+candidate.
 The scope is `complete` / `fixed_prefix` / `sort_only` in the JSON and labeled on both clean
 and finding lines, because a capped search claiming nothing was avoidable is the worst defect
 this tool can have.
@@ -246,8 +320,9 @@ Sort key of the heuristic pole: `(fixed=0 | varlena=1 | always-short=2, alignmen
 irregular-last, original index)`. Irregulars are fixed types whose size isn't a multiple of
 their own alignment — exactly `timetz (12,d)` and `macaddr (6,i)` among built-ins (also
 `tid (6,s)`); putting them last in their group keeps every following smaller-alignment column
-aligned. For all-regular schemas the heuristic expects zero padding under any NULL mask (a
-subsequence of a desc-aligned regular sequence is still one), and a heuristic order achieving
+aligned. For all-regular schemas the heuristic pads zero under any NULL mask (a subsequence of
+a desc-aligned regular sequence is still one, and `dominance::summary` proves it per table), and
+a heuristic order achieving
 zero deterministic and zero worst-case padding is the proven global minimum of both
 lexicographic objectives, so the search completes without running. `refine_fixed_block` repairs
 irregular blocks exactly (`timetz, int4, timetz` is zero where the sort pads 4) with the
@@ -328,9 +403,10 @@ about everything new. Design points, in the order they were decided:
   baseline" — while the same new columns would fail on any fresh table. Entries record
   `{bytes, layout}` where `layout` is the ordered resolved-kind sequence (`f{len}{align}` per
   fixed column, `v{align}` + `p` for proven-short varlena, comma-joined: `f8d,f4i,vi,vip`) —
-  exactly the inputs of the avoidable computation, so the pin expires precisely when those
-  change. Column names and nullability are excluded on purpose: renames and `SET/DROP NOT NULL`
-  do not move a single reported byte, so they must not expire an allowance. The signature is
+  the physical layout, so the pin expires precisely when it changes. Column names and
+  nullability are excluded on purpose: renames and `SET/DROP NOT NULL` move no stored byte, so
+  they must not expire an allowance (nullability still feeds the avoidable computation, which the
+  gate reruns with the current constraints). The signature is
   stored as that readable string rather than a hash: a baseline diff then *shows* what changed,
   and there is no hash-stability liability across releases.
 - **Appends keep the allowance alive (the prefix rule).** `ADD COLUMN` appends physically, so
@@ -368,7 +444,12 @@ degradation — a `CREATE TABLE AS SELECT` (columns come from the query, so the 
 never gated), a temp table (no persistent storage), a dropped column (bitmap cost is modeled),
 an assumed type (a separate honesty axis), or dynamic DDL in a `DO` body. Nothing that should be
 gated passes green silently; a consumer wanting any of those to fail asserts on the specific note
-kind, and `Analysis::degraded()` exposes the same set to library adopters. The membership lives
+kind, and `Analysis::degraded()` exposes the same set to library adopters. A budgeted dominance
+search is counted beside it (`budgeted_tables`) but not in it: findings on such a table stand,
+and a clean verdict there says "found", not "exists". The budget binds on ordinary tables (42%
+of a 3,000-table corpus of 4 to 8 realistic columns), so folding it into `fail_on_degraded`
+would fail most projects that use that flag; `--fail-on-budgeted` (`GateOutcome::fail_on_budgeted`)
+is the separate opt-in for a gate that wants every clean verdict proven. The membership lives
 in one wildcard-free `NoteKind::is_degradation` match, so adding a note kind is a compile error
 until it is classified — the catch-all cannot silently miss a future kind.
 Reports and baselines key on the fold key (lowercased unless quoted), which is identical across
@@ -424,8 +505,16 @@ inserts short-heavy and long-heavy workloads (long-heavy payloads live in the 12
 band that falsified both point priors), and asserts the three spec properties: measured
 padding inside every reported [min, max]; every recommended reorder measuring no worse than
 the current order on both workloads; every declared frontier boundary flipping the measured
-winner. Skipped loudly when no container is reachable (`ROWDIET_MEASURE_CONTAINER`, default
-`condescending_tu`), so plain CI stays database-free. Fixtures include the schemas that
+winner. Fixtures with nullable columns add workloads that NULL each nullable column by its own
+bit of the row counter (every NULL pattern over up to ten columns occurs) and are held to the
+bounds over every NULL pattern, the rows without NULLs to the bounds in rows that store every
+column; exact-tier rows are checked for their header (24 without a NULL, the bitmap header with
+one) and their MAXALIGN-rounded size against `footprint` and `with_nulls`, and recommendations
+and bands there are checked in row size; band sweeps add NULL patterns on top of the residue
+sweep; and a witness order (one the NULL-blind model would have recommended) must measure worse
+than the written order on some row of its witness workload. Skipped loudly when no container is
+reachable (`ROWDIET_MEASURE_CONTAINER`, default `condescending_tu`; tables carry the
+`ROWDIET_MEASURE_PREFIX` prefix, default `synb_`), so plain CI stays database-free. Fixtures include the schemas that
 falsified earlier revisions: the issue #1 pair, the issue #10 band pair, `(float8[], int4)`
 both ways, `(timetz, timetz, text)`, the TOAST pointer case, and the 25-column and many-class
 cap tables.
